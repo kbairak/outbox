@@ -7,33 +7,33 @@
 ```python
 import asyncio
 
-from outbox import setup_async, emit
+from outbox import setup, emit
 from sqlalchemy.ext.asyncio import create_async_engine
 
 db_engine = create_async_engine("postgresql+asyncpg://user:password@localhost/dbname")
 
 async def main():
-    await setup_async(db_engine=db_engine)
+    await setup(db_engine=db_engine)
 
     async with AsyncSession(db_engine) as session:
         await emit(
-            session, "user.created", {"user_id": 123, "username": "johndoe"}, commit=True
+            session, "user.created", {"id": 123, "username": "johndoe"}, commit=True
         )
 
 asyncio.run(main())
 ```
 
-No need for migrations, `setup_async` will get-or-create the outbox table automatically.
+No need for migrations, `setup` will get-or-create the outbox table automatically.
 
 ### Message relay process
 
 ```python
 import asyncio
 
-from outbox import setup_async, message_relay
+from outbox import setup, message_relay
 
 async def main():
-    await setup_async(
+    await setup(
         db_engine_url="postgresql+asyncpg://user:password@localhost/dbname",
         rabbitmq_url="amqp://user:password@localhost:5672/",
     )
@@ -47,15 +47,15 @@ asyncio.run(main())
 ```python
 import asyncio
 
-from outbox import setup_async, listen, worker
+from outbox import setup, listen, worker
 
 @listen("user.created")
 async def on_user_created(user):
     print(user)
-    # <<< {"user_id": 123, "username": "johndoe"}
+    # <<< {"id": 123, "username": "johndoe"}
 
 async def main():
-    await setup_async(rabbitmq_url="amqp://user:password@localhost:5672/")
+    await setup(rabbitmq_url="amqp://user:password@localhost:5672/")
     await worker()
 
 asyncio.run(main())
@@ -69,9 +69,9 @@ You can (should) call `emit` inside a database transaction. This way, data creat
 
 ```python
 async with AsyncSession(db_engine) as session, session.begin():
-    session.add(User(user_id=123, username="johndoe"))
+    session.add(User(id=123, username="johndoe"))
     # `commit=True` not needed because of `session.begin()`
-    await emit(session, "user.created", {"user_id": 123, "username": "johndoe"})
+    await emit(session, "user.created", {"id": 123, "username": "johndoe"})
 ```
 
 ### Topic exchange and wildcard matching
@@ -80,46 +80,82 @@ async with AsyncSession(db_engine) as session, session.begin():
 # Main application
 async with AsyncSession(db_engine) as session:
     await emit(
-        session, "user.created", {"user_id": 123, "username": "johndoe"}, commit=True
+        session, "user.created", {"id": 123, "username": "johndoe"}, commit=True
     )
 
 # Worker process
 @listen("user.*")
 async def on_user_event(user):
     print(user)
-    # <<< {"user_id": 123, "username": "johndoe"}
+    # <<< {"id": 123, "username": "johndoe"}
 ```
 
 ### Automatic (de)serialization of Pydantic models
 
 ```python
 class User(BaseModel):
-    user_id: int
+    id: int
     username: str
 
 # Main application
 async with AsyncSession(db_engine) as session:
     await emit(
-        session, "user.created", User(user_id=123, username="johndoe"), commit=True
+        session, "user.created", User(id=123, username="johndoe"), commit=True
     )
 
 # Worker process
 @listen("user.created")
 async def on_user_created(user: User):  # inspects type annotation
     print(user)
-    # <<< User(user_id=123, username="johndoe")
+    # <<< User(id=123, username="johndoe")
 ```
 
-# TODOs
+### Retries
 
-- Add name parameter to listen
-- Dependency injection on listen
-- Improve message relay polling
-- Use pg notify/listen to avoid polling the database
-- Only async constructor
-- Pass routing key to handler
-- Verify that retries work
-- Figure out a way to not retry on some exceptions
+In most cases, an exception in an event handler will cause a retry:
+
+```python
+@listen("user.created")
+async def on_user_created(user: User):
+    if user.id == 123:
+        raise ValueError("This is a test error")
+    print(user)
+```
+
+You can disable this behavior by passing `retry_on_error=False` during setup:
+
+```python
+await setup(..., retry_on_error=False)
+```
+
+Or during `listen`:
+
+```python
+@listen("user.created", retry_on_error=False)
+async def on_user_created(user: User):
+    ...
+```
+
+Regardless of the default behavior, you can force a retry or a non-retry by raising `Retry` or `Abort` exceptions, respectively:
+
+```python
+from outbox import Retry, Abort, listen
+
+@listen("user.created")
+def on_user_created(user: User):
+    if user.id == 123:
+        raise Retry("This is a test error, retrying")
+    elif user.id == 456:
+        raise Abort("This is a test error, aborting")
+    print(user)
+```
+
+## TODOs
+
+- Add dead-lettering
 - Clean up outbox table
+- Figure out how to show debug logs during tests (and in general)
+- Use pg notify/listen to avoid polling the database
 - Use msgpack (optionally) to reduce size
 - Support binary payloads (without base64)
+- Dependency injection on listen
