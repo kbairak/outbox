@@ -1,22 +1,30 @@
 import asyncio
 import json
-from typing import AsyncGenerator, Protocol
+from typing import AsyncGenerator
 from unittest.mock import AsyncMock
 
 import aio_pika
 import pytest
 import pytest_asyncio
+from aio_pika.abc import AbstractConnection
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
+from testcontainers.rabbitmq import RabbitMqContainer
 
-from outbox import Outbox, OutboxTable
+from outbox import (
+    OutboxTable,
+    emit,
+    listen,
+    message_relay,
+    outbox,
+    setup_async,
+    worker,
+)
 
 
-class EmitType(Protocol):
-    async def __call__(
-        self, session: AsyncSession, routing_key: str, body: str, *, commit: bool = False
-    ) -> None: ...
+class Person(BaseModel):
+    name: str
 
 
 @pytest.fixture
@@ -24,32 +32,35 @@ def db_engine() -> AsyncEngine:
     return create_async_engine("sqlite+aiosqlite://")
 
 
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(loop_scope="session")
 async def session(db_engine: AsyncEngine) -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSession(db_engine) as session:
         yield session
 
 
-@pytest_asyncio.fixture
-async def outbox(db_engine: AsyncEngine) -> Outbox:
-    outbox = Outbox()
-    await outbox.setup_async(db_engine=db_engine)
-    return outbox
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def rmq_connection():
+    with RabbitMqContainer("rabbitmq:4.1") as rabbitmq:
+        connection = await aio_pika.connect(
+            f"amqp://{rabbitmq.username}:{rabbitmq.password}@{rabbitmq.get_container_host_ip()}:"
+            f"{rabbitmq.get_exposed_port(rabbitmq.port)}/"
+        )
+        async with connection:
+            yield connection
 
 
-@pytest_asyncio.fixture
-async def emit(outbox: Outbox) -> EmitType:
-    return outbox.emit
+@pytest_asyncio.fixture(loop_scope="session")
+async def outbox_setup(db_engine: AsyncEngine, rmq_connection: AbstractConnection) -> None:
+    await setup_async(db_engine=db_engine, rmq_connection=rmq_connection)
 
 
-@pytest.mark.asyncio
-async def test_emit(session: AsyncSession, emit: EmitType):
+@pytest.mark.asyncio(loop_scope="session")
+async def test_emit(outbox_setup: None, session: AsyncSession) -> None:
     # test
     await emit(session, "test_routing_key", "test_body")
 
     # assert
-    stmt = select(OutboxTable)
-    messages = (await session.execute(stmt)).scalars().all()
+    messages = (await session.execute(select(OutboxTable))).scalars().all()
     assert len(messages) == 1
     assert messages[0].routing_key == "test_routing_key"
     assert messages[0].body == '"test_body"'
@@ -57,10 +68,24 @@ async def test_emit(session: AsyncSession, emit: EmitType):
     assert messages[0].sent_at is None
 
 
-@pytest.mark.asyncio
-async def test_worker(
-    monkeypatch: pytest.MonkeyPatch, outbox: Outbox, emit: EmitType, session: AsyncSession
-):
+@pytest.mark.asyncio(loop_scope="session")
+async def test_emit_with_pydantic(outbox_setup: None, session: AsyncSession) -> None:
+    # test
+    await emit(session, "my_routing_key", Person(name="MyName"))
+
+    # assert
+    messages = (await session.execute(select(OutboxTable))).scalars().all()
+    assert len(messages) == 1
+    assert messages[0].routing_key == "my_routing_key"
+    assert json.loads(messages[0].body) == {"name": "MyName"}
+    assert messages[0].created_at is not None
+    assert messages[0].sent_at is None
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_message_relay(
+    outbox_setup: None, monkeypatch: pytest.MonkeyPatch, session: AsyncSession
+) -> None:
     # arrange
     monkeypatch.setattr(
         outbox, "rmq_connection", (rmq_connection_mock := AsyncMock(name="rmq_connection"))
@@ -72,7 +97,7 @@ async def test_worker(
 
     # test
     try:
-        await asyncio.wait_for(outbox.message_relay(), timeout=0.1)
+        await asyncio.wait_for(message_relay(), timeout=0.1)
     except asyncio.TimeoutError:
         pass
 
@@ -87,17 +112,99 @@ async def test_worker(
     assert actual_message.body_size == 11
     assert actual_message.content_type == "application/json"
 
+    message = (await session.execute(select(OutboxTable))).scalars().one()
+    assert message.sent_at is not None
 
-class MyModel(BaseModel):
-    name: str
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_regiter_listener(outbox_setup: None) -> None:
+    # test
+    @listen("routing_key")
+    def test_listener(person):
+        pass
+
+    # assert
+    assert list(outbox.listeners.keys()) == ["routing_key"]
+    assert len(list(outbox.listeners.values())[0]) == 1
+    assert "test_listener" in list(outbox.listeners.values())[0][0][0]
 
 
-@pytest.mark.asyncio
-async def test_emit_with_pydantic(emit, session):
-    await emit(session, "my_routing_key", MyModel(name="MyName"))
-    stmt = select(OutboxTable)
-    message = (await session.execute(stmt)).scalars().one()
-    assert message.routing_key == "my_routing_key"
-    assert json.loads(message.body) == {"name": "MyName"}
-    assert message.created_at is not None
-    assert message.sent_at is None
+@pytest.mark.asyncio(loop_scope="session")
+async def test_worker(outbox_setup: None, session: AsyncSession) -> None:
+    # setup
+    callcount = 0
+
+    @listen("routing_key")
+    def test_listener(person):
+        nonlocal callcount
+        callcount += 1
+        assert person == {"name": "MyName"}
+
+    await emit(session, "routing_key", {"name": "MyName"}, commit=True)
+
+    async def _message_relay():
+        await asyncio.sleep(0.1)  # Give a small lead time for the worker to setup up the queue
+        await message_relay()
+
+    # test
+    try:
+        await asyncio.wait_for(asyncio.gather(_message_relay(), worker()), timeout=0.3)
+    except asyncio.TimeoutError:
+        pass
+
+    # assert
+    assert callcount == 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_worker_with_pydantic(outbox_setup: None, session: AsyncSession) -> None:
+    # setup
+    callcount = 0
+
+    @listen("routing_key")
+    def test_listener(person: Person):
+        nonlocal callcount
+        callcount += 1
+        assert person == Person(name="MyName")
+
+    await emit(session, "routing_key", Person(name="MyName"), commit=True)
+
+    async def _message_relay():
+        await asyncio.sleep(0.1)  # Give a small lead time for the worker to setup up the queue
+        await message_relay()
+
+    # test
+    try:
+        await asyncio.wait_for(asyncio.gather(_message_relay(), worker()), timeout=0.3)
+    except asyncio.TimeoutError:
+        pass
+
+    # assert
+    assert callcount == 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_worker_with_wildcard(outbox_setup: None, session: AsyncSession) -> None:
+    # setup
+    callcount = 0
+
+    @listen("routing_key.*")
+    def test_listener(person):
+        nonlocal callcount
+        callcount += 1
+        assert person == {"name": "MyName"}
+
+    await emit(session, "routing_key.foo", {"name": "MyName"}, commit=True)
+
+    async def _message_relay():
+        await asyncio.sleep(0.1)  # Give a small lead time for the worker to setup up the queue
+        await message_relay()
+
+    # test
+    try:
+        await asyncio.wait_for(asyncio.gather(_message_relay(), worker()), timeout=0.3)
+    except asyncio.TimeoutError:
+        pass
+
+    # assert
+    assert callcount == 1

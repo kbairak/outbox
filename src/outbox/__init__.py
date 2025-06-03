@@ -1,11 +1,13 @@
 import asyncio
 import datetime
+import functools
+import inspect
 import json
 import logging
 from typing import Any, Callable
 
 import aio_pika
-from aio_pika.abc import AbstractConnection
+from aio_pika.abc import AbstractConnection, AbstractIncomingMessage
 from pydantic import BaseModel
 from sqlalchemy import Text, select
 from sqlalchemy.exc import NoResultFound
@@ -26,7 +28,7 @@ class OutboxTable(Base):
     routing_key: Mapped[str] = mapped_column(Text)
     body: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime.datetime] = mapped_column(
-        default=datetime.datetime.now(datetime.UTC)
+        default=lambda: datetime.datetime.now(datetime.UTC),
     )
     sent_at: Mapped[datetime.datetime | None] = mapped_column()
 
@@ -37,7 +39,7 @@ class Outbox:
         self.rmq_connection: AbstractConnection | None = None
         self.exchange_name = "outbox_exchange"
         OutboxTable.__tablename__ = "outbox_table"
-        self.queues = {}
+        self.listeners = {}
 
         self.setup_sync(**kwargs)
 
@@ -62,6 +64,7 @@ class Outbox:
         if db_engine_url is not None:
             self.db_engine = create_async_engine(db_engine_url)
             logger.debug("Set up DB engine")
+
         if table_name is not None:
             OutboxTable.__tablename__ = table_name
 
@@ -102,6 +105,8 @@ class Outbox:
         logger.debug(f"Emitted message to outbox: {routing_key=}, {body=}")
 
     async def message_relay(self, *, poll_interval: float = 1.0):
+        if self.db_engine is None:
+            raise ValueError("Database engine is not set up.")
         if self.rmq_connection is None:
             raise ValueError("RabbitMQ connection is not set up.")
         channel = await self.rmq_connection.channel()
@@ -129,14 +134,41 @@ class Outbox:
                         message.routing_key,
                     )
 
-    def listen(self, routing_key: str):
+    def listen(self, binding_key: str) -> Callable[[Callable[[Any], None]], None]:
         def decorator(func: Callable):
-            self.queues.setdefault(routing_key, []).append(func)
+            queue_name = f"{func.__module__}.{func.__qualname__}".replace("<", "").replace(">", "")
+            signature = inspect.signature(func)
+            if not len(signature.parameters) == 1:
+                raise ValueError("Worker functions must accept exactly one argument")
+            param_name = list(signature.parameters.keys())[0]
+            param = signature.parameters[param_name]
+            annotation = param.annotation
+
+            async def _on_message(message: AbstractIncomingMessage) -> None:
+                async with message.process():
+                    if isinstance(annotation, BaseModel):
+                        body = annotation.model_validate_json(message.body)
+                    else:
+                        body = json.loads(message.body)
+                    await func(**{param_name: body})
+
+            self.listeners.setdefault(binding_key, []).append((queue_name, _on_message))
 
         return decorator
 
     async def worker(self):
-        pass
+        if self.rmq_connection is None:
+            raise ValueError("RabbitMQ connection is not set up.")
+        channel = await self.rmq_connection.channel()
+        exchange = await channel.declare_exchange(
+            self.exchange_name, aio_pika.ExchangeType.TOPIC, durable=True
+        )
+        for binding_key, handlers in self.listeners.items():
+            for queue_name, handler in handlers:
+                queue = await channel.declare_queue(queue_name, durable=True)
+                await queue.bind(exchange, binding_key)
+                await queue.consume(handler)
+        await asyncio.Future()
 
 
 outbox = Outbox()

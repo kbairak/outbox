@@ -1,0 +1,39 @@
+name: Run Tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      docker:
+        image: docker:dind
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Add uv to PATH
+        run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Run checks
+        run: uv run ruff format && uv run ruff check
+
+      - name: Pull RabbitMQ Docker image
+        run: docker pull rabbitmq:4.1
+
+      - name: Run tests
+        run: uv run pytest -vv --cov --cov-report=term-missing

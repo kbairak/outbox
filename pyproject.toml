@@ -25,6 +25,7 @@ dev = [
   "pytest-asyncio>=1.0.0",
   "pytest-cov>=6.1.1",
   "ruff>=0.11.12",
+  "testcontainers[rabbitmq]>=4.10.0",
 ]
 
 [tool.ruff]
