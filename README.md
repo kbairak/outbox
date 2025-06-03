@@ -152,9 +152,7 @@ def on_user_created(user: User):
 
 ## TODOs
 
-- Add dead-lettering
 - Clean up outbox table
-- Figure out how to show debug logs during tests (and in general)
 - Use pg notify/listen to avoid polling the database
 - Use msgpack (optionally) to reduce size
 - Support binary payloads (without base64)

@@ -18,6 +18,7 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
   "aiosqlite>=0.21.0",
+  "asyncpg>=0.30.0",
   "ptipython>=1.0.1",
   "pudb>=2025.1",
   "pynvim>=0.5.2",

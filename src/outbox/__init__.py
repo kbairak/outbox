@@ -6,9 +6,9 @@ import logging
 from typing import Any, Callable, Coroutine
 
 import aio_pika
-from aio_pika.abc import AbstractConnection, AbstractIncomingMessage
+from aio_pika.abc import AbstractConnection, AbstractIncomingMessage, DateType
 from pydantic import BaseModel
-from sqlalchemy import Text, select
+from sqlalchemy import DateTime, Text, func, select
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -27,9 +27,9 @@ class OutboxTable(Base):
     routing_key: Mapped[str] = mapped_column(Text)
     body: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime.datetime] = mapped_column(
-        default=lambda: datetime.datetime.now(datetime.UTC),
+        DateTime(timezone=True), server_default=func.now()
     )
-    sent_at: Mapped[datetime.datetime | None] = mapped_column()
+    sent_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Retry(Exception):
@@ -40,6 +40,10 @@ class Abort(Exception):
     pass
 
 
+class Reject(Exception):
+    pass
+
+
 class Outbox:
     def __init__(self):
         self.db_engine: AsyncEngine | None = None
@@ -47,6 +51,7 @@ class Outbox:
         self.exchange_name = "outbox_exchange"
         self.poll_interval = 1.0
         self.retry_on_error = True
+        self.expiration = None
         OutboxTable.__tablename__ = "outbox_table"
         self._reset_listeners()
 
@@ -60,6 +65,7 @@ class Outbox:
         exchange_name: str | None = None,
         poll_interval: float | None = None,
         retry_on_error: bool | None = None,
+        expiration: DateType | None = None,
     ):
         if db_engine is not None and db_engine_url is not None:
             raise ValueError("You cannot set both db_engine and db_engine_url")
@@ -98,6 +104,9 @@ class Outbox:
         if retry_on_error is not None:
             self.retry_on_error = retry_on_error
             logger.debug(f"Set up non-default retry_on_error: {self.retry_on_error}")
+
+        if expiration is not None:
+            self.expiration = expiration
 
     def _reset_listeners(self):
         self.listeners = {}
@@ -153,7 +162,9 @@ class Outbox:
                         message.sent_at = datetime.datetime.now(datetime.UTC)
                         await exchange.publish(
                             aio_pika.Message(
-                                message.body.encode(), content_type="application/json"
+                                message.body.encode(),
+                                content_type="application/json",
+                                expiration=self.expiration,
                             ),
                             message.routing_key,
                         )
@@ -216,13 +227,22 @@ class Outbox:
                     logger.info(
                         f"Aborting (forced): {message=}, {message.routing_key=}, {message.body=}"
                     )
+                    await message.ack()
+                except Reject:
+                    logger.info(
+                        f"Rejecting, this message will likely end up in DLX: {message=}, "
+                        f"{message.routing_key=}, {message.body=}"
+                    )
                     await message.nack(requeue=False)
                 except Exception:
                     logger.info(
                         f"{'Retrying' if retry_on_error else 'Aborting'}: {message=}, "
                         f"{message.routing_key=}, {message.body=}"
                     )
-                    await message.nack(requeue=retry_on_error)
+                    if retry_on_error:
+                        await message.nack(requeue=True)
+                    else:
+                        await message.ack()
                 else:
                     await message.ack()
                     logger.info(f"Sucess: {message=}, {message.routing_key=}, {message.body=}")
@@ -241,14 +261,28 @@ class Outbox:
         exchange = await channel.declare_exchange(
             self.exchange_name, aio_pika.ExchangeType.TOPIC, durable=True
         )
+        dead_letter_exchange = await channel.declare_exchange(
+            f"dlx_{self.exchange_name}", aio_pika.ExchangeType.DIRECT, durable=True
+        )
         for binding_key, handlers in self.listeners.items():
             for queue_name, handler in handlers:
-                queue = await channel.declare_queue(queue_name, durable=True)
+                dead_letter_queue = await channel.declare_queue(f"dlx_{queue_name}", durable=True)
+                await dead_letter_queue.bind(dead_letter_exchange, queue_name)
+
                 logger.debug(
                     f"Binding queue {queue_name} to exchange {self.exchange_name} with binding "
                     f"key {binding_key}"
                 )
+                queue = await channel.declare_queue(
+                    queue_name,
+                    durable=True,
+                    arguments={
+                        "x-dead-letter-exchange": f"dlx_{self.exchange_name}",
+                        "x-dead-letter-routing-key": queue_name,
+                    },
+                )
                 await queue.bind(exchange, binding_key)
+
                 await queue.consume(handler)
         await asyncio.Future()
 

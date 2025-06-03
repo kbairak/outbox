@@ -1,0 +1,18 @@
+services:
+  db:
+    image: postgres:17.5-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - 5432:5432
+
+  queue:
+    image: rabbitmq:4.1-management
+    ports:
+      - 15672:15672
+      - 5672:5672
+    command: >
+      bash -c "
+        echo '[rabbitmq_management,rabbitmq_shovel,rabbitmq_shovel_management].' > /etc/rabbitmq/enabled_plugins &&
+        rabbitmq-server
+      "
