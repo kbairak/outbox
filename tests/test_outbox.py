@@ -1,6 +1,5 @@
 import asyncio
 import json
-import logging
 from typing import AsyncGenerator
 from unittest.mock import AsyncMock
 
@@ -52,7 +51,7 @@ async def outbox_setup(db_engine: AsyncEngine, rmq_connection: AbstractConnectio
 @pytest.mark.asyncio(loop_scope="session")
 async def test_emit(outbox_setup: None, session: AsyncSession) -> None:
     # test
-    await emit(session, "test_routing_key", "test_body")
+    emit(session, "test_routing_key", "test_body")
 
     # assert
     messages = (await session.execute(select(outbox.OutboxTable))).scalars().all()
@@ -66,7 +65,7 @@ async def test_emit(outbox_setup: None, session: AsyncSession) -> None:
 @pytest.mark.asyncio(loop_scope="session")
 async def test_emit_with_pydantic(outbox_setup: None, session: AsyncSession) -> None:
     # test
-    await emit(session, "my_routing_key", Person(name="MyName"))
+    emit(session, "my_routing_key", Person(name="MyName"))
 
     # assert
     messages = (await session.execute(select(outbox.OutboxTable))).scalars().all()
@@ -88,7 +87,8 @@ async def test_message_relay(
     rmq_connection_mock.channel.return_value = (channel_mock := AsyncMock(name="channel"))
     channel_mock.declare_exchange.return_value = (exchange_mock := AsyncMock(name="exchange"))
 
-    await emit(session, "test_routing_key", "test_body", commit=True)
+    emit(session, "test_routing_key", "test_body")
+    await session.commit()
 
     # test
     try:
@@ -136,7 +136,8 @@ async def test_worker(outbox_setup: None, session: AsyncSession) -> None:
         callcount += 1
         retrieved_argument = person
 
-    await emit(session, "routing_key", {"name": "MyName"}, commit=True)
+    emit(session, "routing_key", {"name": "MyName"})
+    await session.commit()
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
@@ -165,7 +166,8 @@ async def test_worker_with_pydantic(outbox_setup: None, session: AsyncSession) -
         callcount += 1
         retrieved_argument = person
 
-    await emit(session, "routing_key", Person(name="MyName"), commit=True)
+    emit(session, "routing_key", Person(name="MyName"))
+    await session.commit()
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
@@ -196,7 +198,8 @@ async def test_worker_with_wildcard(outbox_setup: None, session: AsyncSession) -
         retrieved_routing_key = routing_key
         retrieved_argument = person
 
-    await emit(session, "routing_key.foo", {"name": "MyName"}, commit=True)
+    emit(session, "routing_key.foo", {"name": "MyName"})
+    await session.commit()
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
@@ -228,7 +231,8 @@ async def test_retry(outbox_setup: None, session: AsyncSession) -> None:
             raise ValueError("Simulated failure")
         retrieved_argument = person
 
-    await emit(session, "routing_key", {"name": "MyName"}, commit=True)
+    emit(session, "routing_key", {"name": "MyName"})
+    await session.commit()
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
@@ -260,7 +264,8 @@ async def test_no_retry_with_setup(outbox_setup: None, session: AsyncSession) ->
             raise ValueError("Simulated failure")
         retrieved_argument = person
 
-    await emit(session, "routing_key", {"name": "MyName"}, commit=True)
+    emit(session, "routing_key", {"name": "MyName"})
+    await session.commit()
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
@@ -291,7 +296,8 @@ async def test_no_retry_with_listen(outbox_setup: None, session: AsyncSession) -
             raise ValueError("Simulated failure")
         retrieved_argument = person
 
-    await emit(session, "routing_key", {"name": "MyName"}, commit=True)
+    emit(session, "routing_key", {"name": "MyName"})
+    await session.commit()
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
@@ -323,7 +329,8 @@ async def test_force_retry_with_setup(outbox_setup: None, session: AsyncSession)
             raise outbox.Retry("Simulated failure")
         retrieved_argument = person
 
-    await emit(session, "routing_key", {"name": "MyName"}, commit=True)
+    emit(session, "routing_key", {"name": "MyName"})
+    await session.commit()
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
@@ -354,7 +361,8 @@ async def test_force_no_retry_with_setup(outbox_setup: None, session: AsyncSessi
             raise outbox.Abort("Simulated failure")
         retrieved_argument = person
 
-    await emit(session, "routing_key", {"name": "MyName"}, commit=True)
+    emit(session, "routing_key", {"name": "MyName"})
+    await session.commit()
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
@@ -385,7 +393,8 @@ async def test_force_retry_with_listen(outbox_setup: None, session: AsyncSession
             raise outbox.Retry("Simulated failure")
         retrieved_argument = person
 
-    await emit(session, "routing_key", {"name": "MyName"}, commit=True)
+    emit(session, "routing_key", {"name": "MyName"})
+    await session.commit()
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
@@ -416,7 +425,8 @@ async def test_force_no_retry_with_listen(outbox_setup: None, session: AsyncSess
             raise outbox.Abort("Simulated failure")
         retrieved_argument = person
 
-    await emit(session, "routing_key", {"name": "MyName"}, commit=True)
+    emit(session, "routing_key", {"name": "MyName"})
+    await session.commit()
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue

@@ -16,7 +16,7 @@ db_engine = create_async_engine("postgresql+asyncpg://postgres:postgres@localhos
 
 @listen("foo")
 async def foo(obj):
-    pass
+    3 / 0
 
 
 async def main():
@@ -31,7 +31,8 @@ async def main():
         await outbox.worker()
     elif len(sys.argv) == 1:
         async with AsyncSession(db_engine) as session:
-            await emit(session, "foo", {}, commit=True)
+            emit(session, "foo", {})
+            await session.commit()
     else:
         raise ValueError("Usage: python main.py [message_relay|worker]")
 

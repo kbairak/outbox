@@ -111,22 +111,13 @@ class Outbox:
     def _reset_listeners(self):
         self.listeners = {}
 
-    async def emit(
-        self,
-        session: AsyncSession,
-        routing_key: str,
-        body: Any,
-        *,
-        commit: bool = False,
-    ) -> None:
+    def emit(self, session: AsyncSession, routing_key: str, body: Any) -> None:
         if isinstance(body, BaseModel):
             body = body.model_dump_json()
         else:
             body = json.dumps(body)
 
         session.add(OutboxTable(routing_key=routing_key, body=body))
-        if commit:
-            await session.commit()
 
         logger.debug(f"Emitted message to outbox: {routing_key=}, {body=}")
 
