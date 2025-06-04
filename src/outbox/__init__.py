@@ -7,8 +7,9 @@ from typing import Any, Callable, Coroutine
 
 import aio_pika
 from aio_pika.abc import AbstractConnection, AbstractIncomingMessage, DateType
+from aio_pika.message import encode_expiration
 from pydantic import BaseModel
-from sqlalchemy import DateTime, Text, func, select
+from sqlalchemy import DateTime, Interval, Text, func, select
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -30,6 +31,7 @@ class OutboxTable(Base):
         DateTime(timezone=True), server_default=func.now()
     )
     sent_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    expiration: Mapped[datetime.timedelta | None] = mapped_column()
 
     def __repr__(self):
         routing_key, body = self.routing_key, self.body.decode()
@@ -95,7 +97,7 @@ class Outbox:
 
         if exchange_name is not None:
             self.exchange_name = exchange_name
-            logger.debug(f"Set up non-deault exchange name: {self.exchange_name!r}")
+            logger.debug(f"Set up non-deault exchange name: {self.exchange_name}")
 
         if poll_interval is not None:
             self.poll_interval = poll_interval
@@ -124,13 +126,20 @@ class Outbox:
             logger.debug("Set up RMQ connection")
         return self._rmq_connection
 
-    def emit(self, session: AsyncSession, routing_key: str, body: Any) -> None:
+    def emit(
+        self, session: AsyncSession, routing_key: str, body: Any, *, expiration: DateType = None
+    ) -> None:
         if isinstance(body, BaseModel):
             body = body.model_dump_json().encode()
         elif not isinstance(body, bytes):
             body = json.dumps(body).encode()
 
-        session.add(OutboxTable(routing_key=routing_key, body=body))
+        outbox_row = OutboxTable(routing_key=routing_key, body=body)
+        if expiration is not None:
+            milliseconds = encode_expiration(expiration)
+            assert milliseconds is not None
+            outbox_row.expiration = datetime.timedelta(milliseconds=int(milliseconds))
+        session.add(outbox_row)
 
         logger.debug(f"Emitted message to outbox: {routing_key=}, {body=}")
 
@@ -159,22 +168,23 @@ class Outbox:
                         .with_for_update(skip_locked=True)
                     )
                     try:
-                        message = (await session.execute(stmt)).scalars().one()
+                        outbox_row = (await session.execute(stmt)).scalars().one()
                     except NoResultFound:
                         logger.debug("No unsent messages found, waiting...")
                         break
                     else:
-                        logger.debug(f"Processing message: {message=}")
-                        message.sent_at = datetime.datetime.now(datetime.UTC)
+                        logger.debug(f"Processing message: {outbox_row}")
+                        outbox_row.sent_at = datetime.datetime.now(datetime.UTC)
+                        expiration = outbox_row.expiration or self.expiration
                         await exchange.publish(
                             aio_pika.Message(
-                                message.body,
+                                outbox_row.body,
                                 content_type="application/json",
-                                expiration=self.expiration,
+                                expiration=expiration,
                             ),
-                            message.routing_key,
+                            outbox_row.routing_key,
                         )
-                        logger.debug(f"Sent message: {message=} to RabbitMQ")
+                        logger.debug(f"Sent message: {outbox_row} to RabbitMQ")
             await asyncio.sleep(self.poll_interval)
 
     def listen(
@@ -213,8 +223,8 @@ class Outbox:
 
             async def _on_message(message: AbstractIncomingMessage) -> None:
                 logger.debug(
-                    f"Received message: {message.message_id=}, {message.routing_key=}, "
-                    f"{message.body=}"
+                    f"Received message {message.message_id}: routing key: {message.routing_key}, "
+                    f"body: {message.body}"
                 )
                 try:
                     kwargs = {}
@@ -230,20 +240,20 @@ class Outbox:
                     await func(**kwargs)
                 except Retry:
                     logger.info(
-                        f"Retrying (forced): {message.message_id=}, {message.routing_key=}, "
-                        f"{message.body=}"
+                        f"Retrying (forced) {message.message_id}: routing key: "
+                        f"{message.routing_key}, body: {message.body}"
                     )
                     await message.nack(requeue=True)
                 except Reject:
                     logger.info(
-                        "Rejecting, this message will likely end up in DLX: "
-                        f"{message.message_id=}, {message.routing_key=}, {message.body=}"
+                        f"Rejecting, this message will likely end up in DLX {message.message_id}: "
+                        f"routing key: {message.routing_key}, body: {message.body}"
                     )
                     await message.nack(requeue=False)
                 except Exception:
                     logger.info(
-                        f"{'Retrying' if retry_on_error else 'Aborting'}: {message.message_id=}, "
-                        f"{message.routing_key=}, {message.body=}"
+                        f"{'Retrying' if retry_on_error else 'Aborting'} {message.message_id}: "
+                        f"routing key: {message.routing_key}, body: {message.body}"
                     )
                     if retry_on_error:
                         await message.nack(requeue=True)
@@ -252,7 +262,8 @@ class Outbox:
                 else:
                     await message.ack()
                     logger.info(
-                        f"Sucess: {message.message_id=}, {message.routing_key=}, {message.body=}"
+                        f"Sucess {message.message_id}: routing key: {message.routing_key}, body: "
+                        f"{message.body}"
                     )
 
             logger.debug(f"Registering listener for {binding_key=}: {func=}")

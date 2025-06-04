@@ -12,7 +12,7 @@ flowchart LR
     DB
     end
 
-    subgraph RabbitMQQ
+    subgraph RabbitMQ
     ME -->|binding| Q1[Queue 1]
     end
 
@@ -199,7 +199,7 @@ flowchart LR
     DB
     end
 
-    subgraph RabbitMQQ
+    subgraph RabbitMQ
     ME -->|binding| Q1[Queue 1]
     Q1 -->|reject| DLX["Dead Letter Exchange (direct)"]
     DLX --->|binding| DQ1[Dead Letter Queue]
@@ -211,7 +211,7 @@ flowchart LR
 
 A Dead-letter exchange and one dead-letter queue per regular queue are created automatically by the worker. If a message is rejected, it will find its way to the relevant dead-letter queues. You can then fix the code, re-launch the worker and use the shovel interface in RabbitMQ to move the message back to its respective queue so that it can be processed correctly by the worker.
 
-Apart from raising `Reject`, another way to cause messages to be rejected is to set an `expiration` on the outbox instance. If the message isn't acknowledged by the worker within its expiration time (this can happen because of retries), it will enter the dead-letter exchange and queues:
+Apart from raising `Reject`, another way to cause messages to be rejected is via expiration. You can setup an expiration time while setting up the outbox instance or during `emit`. If the message isn't acknowledged by the worker within its expiration time (this can happen because of retries), it will enter the dead-letter exchange and queues:
 
 ```python
 setup(
@@ -219,6 +219,19 @@ setup(
     rabbitmq_url="amqp://user:password@localhost:5672/",
     expiration=datetime.timedelta(minutes=5),
 )
+```
+
+Or
+
+```python
+async with AsyncSession(db_engine) as session:
+    emit(
+        session,
+        "user.created",
+        {"id": 123, "username": "johndoe"},
+        expiration=datetime.timedelta(minutes=5),
+    )
+    await session.commit()
 ```
 
 The names of the dead-letter queues are the same as their respective counterparts, prefixed with `dlq_`.
@@ -286,7 +299,6 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ## TODOs
 
-- Add expiration to `emit` and `listen`
 - Clean up outbox table
 - Use pg notify/listen to avoid polling the database
 - Use msgpack (optionally) to reduce size
@@ -295,3 +307,4 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 - Pass `routing_key` to listener function by argument name, not type
 - Add ETA to emit (should be easy thanks to the message relay)
 - Find a way to distribute multiple workers
+- Cold shutdown

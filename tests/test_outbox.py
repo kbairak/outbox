@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import aio_pika
 import pytest
 import pytest_asyncio
-from aio_pika.abc import AbstractConnection
+from aio_pika.abc import AbstractConnection, DateType
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
@@ -48,7 +48,10 @@ async def outbox(db_engine: AsyncEngine, rmq_connection: AbstractConnection) -> 
     return outbox
 
 
-EmitType = Callable[[AsyncSession, str, Any], None]
+class EmitType(Protocol):
+    def __call__(
+        self, session: AsyncSession, routing_key: str, body: Any, *, expiration: DateType = None
+    ) -> None: ...
 
 
 @pytest.fixture
@@ -479,4 +482,33 @@ async def test_dead_letter(
     assert connection is not None
     channel = await connection.channel()
     dlq = await channel.get_queue("dlq_test_queue_name")
+    assert dlq.declaration_result.message_count == 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_dead_letter_with_expiration(
+    listen: ListenType, emit: EmitType, session: AsyncSession, outbox: Outbox
+):
+    @listen("routing_key", queue_name="test_queue_name2")
+    async def _(_):
+        raise Retry("test")
+
+    emit(session, "routing_key", {}, expiration=0.01)
+    await session.commit()
+
+    async def _message_relay():
+        await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
+        await outbox.message_relay()
+
+    # test
+    try:
+        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.1)
+    except asyncio.TimeoutError:
+        pass
+
+    # get queue info
+    connection = await outbox._get_rmq_connection()
+    assert connection is not None
+    channel = await connection.channel()
+    dlq = await channel.get_queue("dlq_test_queue_name2")
     assert dlq.declaration_result.message_count == 1
