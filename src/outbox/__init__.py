@@ -275,7 +275,7 @@ class Outbox:
         )
         for binding_key, handlers in self._listeners.items():
             for queue_name, handler in handlers:
-                dead_letter_queue = await channel.declare_queue(f"dlx_{queue_name}", durable=True)
+                dead_letter_queue = await channel.declare_queue(f"dlq_{queue_name}", durable=True)
                 await dead_letter_queue.bind(dead_letter_exchange, queue_name)
 
                 logger.debug(

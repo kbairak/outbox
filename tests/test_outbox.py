@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from testcontainers.rabbitmq import RabbitMqContainer
 
-from outbox import Outbox, OutboxTable, Retry
+from outbox import Outbox, OutboxTable, Reject, Retry
 
 
 class Person(BaseModel):
@@ -139,14 +139,14 @@ async def test_message_relay(
 @pytest.mark.asyncio(loop_scope="session")
 async def test_regiter_listener(listen: ListenType, outbox: Outbox) -> None:
     # test
-    @listen("routing_key")
-    async def test_listener(person):
+    @listen("routing_key", queue_name="test_queue_name")
+    async def _(_):  # pragma: no cover
         pass
 
     # assert
     assert list(outbox._listeners.keys()) == ["routing_key"]
     assert len(list(outbox._listeners.values())[0]) == 1
-    assert "test_listener" in list(outbox._listeners.values())[0][0][0]
+    assert "test_queue_name" in list(outbox._listeners.values())[0][0][0]
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -158,7 +158,7 @@ async def test_worker(
     retrieved_argument = None
 
     @listen("routing_key")
-    async def test_listener(person):
+    async def _(person):
         nonlocal callcount, retrieved_argument
         callcount += 1
         retrieved_argument = person
@@ -190,7 +190,7 @@ async def test_worker_with_pydantic(
     retrieved_argument = None
 
     @listen("routing_key")
-    async def test_listener(person: Person):
+    async def _(person: Person):
         nonlocal callcount, retrieved_argument
         callcount += 1
         retrieved_argument = person
@@ -223,7 +223,7 @@ async def test_worker_with_wildcard(
     retrieved_routing_key = None
 
     @listen("routing_key.*")
-    async def test_listener(routing_key: str, person):
+    async def _(routing_key: str, person):
         nonlocal callcount, retrieved_routing_key, retrieved_argument
         callcount += 1
         retrieved_routing_key = routing_key
@@ -257,7 +257,7 @@ async def test_retry(
     retrieved_argument = None
 
     @listen("routing_key")
-    async def test_listener(person):
+    async def _(person):
         nonlocal callcount, retrieved_argument
         callcount += 1
         if callcount < 3:
@@ -292,7 +292,7 @@ async def test_no_retry_with_setup(
     retrieved_argument = None
 
     @listen("routing_key")
-    async def test_listener(person):
+    async def _(person):
         nonlocal callcount, retrieved_argument
         callcount += 1
         if callcount < 3:
@@ -326,7 +326,7 @@ async def test_no_retry_with_listen(
     retrieved_argument = None
 
     @listen("routing_key", retry_on_error=False)
-    async def test_listener(person):
+    async def _(person):
         nonlocal callcount, retrieved_argument
         callcount += 1
         if callcount < 3:
@@ -361,7 +361,7 @@ async def test_force_retry_with_setup(
     retrieved_argument = None
 
     @listen("routing_key")
-    async def test_listener(person):
+    async def _(person):
         nonlocal callcount, retrieved_argument
         callcount += 1
         if callcount < 3:
@@ -395,7 +395,7 @@ async def test_force_retry_with_listen(
     retrieved_argument = None
 
     @listen("routing_key", retry_on_error=False)
-    async def test_listener(person):
+    async def _(person):
         nonlocal callcount, retrieved_argument
         callcount += 1
         if callcount < 3:
@@ -421,7 +421,7 @@ async def test_force_retry_with_listen(
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def emit_and_consume_binary(
+async def test_emit_and_consume_binary(
     listen: ListenType, emit: EmitType, outbox: Outbox, session: AsyncSession
 ) -> None:
     # setup
@@ -429,7 +429,7 @@ async def emit_and_consume_binary(
     retrieved_argument = None
 
     @listen("routing_key")
-    async def test_listener(person: bytes):
+    async def _(person: bytes):
         nonlocal callcount, retrieved_argument
         callcount += 1
         retrieved_argument = person
@@ -451,3 +451,32 @@ async def emit_and_consume_binary(
     assert callcount == 1
     assert retrieved_argument == "hεllo".encode()
     assert retrieved_argument is not None and len(retrieved_argument) == 6
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_dead_letter(
+    listen: ListenType, emit: EmitType, session: AsyncSession, outbox: Outbox
+):
+    @listen("routing_key", queue_name="test_queue_name")
+    async def _(person):
+        raise Reject("test")
+
+    emit(session, "routing_key", {})
+    await session.commit()
+
+    async def _message_relay():
+        await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
+        await outbox.message_relay()
+
+    # test
+    try:
+        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.1)
+    except asyncio.TimeoutError:
+        pass
+
+    # get queue info
+    connection = await outbox._get_rmq_connection()
+    assert connection is not None
+    channel = await connection.channel()
+    dlq = await channel.get_queue("dlq_test_queue_name")
+    assert dlq.declaration_result.message_count == 1
