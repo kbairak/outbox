@@ -31,7 +31,7 @@ async def main():
         await outbox.worker()
     elif len(sys.argv) == 1:
         async with AsyncSession(db_engine) as session:
-            emit(session, "foo", {})
+            emit(session, "foo", {}, eta=4)
             await session.commit()
     else:
         raise ValueError("Usage: python main.py [message_relay|worker]")

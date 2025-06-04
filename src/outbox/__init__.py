@@ -30,6 +30,7 @@ class OutboxTable(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    send_after: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
     sent_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
     expiration: Mapped[datetime.timedelta | None] = mapped_column()
 
@@ -127,7 +128,13 @@ class Outbox:
         return self._rmq_connection
 
     def emit(
-        self, session: AsyncSession, routing_key: str, body: Any, *, expiration: DateType = None
+        self,
+        session: AsyncSession,
+        routing_key: str,
+        body: Any,
+        *,
+        expiration: DateType = None,
+        eta: DateType | None = None,
     ) -> None:
         if isinstance(body, BaseModel):
             body = body.model_dump_json().encode()
@@ -135,10 +142,19 @@ class Outbox:
             body = json.dumps(body).encode()
 
         outbox_row = OutboxTable(routing_key=routing_key, body=body)
+
         if expiration is not None:
             milliseconds = encode_expiration(expiration)
             assert milliseconds is not None
             outbox_row.expiration = datetime.timedelta(milliseconds=int(milliseconds))
+        if eta is not None:
+            milliseconds = encode_expiration(eta)
+            assert milliseconds is not None
+            outbox_row.send_after = datetime.datetime.now(datetime.UTC) + datetime.timedelta(
+                milliseconds=int(milliseconds)
+            )
+        else:
+            outbox_row.send_after = datetime.datetime.now(datetime.UTC)
         session.add(outbox_row)
 
         logger.debug(f"Emitted message to outbox: {routing_key=}, {body=}")
@@ -162,7 +178,10 @@ class Outbox:
                     logger.debug("Checking for unsent messages...")
                     stmt = (
                         select(OutboxTable)
-                        .where(OutboxTable.sent_at.is_(None))
+                        .where(
+                            OutboxTable.sent_at.is_(None),
+                            OutboxTable.send_after <= datetime.datetime.now(datetime.UTC),
+                        )
                         .order_by(OutboxTable.created_at)
                         .limit(1)
                         .with_for_update(skip_locked=True)

@@ -124,8 +124,6 @@ async def on_user_event(routing_key: str, user):
     # <<< {"id": 123, "username": "johndoe"}
 ```
 
-```python
-
 </details>
 
 <details>
@@ -257,6 +255,24 @@ The names of the dead-letter queues are the same as their respective counterpart
 </details>
 
 <details>
+    <summary>Delayed execution</summary>
+
+You can cause an event to be sent some time in the future by setting the `eta` argument during `emit`:
+
+```python
+async with AsyncSession(db_engine) as session:
+    emit(
+        session,
+        "user.created",
+        {"id": 123, "username": "johndoe"},
+        eta=datetime.datetime.now() + datetime.timedelta(minutes=5),
+    )
+    await session.commit()
+```
+
+</details>
+
+<details>
     <summary>Singleton vs multiple instances</summary>
 
 This library has been implemented in such a way that you can run single or multiple outbox setups. Most use-cases will use the singleton approach:
@@ -318,11 +334,10 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ## TODOs
 
-- Clean up outbox table
 - Use pg notify/listen to avoid polling the database
+- Clean up outbox table
 - Use msgpack (optionally) to reduce size
 - Dependency injection on listen
 - Don't retry immediately, implement a backoff strategy
-- Add ETA to emit (should be easy thanks to the message relay)
 - Find a way to distribute multiple workers
 - Cold shutdown
