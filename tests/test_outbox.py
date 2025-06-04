@@ -57,7 +57,7 @@ async def test_emit(outbox_setup: None, session: AsyncSession) -> None:
     messages = (await session.execute(select(outbox.OutboxTable))).scalars().all()
     assert len(messages) == 1
     assert messages[0].routing_key == "test_routing_key"
-    assert messages[0].body == '"test_body"'
+    assert messages[0].body == b'"test_body"'
     assert messages[0].created_at is not None
     assert messages[0].sent_at is None
 
@@ -441,3 +441,34 @@ async def test_force_no_retry_with_listen(outbox_setup: None, session: AsyncSess
     # assert
     assert callcount == 1
     assert retrieved_argument is None
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def emit_and_consume_binary(outbox_setup: None, session: AsyncSession) -> None:
+    # setup
+    callcount = 0
+    retrieved_argument = None
+
+    @listen("routing_key")
+    async def test_listener(person: bytes):
+        nonlocal callcount, retrieved_argument
+        callcount += 1
+        retrieved_argument = person
+
+    emit(session, "routing_key", "hεllo".encode())
+    await session.commit()
+
+    async def _message_relay():
+        await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
+        await message_relay()
+
+    # test
+    try:
+        await asyncio.wait_for(asyncio.gather(_message_relay(), worker()), timeout=0.1)
+    except asyncio.TimeoutError:
+        pass
+
+    # assert
+    assert callcount == 1
+    assert retrieved_argument == "hεllo".encode()
+    assert retrieved_argument is not None and len(retrieved_argument) == 6

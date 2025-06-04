@@ -29,6 +29,9 @@ jobs:
       - name: Add uv to PATH
         run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
+      - name: uv sync
+        run: uv sync
+
       - name: Run checks
         run: uv run ruff format && uv run ruff check
 

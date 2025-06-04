@@ -25,11 +25,15 @@ class OutboxTable(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     routing_key: Mapped[str] = mapped_column(Text)
-    body: Mapped[str] = mapped_column(Text)
+    body: Mapped[bytes] = mapped_column()
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
     sent_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+
+    def __repr__(self):
+        routing_key, body = self.routing_key, self.body.decode()
+        return f"OutboxTable({routing_key=}, {body=})"
 
 
 class Retry(Exception):
@@ -113,9 +117,9 @@ class Outbox:
 
     def emit(self, session: AsyncSession, routing_key: str, body: Any) -> None:
         if isinstance(body, BaseModel):
-            body = body.model_dump_json()
-        else:
-            body = json.dumps(body)
+            body = body.model_dump_json().encode()
+        elif not isinstance(body, bytes):
+            body = json.dumps(body).encode()
 
         session.add(OutboxTable(routing_key=routing_key, body=body))
 
@@ -153,7 +157,7 @@ class Outbox:
                         message.sent_at = datetime.datetime.now(datetime.UTC)
                         await exchange.publish(
                             aio_pika.Message(
-                                message.body.encode(),
+                                message.body,
                                 content_type="application/json",
                                 expiration=self.expiration,
                             ),
@@ -204,8 +208,11 @@ class Outbox:
                     kwargs = {}
                     if issubclass(annotation, BaseModel):
                         kwargs[body_arg] = annotation.model_validate_json(message.body)
+                    elif issubclass(annotation, bytes):
+                        kwargs[body_arg] = message.body
                     else:
                         kwargs[body_arg] = json.loads(message.body)
+
                     if routing_key_arg is not None:
                         kwargs[routing_key_arg] = message.routing_key
                     await func(**kwargs)

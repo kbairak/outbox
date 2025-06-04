@@ -217,12 +217,11 @@ The names of the dead-letter queues are the same as their respective counterpart
 
 ## TODOs
 
+- Add expiration to `emit` and `listen`
 - Clean up outbox table
 - Use pg notify/listen to avoid polling the database
 - Use msgpack (optionally) to reduce size
-- Support binary payloads (without base64)
 - Dependency injection on listen
-- Add expiration to `emit` and `listen`
 - Don't retry immediately, implement a backoff strategy
 - Turn setup sync, rmq connection can be lazily created using an async private method
 - Pass `routing_key` to listener function by argument name, not type
