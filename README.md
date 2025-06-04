@@ -77,7 +77,8 @@ asyncio.run(worker())
 
 ## Features
 
-### Emit inside database transaction
+<details>
+    <summary>Emit inside database transaction</summary>
 
 You can (should) call `emit` inside a database transaction. This way, data creation and triggering of side-effects will either succeed together or fail together.
 
@@ -88,7 +89,10 @@ async with AsyncSession(db_engine) as session, session.begin():
     # commit not needed because of `session.begin()`
 ```
 
-### Topic exchange and wildcard matching
+</details>
+
+<details>
+    <summary>Topic exchange and wildcard matching</summary>
 
 ```python
 # Main application
@@ -103,7 +107,10 @@ async def on_user_event(user):
     # <<< {"id": 123, "username": "johndoe"}
 ```
 
-### Automatic (de)serialization of Pydantic models
+</details>
+
+<details>
+    <summary>Automatic (de)serialization of Pydantic models</summary>
 
 ```python
 class User(BaseModel):
@@ -122,7 +129,10 @@ async def on_user_created(user: User):  # inspects type annotation
     # <<< User(id=123, username="johndoe")
 ```
 
-### Retries
+</details>
+
+<details>
+    <summary>Retries</summary>
 
 In most cases, an exception in an event handler will cause a retry:
 
@@ -148,17 +158,15 @@ async def on_user_created(user: User):
     ...
 ```
 
-Regardless of the default behavior, you can force a retry or a non-retry by raising `Retry` or `Abort` exceptions, respectively:
+Regardless of the default behavior, you can force a retry by raising the `Retry` exception:
 
 ```python
-from outbox import Retry, Abort, listen
+from outbox import Retry, listen
 
 @listen("user.created")
 def on_user_created(user: User):
     if user.id == 123:
         raise Retry("This is a test error, retrying")
-    elif user.id == 456:
-        raise Abort("This is a test error, aborting")
     print(user)
 ```
 
@@ -174,7 +182,10 @@ def on_user_created(user: User):
     print(user)
 ```
 
-### Dead-lettering
+</details>
+
+<details>
+    <summary>Dead-lettering</summary>
 
 ```mermaid
 flowchart LR
@@ -211,8 +222,10 @@ setup(
 ```
 
 The names of the dead-letter queues are the same as their respective counterparts, prefixed with `dlq_`.
+</details>
 
-### Singleton vs multiple instances
+<details>
+    <summary>Singleton vs multiple instances</summary>
 
 This library has been implemented in such a way that you can run single or multiple outbox setups. Most use-cases will use the singleton approach:
 
@@ -269,6 +282,7 @@ asyncio.run(main())
 ```
 
 The whole approach is explained [in this blog post](https://www.kbairak.net/programming/python/2020/09/16/global-singleton-vs-instance-for-libraries.html).
+</details>
 
 ## TODOs
 
@@ -279,3 +293,5 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 - Dependency injection on listen
 - Don't retry immediately, implement a backoff strategy
 - Pass `routing_key` to listener function by argument name, not type
+- Add ETA to emit (should be easy thanks to the message relay)
+- Find a way to distribute multiple workers

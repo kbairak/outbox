@@ -40,10 +40,6 @@ class Retry(Exception):
     pass
 
 
-class Abort(Exception):
-    pass
-
-
 class Reject(Exception):
     pass
 
@@ -75,7 +71,7 @@ class Outbox:
         poll_interval: float | None = None,
         retry_on_error: bool | None = None,
         expiration: DateType | None = None,
-    ):
+    ) -> None:
         if db_engine is not None and db_engine_url is not None:
             raise ValueError("You cannot set both db_engine and db_engine_url")
         if rmq_connection is not None and rmq_connection_url is not None:
@@ -138,7 +134,7 @@ class Outbox:
 
         logger.debug(f"Emitted message to outbox: {routing_key=}, {body=}")
 
-    async def message_relay(self):
+    async def message_relay(self) -> None:
         db_engine = await self._get_db_engine()
         if db_engine is None:
             raise ValueError("Database engine is not set up.")
@@ -238,12 +234,6 @@ class Outbox:
                         f"{message.body=}"
                     )
                     await message.nack(requeue=True)
-                except Abort:
-                    logger.info(
-                        f"Aborting (forced): {message.message_id=}, {message.routing_key=}, "
-                        f"{message.body=}"
-                    )
-                    await message.ack()
                 except Reject:
                     logger.info(
                         "Rejecting, this message will likely end up in DLX: "
@@ -270,7 +260,7 @@ class Outbox:
 
         return decorator
 
-    async def worker(self):
+    async def worker(self) -> None:
         rmq_connection = await self._get_rmq_connection()
         if rmq_connection is None:
             raise ValueError("RabbitMQ connection is not set up.")

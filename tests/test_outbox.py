@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from testcontainers.rabbitmq import RabbitMqContainer
 
-from outbox import Abort, Outbox, OutboxTable, Retry
+from outbox import Outbox, OutboxTable, Retry
 
 
 class Person(BaseModel):
@@ -44,7 +44,7 @@ async def rmq_connection():
 @pytest_asyncio.fixture(loop_scope="session")
 async def outbox(db_engine: AsyncEngine, rmq_connection: AbstractConnection) -> Outbox:
     outbox = Outbox(db_engine=db_engine, rmq_connection=rmq_connection)
-    await outbox._get_db_engine()
+    await outbox._get_db_engine()  # Force table setup
     return outbox
 
 
@@ -387,40 +387,6 @@ async def test_force_retry_with_setup(
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_force_no_retry_with_setup(
-    listen: ListenType, emit: EmitType, outbox: Outbox, session: AsyncSession
-) -> None:
-    # setup
-    callcount = 0
-    retrieved_argument = None
-
-    @listen("routing_key")
-    async def test_listener(person):
-        nonlocal callcount, retrieved_argument
-        callcount += 1
-        if callcount < 3:
-            raise Abort("Simulated failure")
-        retrieved_argument = person
-
-    emit(session, "routing_key", {"name": "MyName"})
-    await session.commit()
-
-    async def _message_relay():
-        await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
-        await outbox.message_relay()
-
-    # test
-    try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.1)
-    except asyncio.TimeoutError:
-        pass
-
-    # assert
-    assert callcount == 1
-    assert retrieved_argument is None
-
-
-@pytest.mark.asyncio(loop_scope="session")
 async def test_force_retry_with_listen(
     listen: ListenType, emit: EmitType, outbox: Outbox, session: AsyncSession
 ) -> None:
@@ -452,40 +418,6 @@ async def test_force_retry_with_listen(
     # assert
     assert callcount == 3
     assert retrieved_argument == {"name": "MyName"}
-
-
-@pytest.mark.asyncio(loop_scope="session")
-async def test_force_no_retry_with_listen(
-    listen: ListenType, emit: EmitType, outbox: Outbox, session: AsyncSession
-) -> None:
-    # setup
-    callcount = 0
-    retrieved_argument = None
-
-    @listen("routing_key", retry_on_error=True)
-    async def test_listener(person):
-        nonlocal callcount, retrieved_argument
-        callcount += 1
-        if callcount < 3:
-            raise Abort("Simulated failure")
-        retrieved_argument = person
-
-    emit(session, "routing_key", {"name": "MyName"})
-    await session.commit()
-
-    async def _message_relay():
-        await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
-        await outbox.message_relay()
-
-    # test
-    try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.1)
-    except asyncio.TimeoutError:
-        pass
-
-    # assert
-    assert callcount == 1
-    assert retrieved_argument is None
 
 
 @pytest.mark.asyncio(loop_scope="session")
