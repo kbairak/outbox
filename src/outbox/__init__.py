@@ -49,17 +49,22 @@ class Reject(Exception):
 
 
 class Outbox:
-    def __init__(self):
-        self.db_engine: AsyncEngine | None = None
-        self.rmq_connection: AbstractConnection | None = None
+    def __init__(self, **kwargs):
+        self._db_engine: AsyncEngine | None = None
+        self._rmq_connection: AbstractConnection | None = None
+        self._rmq_connection_url: str | None = None
         self.exchange_name = "outbox_exchange"
         self.poll_interval = 1.0
         self.retry_on_error = True
         self.expiration = None
         OutboxTable.__tablename__ = "outbox_table"
-        self._reset_listeners()
 
-    async def setup(
+        self._listeners = {}
+        self._table_created = False
+
+        self.setup(**kwargs)
+
+    def setup(
         self,
         db_engine: AsyncEngine | None = None,
         db_engine_url: str | None = None,
@@ -73,29 +78,24 @@ class Outbox:
     ):
         if db_engine is not None and db_engine_url is not None:
             raise ValueError("You cannot set both db_engine and db_engine_url")
+        if rmq_connection is not None and rmq_connection_url is not None:
+            raise ValueError("You cannot set both rmq_connection and rmq_connection_url")
+
         if db_engine is not None:
-            self.db_engine = db_engine
+            self._db_engine = db_engine
             logger.debug("Set up DB engine")
         if db_engine_url is not None:
-            self.db_engine = create_async_engine(db_engine_url)
+            self._db_engine = create_async_engine(db_engine_url)
             logger.debug("Set up DB engine")
 
         if table_name is not None:
             OutboxTable.__tablename__ = table_name
 
-        if self.db_engine:
-            async with self.db_engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
-            logger.debug("Created outbox table in the database")
-
-        if rmq_connection is not None and rmq_connection_url is not None:
-            raise ValueError("You cannot set both rmq_connection and rmq_connection_url")
         if rmq_connection is not None:
-            self.rmq_connection = rmq_connection
+            self._rmq_connection = rmq_connection
             logger.debug("Set up RMQ connection")
         if rmq_connection_url is not None:
-            self.rmq_connection = await aio_pika.connect(rmq_connection_url)
-            logger.debug("Set up RMQ connection")
+            self._rmq_connection_url = rmq_connection_url
 
         if exchange_name is not None:
             self.exchange_name = exchange_name
@@ -112,8 +112,21 @@ class Outbox:
         if expiration is not None:
             self.expiration = expiration
 
-    def _reset_listeners(self):
-        self.listeners = {}
+    async def _get_db_engine(self) -> AsyncEngine | None:
+        if not self._table_created and self._db_engine:
+            async with self._db_engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            self._table_created = True
+            logger.debug("Created outbox table in the database")
+        return self._db_engine
+
+    async def _get_rmq_connection(self) -> AbstractConnection | None:
+        if self._rmq_connection is not None:
+            return self._rmq_connection
+        if self._rmq_connection_url is not None:
+            self._rmq_connection = await aio_pika.connect(self._rmq_connection_url)
+            logger.debug("Set up RMQ connection")
+        return self._rmq_connection
 
     def emit(self, session: AsyncSession, routing_key: str, body: Any) -> None:
         if isinstance(body, BaseModel):
@@ -126,19 +139,21 @@ class Outbox:
         logger.debug(f"Emitted message to outbox: {routing_key=}, {body=}")
 
     async def message_relay(self):
-        if self.db_engine is None:
+        db_engine = await self._get_db_engine()
+        if db_engine is None:
             raise ValueError("Database engine is not set up.")
-        if self.rmq_connection is None:
+        rmq_connection = await self._get_rmq_connection()
+        if rmq_connection is None:
             raise ValueError("RabbitMQ connection is not set up.")
 
         logger.info(f"Starting message relay on exchange: {self.exchange_name} ...")
-        channel = await self.rmq_connection.channel()
+        channel = await rmq_connection.channel()
         exchange = await channel.declare_exchange(
             self.exchange_name, aio_pika.ExchangeType.TOPIC, durable=True
         )
         while True:
             while True:
-                async with AsyncSession(self.db_engine) as session, session.begin():
+                async with AsyncSession(db_engine) as session, session.begin():
                     logger.debug("Checking for unsent messages...")
                     stmt = (
                         select(OutboxTable)
@@ -202,7 +217,8 @@ class Outbox:
 
             async def _on_message(message: AbstractIncomingMessage) -> None:
                 logger.debug(
-                    f"Received message: {message=}, {message.routing_key=}, {message.body=}"
+                    f"Received message: {message.message_id=}, {message.routing_key=}, "
+                    f"{message.body=}"
                 )
                 try:
                     kwargs = {}
@@ -218,23 +234,25 @@ class Outbox:
                     await func(**kwargs)
                 except Retry:
                     logger.info(
-                        f"Retrying (forced): {message=}, {message.routing_key=}, {message.body=}"
+                        f"Retrying (forced): {message.message_id=}, {message.routing_key=}, "
+                        f"{message.body=}"
                     )
                     await message.nack(requeue=True)
                 except Abort:
                     logger.info(
-                        f"Aborting (forced): {message=}, {message.routing_key=}, {message.body=}"
+                        f"Aborting (forced): {message.message_id=}, {message.routing_key=}, "
+                        f"{message.body=}"
                     )
                     await message.ack()
                 except Reject:
                     logger.info(
-                        f"Rejecting, this message will likely end up in DLX: {message=}, "
-                        f"{message.routing_key=}, {message.body=}"
+                        "Rejecting, this message will likely end up in DLX: "
+                        f"{message.message_id=}, {message.routing_key=}, {message.body=}"
                     )
                     await message.nack(requeue=False)
                 except Exception:
                     logger.info(
-                        f"{'Retrying' if retry_on_error else 'Aborting'}: {message=}, "
+                        f"{'Retrying' if retry_on_error else 'Aborting'}: {message.message_id=}, "
                         f"{message.routing_key=}, {message.body=}"
                     )
                     if retry_on_error:
@@ -243,26 +261,29 @@ class Outbox:
                         await message.ack()
                 else:
                     await message.ack()
-                    logger.info(f"Sucess: {message=}, {message.routing_key=}, {message.body=}")
+                    logger.info(
+                        f"Sucess: {message.message_id=}, {message.routing_key=}, {message.body=}"
+                    )
 
             logger.debug(f"Registering listener for {binding_key=}: {func=}")
-            self.listeners.setdefault(binding_key, []).append((queue_name, _on_message))
+            self._listeners.setdefault(binding_key, []).append((queue_name, _on_message))
 
         return decorator
 
     async def worker(self):
-        if self.rmq_connection is None:
+        rmq_connection = await self._get_rmq_connection()
+        if rmq_connection is None:
             raise ValueError("RabbitMQ connection is not set up.")
 
         logger.info(f"Starting worker on exchange: {self.exchange_name} ...")
-        channel = await self.rmq_connection.channel()
+        channel = await rmq_connection.channel()
         exchange = await channel.declare_exchange(
             self.exchange_name, aio_pika.ExchangeType.TOPIC, durable=True
         )
         dead_letter_exchange = await channel.declare_exchange(
             f"dlx_{self.exchange_name}", aio_pika.ExchangeType.DIRECT, durable=True
         )
-        for binding_key, handlers in self.listeners.items():
+        for binding_key, handlers in self._listeners.items():
             for queue_name, handler in handlers:
                 dead_letter_queue = await channel.declare_queue(f"dlx_{queue_name}", durable=True)
                 await dead_letter_queue.bind(dead_letter_exchange, queue_name)

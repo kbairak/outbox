@@ -31,10 +31,9 @@ from outbox import setup, emit
 from sqlalchemy.ext.asyncio import create_async_engine
 
 db_engine = create_async_engine("postgresql+asyncpg://user:password@localhost/dbname")
+setup(db_engine=db_engine)
 
 async def main():
-    await setup(db_engine=db_engine)
-
     async with AsyncSession(db_engine) as session:
         emit(session, "user.created", {"id": 123, "username": "johndoe"})
         await session.commit()
@@ -51,14 +50,12 @@ import asyncio
 
 from outbox import setup, message_relay
 
-async def main():
-    await setup(
-        db_engine_url="postgresql+asyncpg://user:password@localhost/dbname",
-        rabbitmq_url="amqp://user:password@localhost:5672/",
-    )
-    await message_relay()
+setup(
+    db_engine_url="postgresql+asyncpg://user:password@localhost/dbname",
+    rabbitmq_url="amqp://user:password@localhost:5672/",
+)
 
-asyncio.run(main())
+asyncio.run(message_relay())
 ```
 
 ### Worker process
@@ -68,16 +65,14 @@ import asyncio
 
 from outbox import setup, listen, worker
 
+setup(rabbitmq_url="amqp://user:password@localhost:5672/")
+
 @listen("user.created")
 async def on_user_created(user):
     print(user)
     # <<< {"id": 123, "username": "johndoe"}
 
-async def main():
-    await setup(rabbitmq_url="amqp://user:password@localhost:5672/")
-    await worker()
-
-asyncio.run(main())
+asyncio.run(worker())
 ```
 
 ## Features
@@ -99,6 +94,7 @@ async with AsyncSession(db_engine) as session, session.begin():
 # Main application
 async with AsyncSession(db_engine) as session:
     emit(session, "user.created", {"id": 123, "username": "johndoe"})
+    await session.commit()
 
 # Worker process
 @listen("user.*")
@@ -117,6 +113,7 @@ class User(BaseModel):
 # Main application
 async with AsyncSession(db_engine) as session:
     emit(session, "user.created", User(id=123, username="johndoe"))
+    await session.commit()
 
 # Worker process
 @listen("user.created")
@@ -140,7 +137,7 @@ async def on_user_created(user: User):
 You can disable this behavior by passing `retry_on_error=False` during setup:
 
 ```python
-await setup(..., retry_on_error=False)
+setup(..., retry_on_error=False)
 ```
 
 Or during `listen`:
@@ -206,14 +203,72 @@ A Dead-letter exchange and one dead-letter queue per regular queue are created a
 Apart from raising `Reject`, another way to cause messages to be rejected is to set an `expiration` on the outbox instance. If the message isn't acknowledged by the worker within its expiration time (this can happen because of retries), it will enter the dead-letter exchange and queues:
 
 ```python
-await setup(
-    db_engine_url="...",
-    rabbitmq_url="...",
+setup(
+    db_engine_url="postgresql+asyncpg://user:password@localhost/dbname",
+    rabbitmq_url="amqp://user:password@localhost:5672/",
     expiration=datetime.timedelta(minutes=5),
 )
 ```
 
 The names of the dead-letter queues are the same as their respective counterparts, prefixed with `dlq_`.
+
+### Singleton vs multiple instances
+
+This library has been implemented in such a way that you can run single or multiple outbox setups. Most use-cases will use the singleton approach:
+
+```python
+from outbox import setup, emit
+
+db_engine = create_async_engine("postgresql+asyncpg://user:password@localhost/dbname")
+setup(db_engine=db_engine)
+
+async def main():
+    async with AsyncSession(db_engine) as session:
+        emit(session, "user.created", {"id": 123, "username": "johndoe"})
+        await session.commit()
+
+asyncio.run(main())
+```
+
+or
+
+```python
+from outbox import outbox
+
+db_engine = create_async_engine("postgresql+asyncpg://user:password@localhost/dbname")
+outbox.setup(db_engine=db_engine)
+
+async def main():
+    async with AsyncSession(db_engine) as session:
+        outbox.emit(session, "user.created", {"id": 123, "username": "johndoe"})
+        await session.commit()
+
+asyncio.run(main())
+```
+
+You can, however, setup multiple instances:
+
+```python
+from outbox import Outbox
+
+db_engine1 = create_async_engine("postgresql+asyncpg://user:password@localhost/dbname1")
+db_engine2 = create_async_engine("postgresql+asyncpg://user:password@localhost/dbname2")
+
+outbox1 = Outbox(db_engine=db_engine1)
+outbox2 = Outbox(db_engine=db_engine2)
+
+async def main():
+    async with AsyncSession(db_engine1) as session:
+        outbox1.emit(session, "user.created", {"id": 123, "username": "johndoe"})
+        await session.commit()
+    async with AsyncSession(db_engine2) as session:
+        outbox2.emit(session, "user.created", {"id": 456, "username": "maryjane"})
+        await session.commit()
+
+asyncio.run(main())
+```
+
+The whole approach is explained [in this blog post](https://www.kbairak.net/programming/python/2020/09/16/global-singleton-vs-instance-for-libraries.html).
 
 ## TODOs
 
@@ -223,5 +278,4 @@ The names of the dead-letter queues are the same as their respective counterpart
 - Use msgpack (optionally) to reduce size
 - Dependency injection on listen
 - Don't retry immediately, implement a backoff strategy
-- Turn setup sync, rmq connection can be lazily created using an async private method
 - Pass `routing_key` to listener function by argument name, not type

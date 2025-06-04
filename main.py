@@ -12,6 +12,11 @@ logging.basicConfig(level=logging.INFO)
 logging.getLogger("outbox").setLevel(logging.DEBUG)
 
 db_engine = create_async_engine("postgresql+asyncpg://postgres:postgres@localhost:5432/postgres")
+outbox.setup(
+    db_engine=db_engine,
+    rmq_connection_url="amqp://guest:guest@localhost:5672/",
+    expiration=datetime.timedelta(seconds=5),
+)
 
 
 @listen("foo")
@@ -20,11 +25,6 @@ async def foo(obj):
 
 
 async def main():
-    await outbox.setup(
-        db_engine=db_engine,
-        rmq_connection_url="amqp://guest:guest@localhost:5672/",
-        expiration=datetime.timedelta(seconds=5),
-    )
     if len(sys.argv) == 2 and sys.argv[1] == "message_relay":
         await outbox.message_relay()
     elif len(sys.argv) == 2 and sys.argv[1] == "worker":

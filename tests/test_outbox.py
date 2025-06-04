@@ -1,6 +1,6 @@
 import asyncio
 import json
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator, Callable, Coroutine, Protocol
 from unittest.mock import AsyncMock
 
 import aio_pika
@@ -12,8 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from testcontainers.rabbitmq import RabbitMqContainer
 
-import outbox
-from outbox import emit, listen, message_relay, setup, worker
+from outbox import Abort, Outbox, OutboxTable, Retry
 
 
 class Person(BaseModel):
@@ -43,18 +42,38 @@ async def rmq_connection():
 
 
 @pytest_asyncio.fixture(loop_scope="session")
-async def outbox_setup(db_engine: AsyncEngine, rmq_connection: AbstractConnection) -> None:
-    outbox.outbox._reset_listeners()  # Reset listeners before setup
-    await setup(db_engine=db_engine, rmq_connection=rmq_connection)
+async def outbox(db_engine: AsyncEngine, rmq_connection: AbstractConnection) -> Outbox:
+    outbox = Outbox(db_engine=db_engine, rmq_connection=rmq_connection)
+    await outbox._get_db_engine()
+    return outbox
+
+
+EmitType = Callable[[AsyncSession, str, Any], None]
+
+
+@pytest.fixture
+def emit(outbox: Outbox) -> EmitType:
+    return outbox.emit
+
+
+class ListenType(Protocol):
+    def __call__(
+        self, binding_key: str, queue_name: str | None = None, retry_on_error: bool | None = None
+    ) -> Callable[[Callable[..., Coroutine[None, None, None]]], None]: ...
+
+
+@pytest.fixture
+def listen(outbox: Outbox) -> ListenType:
+    return outbox.listen
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_emit(outbox_setup: None, session: AsyncSession) -> None:
+async def test_emit(emit: EmitType, session: AsyncSession) -> None:
     # test
     emit(session, "test_routing_key", "test_body")
 
     # assert
-    messages = (await session.execute(select(outbox.OutboxTable))).scalars().all()
+    messages = (await session.execute(select(OutboxTable))).scalars().all()
     assert len(messages) == 1
     assert messages[0].routing_key == "test_routing_key"
     assert messages[0].body == b'"test_body"'
@@ -63,12 +82,12 @@ async def test_emit(outbox_setup: None, session: AsyncSession) -> None:
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_emit_with_pydantic(outbox_setup: None, session: AsyncSession) -> None:
+async def test_emit_with_pydantic(emit: EmitType, session: AsyncSession) -> None:
     # test
     emit(session, "my_routing_key", Person(name="MyName"))
 
     # assert
-    messages = (await session.execute(select(outbox.OutboxTable))).scalars().all()
+    messages = (await session.execute(select(OutboxTable))).scalars().all()
     assert len(messages) == 1
     assert messages[0].routing_key == "my_routing_key"
     assert json.loads(messages[0].body) == {"name": "MyName"}
@@ -78,12 +97,18 @@ async def test_emit_with_pydantic(outbox_setup: None, session: AsyncSession) -> 
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_message_relay(
-    outbox_setup: None, monkeypatch: pytest.MonkeyPatch, session: AsyncSession
+    emit: EmitType,
+    outbox: Outbox,
+    monkeypatch: pytest.MonkeyPatch,
+    session: AsyncSession,
 ) -> None:
     # arrange
-    monkeypatch.setattr(
-        outbox.outbox, "rmq_connection", (rmq_connection_mock := AsyncMock(name="rmq_connection"))
-    )
+    rmq_connection_mock = AsyncMock(name="rmq_connection")
+
+    async def _get_rmq_connection():
+        return rmq_connection_mock
+
+    monkeypatch.setattr(outbox, "_get_rmq_connection", _get_rmq_connection)
     rmq_connection_mock.channel.return_value = (channel_mock := AsyncMock(name="channel"))
     channel_mock.declare_exchange.return_value = (exchange_mock := AsyncMock(name="exchange"))
 
@@ -92,7 +117,7 @@ async def test_message_relay(
 
     # test
     try:
-        await asyncio.wait_for(message_relay(), timeout=0.1)
+        await asyncio.wait_for(outbox.message_relay(), timeout=0.1)
     except asyncio.TimeoutError:
         pass
 
@@ -107,25 +132,27 @@ async def test_message_relay(
     assert actual_message.body_size == 11
     assert actual_message.content_type == "application/json"
 
-    message = (await session.execute(select(outbox.OutboxTable))).scalars().one()
+    message = (await session.execute(select(OutboxTable))).scalars().one()
     assert message.sent_at is not None
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_regiter_listener(outbox_setup: None) -> None:
+async def test_regiter_listener(listen: ListenType, outbox: Outbox) -> None:
     # test
     @listen("routing_key")
     async def test_listener(person):
         pass
 
     # assert
-    assert list(outbox.outbox.listeners.keys()) == ["routing_key"]
-    assert len(list(outbox.outbox.listeners.values())[0]) == 1
-    assert "test_listener" in list(outbox.outbox.listeners.values())[0][0][0]
+    assert list(outbox._listeners.keys()) == ["routing_key"]
+    assert len(list(outbox._listeners.values())[0]) == 1
+    assert "test_listener" in list(outbox._listeners.values())[0][0][0]
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_worker(outbox_setup: None, session: AsyncSession) -> None:
+async def test_worker(
+    listen: ListenType, emit: EmitType, session: AsyncSession, outbox: Outbox
+) -> None:
     # setup
     callcount = 0
     retrieved_argument = None
@@ -141,11 +168,11 @@ async def test_worker(outbox_setup: None, session: AsyncSession) -> None:
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
-        await message_relay()
+        await outbox.message_relay()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), worker()), timeout=0.1)
+        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.1)
     except asyncio.TimeoutError:
         pass
 
@@ -155,7 +182,9 @@ async def test_worker(outbox_setup: None, session: AsyncSession) -> None:
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_worker_with_pydantic(outbox_setup: None, session: AsyncSession) -> None:
+async def test_worker_with_pydantic(
+    listen: ListenType, emit: EmitType, session: AsyncSession, outbox: Outbox
+) -> None:
     # setup
     callcount = 0
     retrieved_argument = None
@@ -171,11 +200,11 @@ async def test_worker_with_pydantic(outbox_setup: None, session: AsyncSession) -
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
-        await message_relay()
+        await outbox.message_relay()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), worker()), timeout=0.1)
+        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.1)
     except asyncio.TimeoutError:
         pass
 
@@ -185,7 +214,9 @@ async def test_worker_with_pydantic(outbox_setup: None, session: AsyncSession) -
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_worker_with_wildcard(outbox_setup: None, session: AsyncSession) -> None:
+async def test_worker_with_wildcard(
+    listen: ListenType, emit: EmitType, outbox: Outbox, session: AsyncSession
+) -> None:
     # setup
     callcount = 0
     retrieved_argument = None
@@ -203,11 +234,11 @@ async def test_worker_with_wildcard(outbox_setup: None, session: AsyncSession) -
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
-        await message_relay()
+        await outbox.message_relay()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), worker()), timeout=0.1)
+        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.1)
     except asyncio.TimeoutError:
         pass
 
@@ -218,7 +249,9 @@ async def test_worker_with_wildcard(outbox_setup: None, session: AsyncSession) -
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_retry(outbox_setup: None, session: AsyncSession) -> None:
+async def test_retry(
+    listen: ListenType, emit: EmitType, outbox: Outbox, session: AsyncSession
+) -> None:
     # setup
     callcount = 0
     retrieved_argument = None
@@ -236,11 +269,11 @@ async def test_retry(outbox_setup: None, session: AsyncSession) -> None:
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
-        await message_relay()
+        await outbox.message_relay()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), worker()), timeout=0.1)
+        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.1)
     except asyncio.TimeoutError:
         pass
 
@@ -250,9 +283,11 @@ async def test_retry(outbox_setup: None, session: AsyncSession) -> None:
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_no_retry_with_setup(outbox_setup: None, session: AsyncSession) -> None:
+async def test_no_retry_with_setup(
+    listen: ListenType, emit: EmitType, outbox: Outbox, session: AsyncSession
+) -> None:
     # setup
-    await setup(retry_on_error=False)
+    outbox.setup(retry_on_error=False)
     callcount = 0
     retrieved_argument = None
 
@@ -269,11 +304,11 @@ async def test_no_retry_with_setup(outbox_setup: None, session: AsyncSession) ->
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
-        await message_relay()
+        await outbox.message_relay()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), worker()), timeout=0.1)
+        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.1)
     except asyncio.TimeoutError:
         pass
 
@@ -283,7 +318,9 @@ async def test_no_retry_with_setup(outbox_setup: None, session: AsyncSession) ->
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_no_retry_with_listen(outbox_setup: None, session: AsyncSession) -> None:
+async def test_no_retry_with_listen(
+    listen: ListenType, emit: EmitType, outbox: Outbox, session: AsyncSession
+) -> None:
     # setup
     callcount = 0
     retrieved_argument = None
@@ -301,11 +338,11 @@ async def test_no_retry_with_listen(outbox_setup: None, session: AsyncSession) -
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
-        await message_relay()
+        await outbox.message_relay()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), worker()), timeout=0.1)
+        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.1)
     except asyncio.TimeoutError:
         pass
 
@@ -315,9 +352,11 @@ async def test_no_retry_with_listen(outbox_setup: None, session: AsyncSession) -
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_force_retry_with_setup(outbox_setup: None, session: AsyncSession) -> None:
+async def test_force_retry_with_setup(
+    listen: ListenType, emit: EmitType, session: AsyncSession, outbox: Outbox
+) -> None:
     # setup
-    await setup(retry_on_error=False)
+    outbox.setup(retry_on_error=False)
     callcount = 0
     retrieved_argument = None
 
@@ -326,7 +365,7 @@ async def test_force_retry_with_setup(outbox_setup: None, session: AsyncSession)
         nonlocal callcount, retrieved_argument
         callcount += 1
         if callcount < 3:
-            raise outbox.Retry("Simulated failure")
+            raise Retry("Simulated failure")
         retrieved_argument = person
 
     emit(session, "routing_key", {"name": "MyName"})
@@ -334,11 +373,11 @@ async def test_force_retry_with_setup(outbox_setup: None, session: AsyncSession)
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
-        await message_relay()
+        await outbox.message_relay()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), worker()), timeout=0.1)
+        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.1)
     except asyncio.TimeoutError:
         pass
 
@@ -348,7 +387,9 @@ async def test_force_retry_with_setup(outbox_setup: None, session: AsyncSession)
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_force_no_retry_with_setup(outbox_setup: None, session: AsyncSession) -> None:
+async def test_force_no_retry_with_setup(
+    listen: ListenType, emit: EmitType, outbox: Outbox, session: AsyncSession
+) -> None:
     # setup
     callcount = 0
     retrieved_argument = None
@@ -358,7 +399,7 @@ async def test_force_no_retry_with_setup(outbox_setup: None, session: AsyncSessi
         nonlocal callcount, retrieved_argument
         callcount += 1
         if callcount < 3:
-            raise outbox.Abort("Simulated failure")
+            raise Abort("Simulated failure")
         retrieved_argument = person
 
     emit(session, "routing_key", {"name": "MyName"})
@@ -366,11 +407,11 @@ async def test_force_no_retry_with_setup(outbox_setup: None, session: AsyncSessi
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
-        await message_relay()
+        await outbox.message_relay()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), worker()), timeout=0.1)
+        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.1)
     except asyncio.TimeoutError:
         pass
 
@@ -380,7 +421,9 @@ async def test_force_no_retry_with_setup(outbox_setup: None, session: AsyncSessi
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_force_retry_with_listen(outbox_setup: None, session: AsyncSession) -> None:
+async def test_force_retry_with_listen(
+    listen: ListenType, emit: EmitType, outbox: Outbox, session: AsyncSession
+) -> None:
     # setup
     callcount = 0
     retrieved_argument = None
@@ -390,7 +433,7 @@ async def test_force_retry_with_listen(outbox_setup: None, session: AsyncSession
         nonlocal callcount, retrieved_argument
         callcount += 1
         if callcount < 3:
-            raise outbox.Retry("Simulated failure")
+            raise Retry("Simulated failure")
         retrieved_argument = person
 
     emit(session, "routing_key", {"name": "MyName"})
@@ -398,11 +441,11 @@ async def test_force_retry_with_listen(outbox_setup: None, session: AsyncSession
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
-        await message_relay()
+        await outbox.message_relay()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), worker()), timeout=0.1)
+        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.1)
     except asyncio.TimeoutError:
         pass
 
@@ -412,7 +455,9 @@ async def test_force_retry_with_listen(outbox_setup: None, session: AsyncSession
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_force_no_retry_with_listen(outbox_setup: None, session: AsyncSession) -> None:
+async def test_force_no_retry_with_listen(
+    listen: ListenType, emit: EmitType, outbox: Outbox, session: AsyncSession
+) -> None:
     # setup
     callcount = 0
     retrieved_argument = None
@@ -422,7 +467,7 @@ async def test_force_no_retry_with_listen(outbox_setup: None, session: AsyncSess
         nonlocal callcount, retrieved_argument
         callcount += 1
         if callcount < 3:
-            raise outbox.Abort("Simulated failure")
+            raise Abort("Simulated failure")
         retrieved_argument = person
 
     emit(session, "routing_key", {"name": "MyName"})
@@ -430,11 +475,11 @@ async def test_force_no_retry_with_listen(outbox_setup: None, session: AsyncSess
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
-        await message_relay()
+        await outbox.message_relay()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), worker()), timeout=0.1)
+        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.1)
     except asyncio.TimeoutError:
         pass
 
@@ -444,7 +489,9 @@ async def test_force_no_retry_with_listen(outbox_setup: None, session: AsyncSess
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def emit_and_consume_binary(outbox_setup: None, session: AsyncSession) -> None:
+async def emit_and_consume_binary(
+    listen: ListenType, emit: EmitType, outbox: Outbox, session: AsyncSession
+) -> None:
     # setup
     callcount = 0
     retrieved_argument = None
@@ -460,11 +507,11 @@ async def emit_and_consume_binary(outbox_setup: None, session: AsyncSession) -> 
 
     async def _message_relay():
         await asyncio.sleep(0.05)  # Give a small lead time for the worker to setup up the queue
-        await message_relay()
+        await outbox.message_relay()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), worker()), timeout=0.1)
+        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.1)
     except asyncio.TimeoutError:
         pass
 
