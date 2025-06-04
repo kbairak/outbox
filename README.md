@@ -273,6 +273,23 @@ async with AsyncSession(db_engine) as session:
 </details>
 
 <details>
+    <Summary>Outbox table cleanup</summary>
+
+You can choose a strategy for when already sent messages from the outbox table should be cleaned up by passing the `clean_up_after` argument during setup:
+
+```python
+setup(..., clean_up_after=datetime.timedelta(days=7))
+```
+
+The options are:
+
+- **`IMMEDIATELY` (the default)**: messages are cleaned up immediately after being sent to RabbitMQ.
+- **`NEVER`**: messages are never cleaned up, you will have to do it manually.
+- **Any `datetime.timedelta` instance**.
+
+</details>
+
+<details>
     <summary>Singleton vs multiple instances</summary>
 
 This library has been implemented in such a way that you can run single or multiple outbox setups. Most use-cases will use the singleton approach:
@@ -335,7 +352,6 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 ## TODOs
 
 - Use pg notify/listen to avoid polling the database
-- Clean up outbox table
 - Use msgpack (optionally) to reduce size
 - Dependency injection on listen
 - Don't retry immediately, implement a backoff strategy

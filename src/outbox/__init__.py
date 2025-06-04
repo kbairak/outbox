@@ -3,13 +3,13 @@ import datetime
 import inspect
 import json
 import logging
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable, Coroutine, Literal
 
 import aio_pika
-from aio_pika.abc import AbstractConnection, AbstractIncomingMessage, DateType
+from aio_pika.abc import AbstractConnection, AbstractExchange, AbstractIncomingMessage, DateType
 from aio_pika.message import encode_expiration
 from pydantic import BaseModel
-from sqlalchemy import DateTime, Interval, Text, func, select
+from sqlalchemy import DateTime, Text, delete, func, select
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -56,6 +56,7 @@ class Outbox:
         self.poll_interval = 1.0
         self.retry_on_error = True
         self.expiration = None
+        self.clean_up_after = "IMMEDIATELY"
         OutboxTable.__tablename__ = "outbox_table"
 
         self._listeners = []
@@ -74,6 +75,9 @@ class Outbox:
         poll_interval: float | None = None,
         retry_on_error: bool | None = None,
         expiration: DateType | None = None,
+        clean_up_after: (
+            Literal["IMMEDIATELY"] | Literal["NEVER"] | datetime.timedelta | None
+        ) = None,
     ) -> None:
         if db_engine is not None and db_engine_url is not None:
             raise ValueError("You cannot set both db_engine and db_engine_url")
@@ -110,6 +114,9 @@ class Outbox:
 
         if expiration is not None:
             self.expiration = expiration
+
+        if clean_up_after is not None:
+            self.clean_up_after = clean_up_after
 
     async def _get_db_engine(self) -> AsyncEngine | None:
         if not self._table_created and self._db_engine:
@@ -193,7 +200,6 @@ class Outbox:
                         break
                     else:
                         logger.debug(f"Processing message: {outbox_row}")
-                        outbox_row.sent_at = datetime.datetime.now(datetime.UTC)
                         expiration = outbox_row.expiration or self.expiration
                         await exchange.publish(
                             aio_pika.Message(
@@ -204,6 +210,17 @@ class Outbox:
                             outbox_row.routing_key,
                         )
                         logger.debug(f"Sent message: {outbox_row} to RabbitMQ")
+                        if self.clean_up_after == "IMMEDIATELY":
+                            await session.delete(outbox_row)
+                        else:
+                            outbox_row.sent_at = datetime.datetime.now(datetime.UTC)
+                        if isinstance(self.clean_up_after, datetime.timedelta):
+                            stmt = delete(OutboxTable).where(
+                                OutboxTable.sent_at.is_not(None),
+                                OutboxTable.sent_at
+                                < datetime.datetime.now(datetime.UTC) - self.clean_up_after,
+                            )
+                            await session.execute(stmt)
             await asyncio.sleep(self.poll_interval)
 
     def listen(

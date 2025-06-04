@@ -43,7 +43,7 @@ async def rmq_connection():
 
 @pytest_asyncio.fixture(loop_scope="session")
 async def outbox(db_engine: AsyncEngine, rmq_connection: AbstractConnection) -> Outbox:
-    outbox = Outbox(db_engine=db_engine, rmq_connection=rmq_connection)
+    outbox = Outbox(db_engine=db_engine, rmq_connection=rmq_connection, clean_up_after="NEVER")
     await outbox._get_db_engine()  # Force table setup
     return outbox
 
