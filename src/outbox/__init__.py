@@ -57,7 +57,7 @@ class Outbox:
         self.expiration = None
         OutboxTable.__tablename__ = "outbox_table"
 
-        self._listeners = {}
+        self._listeners = []
         self._table_created = False
 
         self.setup(**kwargs)
@@ -199,22 +199,13 @@ class Outbox:
                 queue_name = f"{func.__module__}.{func.__qualname__}".replace("<", "").replace(
                     ">", ""
                 )
-            signature = inspect.signature(func)
-            parameters = dict(signature.parameters.items())
+            parameters = dict(inspect.signature(func).parameters.items())
 
-            # lets find the (hopefully at most one) parameter that has a string annotation
-            str_parameters = [
-                param_name for param_name, param in parameters.items() if param.annotation is str
-            ]
-            if len(str_parameters) == 1:
-                routing_key_arg = str_parameters[0]
-                del parameters[routing_key_arg]
-            elif len(str_parameters) > 1:
-                raise ValueError(
-                    "Worker functions can have at most one parameter with a string annotation"
-                )
+            if "routing_key" in parameters:
+                provide_routing_key = True
+                del parameters["routing_key"]
             else:
-                routing_key_arg = None
+                provide_routing_key = False
 
             if not len(parameters) == 1:
                 raise ValueError("Worker functions must accept exactly one argument")
@@ -228,6 +219,10 @@ class Outbox:
                 )
                 try:
                     kwargs = {}
+
+                    if provide_routing_key:
+                        kwargs["routing_key"] = message.routing_key
+
                     if issubclass(annotation, BaseModel):
                         kwargs[body_arg] = annotation.model_validate_json(message.body)
                     elif issubclass(annotation, bytes):
@@ -235,8 +230,6 @@ class Outbox:
                     else:
                         kwargs[body_arg] = json.loads(message.body)
 
-                    if routing_key_arg is not None:
-                        kwargs[routing_key_arg] = message.routing_key
                     await func(**kwargs)
                 except Retry:
                     logger.info(
@@ -267,7 +260,7 @@ class Outbox:
                     )
 
             logger.debug(f"Registering listener for {binding_key=}: {func=}")
-            self._listeners.setdefault(binding_key, []).append((queue_name, _on_message))
+            self._listeners.append((queue_name, binding_key, _on_message))
 
         return decorator
 
@@ -284,26 +277,25 @@ class Outbox:
         dead_letter_exchange = await channel.declare_exchange(
             f"dlx_{self.exchange_name}", aio_pika.ExchangeType.DIRECT, durable=True
         )
-        for binding_key, handlers in self._listeners.items():
-            for queue_name, handler in handlers:
-                dead_letter_queue = await channel.declare_queue(f"dlq_{queue_name}", durable=True)
-                await dead_letter_queue.bind(dead_letter_exchange, queue_name)
+        for queue_name, binding_key, handler in self._listeners:
+            dead_letter_queue = await channel.declare_queue(f"dlq_{queue_name}", durable=True)
+            await dead_letter_queue.bind(dead_letter_exchange, queue_name)
 
-                logger.debug(
-                    f"Binding queue {queue_name} to exchange {self.exchange_name} with binding "
-                    f"key {binding_key}"
-                )
-                queue = await channel.declare_queue(
-                    queue_name,
-                    durable=True,
-                    arguments={
-                        "x-dead-letter-exchange": f"dlx_{self.exchange_name}",
-                        "x-dead-letter-routing-key": queue_name,
-                    },
-                )
-                await queue.bind(exchange, binding_key)
+            logger.debug(
+                f"Binding queue {queue_name} to exchange {self.exchange_name} with binding key "
+                f"{binding_key}"
+            )
+            queue = await channel.declare_queue(
+                queue_name,
+                durable=True,
+                arguments={
+                    "x-dead-letter-exchange": f"dlx_{self.exchange_name}",
+                    "x-dead-letter-routing-key": queue_name,
+                },
+            )
+            await queue.bind(exchange, binding_key)
 
-                await queue.consume(handler)
+            await queue.consume(handler)
         await asyncio.Future()
 
 

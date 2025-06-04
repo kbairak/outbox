@@ -20,8 +20,8 @@ outbox.setup(
 
 
 @listen("foo")
-async def foo(obj):
-    3 / 0
+async def foo(_):
+    pass
 
 
 async def main():

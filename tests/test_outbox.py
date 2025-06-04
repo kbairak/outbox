@@ -147,9 +147,8 @@ async def test_regiter_listener(listen: ListenType, outbox: Outbox) -> None:
         pass
 
     # assert
-    assert list(outbox._listeners.keys()) == ["routing_key"]
-    assert len(list(outbox._listeners.values())[0]) == 1
-    assert "test_queue_name" in list(outbox._listeners.values())[0][0][0]
+    ((queue_name, _, _),) = outbox._listeners
+    assert "test_queue_name" in queue_name
 
 
 @pytest.mark.asyncio(loop_scope="session")

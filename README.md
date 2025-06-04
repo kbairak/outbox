@@ -107,6 +107,25 @@ async def on_user_event(user):
     # <<< {"id": 123, "username": "johndoe"}
 ```
 
+If you are using this and you want to know the routing key inside the body o the listener, you can add a `routing_key` argument to the listener:
+
+```python
+# Main application
+async with AsyncSession(db_engine) as session:
+    emit(session, "user.created", {"id": 123, "username": "johndoe"})
+    await session.commit()
+
+# Worker process
+@listen("user.*")
+async def on_user_event(routing_key: str, user):
+    print(f"Received {routing_key=}")
+    # <<< Received routing_key=user.created
+    print(user)
+    # <<< {"id": 123, "username": "johndoe"}
+```
+
+```python
+
 </details>
 
 <details>
@@ -304,7 +323,6 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 - Use msgpack (optionally) to reduce size
 - Dependency injection on listen
 - Don't retry immediately, implement a backoff strategy
-- Pass `routing_key` to listener function by argument name, not type
 - Add ETA to emit (should be easy thanks to the message relay)
 - Find a way to distribute multiple workers
 - Cold shutdown
