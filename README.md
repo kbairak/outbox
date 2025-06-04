@@ -35,7 +35,7 @@ setup(db_engine=db_engine)
 
 async def main():
     async with AsyncSession(db_engine) as session:
-        emit(session, "user.created", {"id": 123, "username": "johndoe"})
+        await emit(session, "user.created", {"id": 123, "username": "johndoe"})
         await session.commit()
 
 asyncio.run(main())
@@ -85,7 +85,7 @@ You can (should) call `emit` inside a database transaction. This way, data creat
 ```python
 async with AsyncSession(db_engine) as session, session.begin():
     session.add(User(id=123, username="johndoe"))
-    emit(session, "user.created", {"id": 123, "username": "johndoe"})
+    await emit(session, "user.created", {"id": 123, "username": "johndoe"})
     # commit not needed because of `session.begin()`
 ```
 
@@ -97,7 +97,7 @@ async with AsyncSession(db_engine) as session, session.begin():
 ```python
 # Main application
 async with AsyncSession(db_engine) as session:
-    emit(session, "user.created", {"id": 123, "username": "johndoe"})
+    await emit(session, "user.created", {"id": 123, "username": "johndoe"})
     await session.commit()
 
 # Worker process
@@ -112,7 +112,7 @@ If you are using this and you want to know the routing key inside the body o the
 ```python
 # Main application
 async with AsyncSession(db_engine) as session:
-    emit(session, "user.created", {"id": 123, "username": "johndoe"})
+    await emit(session, "user.created", {"id": 123, "username": "johndoe"})
     await session.commit()
 
 # Worker process
@@ -136,7 +136,7 @@ class User(BaseModel):
 
 # Main application
 async with AsyncSession(db_engine) as session:
-    emit(session, "user.created", User(id=123, username="johndoe"))
+    await emit(session, "user.created", User(id=123, username="johndoe"))
     await session.commit()
 
 # Worker process
@@ -242,7 +242,7 @@ Or
 
 ```python
 async with AsyncSession(db_engine) as session:
-    emit(
+    await emit(
         session,
         "user.created",
         {"id": 123, "username": "johndoe"},
@@ -261,7 +261,7 @@ You can cause an event to be sent some time in the future by setting the `eta` a
 
 ```python
 async with AsyncSession(db_engine) as session:
-    emit(
+    await emit(
         session,
         "user.created",
         {"id": 123, "username": "johndoe"},
@@ -302,7 +302,7 @@ setup(db_engine=db_engine)
 
 async def main():
     async with AsyncSession(db_engine) as session:
-        emit(session, "user.created", {"id": 123, "username": "johndoe"})
+        await emit(session, "user.created", {"id": 123, "username": "johndoe"})
         await session.commit()
 
 asyncio.run(main())
@@ -318,7 +318,7 @@ outbox.setup(db_engine=db_engine)
 
 async def main():
     async with AsyncSession(db_engine) as session:
-        outbox.emit(session, "user.created", {"id": 123, "username": "johndoe"})
+        await outbox.emit(session, "user.created", {"id": 123, "username": "johndoe"})
         await session.commit()
 
 asyncio.run(main())
@@ -337,10 +337,10 @@ outbox2 = Outbox(db_engine=db_engine2)
 
 async def main():
     async with AsyncSession(db_engine1) as session:
-        outbox1.emit(session, "user.created", {"id": 123, "username": "johndoe"})
+        await outbox1.emit(session, "user.created", {"id": 123, "username": "johndoe"})
         await session.commit()
     async with AsyncSession(db_engine2) as session:
-        outbox2.emit(session, "user.created", {"id": 456, "username": "maryjane"})
+        await outbox2.emit(session, "user.created", {"id": 456, "username": "maryjane"})
         await session.commit()
 
 asyncio.run(main())
@@ -351,9 +351,9 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ## TODOs
 
+- Graceful shutdown
 - Use pg notify/listen to avoid polling the database
 - Use msgpack (optionally) to reduce size
 - Dependency injection on listen
 - Don't retry immediately, implement a backoff strategy
 - Find a way to distribute multiple workers
-- Cold shutdown

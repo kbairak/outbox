@@ -49,7 +49,7 @@ class Reject(Exception):
 
 class Outbox:
     def __init__(self, **kwargs):
-        self._db_engine: AsyncEngine | None = None
+        self.db_engine: AsyncEngine | None = None
         self._rmq_connection: AbstractConnection | None = None
         self._rmq_connection_url: str | None = None
         self.exchange_name = "outbox_exchange"
@@ -85,10 +85,10 @@ class Outbox:
             raise ValueError("You cannot set both rmq_connection and rmq_connection_url")
 
         if db_engine is not None:
-            self._db_engine = db_engine
+            self.db_engine = db_engine
             logger.debug("Set up DB engine")
         if db_engine_url is not None:
-            self._db_engine = create_async_engine(db_engine_url)
+            self.db_engine = create_async_engine(db_engine_url)
             logger.debug("Set up DB engine")
 
         if table_name is not None:
@@ -114,27 +114,26 @@ class Outbox:
 
         if expiration is not None:
             self.expiration = expiration
+            logger.debug(f"Set up non-default expiration: {self.expiration}")
 
         if clean_up_after is not None:
             self.clean_up_after = clean_up_after
+            logger.debug(f"Set up non-default clean_up_after: {self.clean_up_after}")
 
-    async def _get_db_engine(self) -> AsyncEngine | None:
-        if not self._table_created and self._db_engine:
-            async with self._db_engine.begin() as conn:
+    async def _ensure_dataabase(self) -> None:
+        if not self._table_created and self.db_engine:
+            async with self.db_engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
             self._table_created = True
             logger.debug("Created outbox table in the database")
-        return self._db_engine
 
     async def _get_rmq_connection(self) -> AbstractConnection | None:
-        if self._rmq_connection is not None:
-            return self._rmq_connection
-        if self._rmq_connection_url is not None:
+        if self._rmq_connection is None and self._rmq_connection_url is not None:
             self._rmq_connection = await aio_pika.connect(self._rmq_connection_url)
             logger.debug("Set up RMQ connection")
         return self._rmq_connection
 
-    def emit(
+    async def emit(
         self,
         session: AsyncSession,
         routing_key: str,
@@ -143,6 +142,8 @@ class Outbox:
         expiration: DateType = None,
         eta: DateType | None = None,
     ) -> None:
+        await self._ensure_dataabase()
+
         if isinstance(body, BaseModel):
             body = body.model_dump_json().encode()
         elif not isinstance(body, bytes):
@@ -167,12 +168,12 @@ class Outbox:
         logger.debug(f"Emitted message to outbox: {routing_key=}, {body=}")
 
     async def message_relay(self) -> None:
-        db_engine = await self._get_db_engine()
-        if db_engine is None:
+        if self.db_engine is None:
             raise ValueError("Database engine is not set up.")
         rmq_connection = await self._get_rmq_connection()
         if rmq_connection is None:
             raise ValueError("RabbitMQ connection is not set up.")
+        await self._ensure_dataabase()
 
         logger.info(f"Starting message relay on exchange: {self.exchange_name} ...")
         channel = await rmq_connection.channel()
@@ -181,7 +182,7 @@ class Outbox:
         )
         while True:
             while True:
-                async with AsyncSession(db_engine) as session, session.begin():
+                async with AsyncSession(self.db_engine) as session, session.begin():
                     logger.debug("Checking for unsent messages...")
                     stmt = (
                         select(OutboxTable)

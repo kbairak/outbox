@@ -1,7 +1,6 @@
 import asyncio
 import datetime
 import logging
-import sys
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
@@ -25,16 +24,12 @@ async def foo(_):
 
 
 async def main():
-    if len(sys.argv) == 2 and sys.argv[1] == "message_relay":
-        await outbox.message_relay()
-    elif len(sys.argv) == 2 and sys.argv[1] == "worker":
-        await outbox.worker()
-    elif len(sys.argv) == 1:
-        async with AsyncSession(db_engine) as session:
-            emit(session, "foo", {}, eta=4)
-            await session.commit()
-    else:
-        raise ValueError("Usage: python main.py [message_relay|worker]")
+    asyncio.create_task(outbox.worker())
+    asyncio.create_task(outbox.message_relay())
+    async with AsyncSession(db_engine) as session, session.begin():
+        await emit(session, "foo", {"message": "Hello, World!"})
+    await asyncio.Future()
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

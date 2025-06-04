@@ -44,12 +44,11 @@ async def rmq_connection():
 @pytest_asyncio.fixture(loop_scope="session")
 async def outbox(db_engine: AsyncEngine, rmq_connection: AbstractConnection) -> Outbox:
     outbox = Outbox(db_engine=db_engine, rmq_connection=rmq_connection, clean_up_after="NEVER")
-    await outbox._get_db_engine()  # Force table setup
     return outbox
 
 
 class EmitType(Protocol):
-    def __call__(
+    async def __call__(
         self, session: AsyncSession, routing_key: str, body: Any, *, expiration: DateType = None
     ) -> None: ...
 
@@ -73,7 +72,7 @@ def listen(outbox: Outbox) -> ListenType:
 @pytest.mark.asyncio(loop_scope="session")
 async def test_emit(emit: EmitType, session: AsyncSession) -> None:
     # test
-    emit(session, "test_routing_key", "test_body")
+    await emit(session, "test_routing_key", "test_body")
 
     # assert
     messages = (await session.execute(select(OutboxTable))).scalars().all()
@@ -87,7 +86,7 @@ async def test_emit(emit: EmitType, session: AsyncSession) -> None:
 @pytest.mark.asyncio(loop_scope="session")
 async def test_emit_with_pydantic(emit: EmitType, session: AsyncSession) -> None:
     # test
-    emit(session, "my_routing_key", Person(name="MyName"))
+    await emit(session, "my_routing_key", Person(name="MyName"))
 
     # assert
     messages = (await session.execute(select(OutboxTable))).scalars().all()
@@ -115,7 +114,7 @@ async def test_message_relay(
     rmq_connection_mock.channel.return_value = (channel_mock := AsyncMock(name="channel"))
     channel_mock.declare_exchange.return_value = (exchange_mock := AsyncMock(name="exchange"))
 
-    emit(session, "test_routing_key", "test_body")
+    await emit(session, "test_routing_key", "test_body")
     await session.commit()
 
     # test
@@ -140,15 +139,16 @@ async def test_message_relay(
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_regiter_listener(listen: ListenType, outbox: Outbox) -> None:
+async def test_register_listener(listen: ListenType, outbox: Outbox) -> None:
     # test
-    @listen("routing_key", queue_name="test_queue_name")
+    @listen("test_binding_key", queue_name="test_queue_name")
     async def _(_):  # pragma: no cover
         pass
 
     # assert
-    ((queue_name, _, _),) = outbox._listeners
-    assert "test_queue_name" in queue_name
+    ((queue_name, binding_key, _),) = outbox._listeners
+    assert queue_name == "test_queue_name"
+    assert binding_key == "test_binding_key"
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -165,7 +165,7 @@ async def test_worker(
         callcount += 1
         retrieved_argument = person
 
-    emit(session, "routing_key", {"name": "MyName"})
+    await emit(session, "routing_key", {"name": "MyName"})
     await session.commit()
 
     async def _message_relay():
@@ -197,7 +197,7 @@ async def test_worker_with_pydantic(
         callcount += 1
         retrieved_argument = person
 
-    emit(session, "routing_key", Person(name="MyName"))
+    await emit(session, "routing_key", Person(name="MyName"))
     await session.commit()
 
     async def _message_relay():
@@ -231,7 +231,7 @@ async def test_worker_with_wildcard(
         retrieved_routing_key = routing_key
         retrieved_argument = person
 
-    emit(session, "routing_key.foo", {"name": "MyName"})
+    await emit(session, "routing_key.foo", {"name": "MyName"})
     await session.commit()
 
     async def _message_relay():
@@ -266,7 +266,7 @@ async def test_retry(
             raise ValueError("Simulated failure")
         retrieved_argument = person
 
-    emit(session, "routing_key", {"name": "MyName"})
+    await emit(session, "routing_key", {"name": "MyName"})
     await session.commit()
 
     async def _message_relay():
@@ -301,7 +301,7 @@ async def test_no_retry_with_setup(
             raise ValueError("Simulated failure")
         retrieved_argument = person
 
-    emit(session, "routing_key", {"name": "MyName"})
+    await emit(session, "routing_key", {"name": "MyName"})
     await session.commit()
 
     async def _message_relay():
@@ -335,7 +335,7 @@ async def test_no_retry_with_listen(
             raise ValueError("Simulated failure")
         retrieved_argument = person
 
-    emit(session, "routing_key", {"name": "MyName"})
+    await emit(session, "routing_key", {"name": "MyName"})
     await session.commit()
 
     async def _message_relay():
@@ -370,7 +370,7 @@ async def test_force_retry_with_setup(
             raise Retry("Simulated failure")
         retrieved_argument = person
 
-    emit(session, "routing_key", {"name": "MyName"})
+    await emit(session, "routing_key", {"name": "MyName"})
     await session.commit()
 
     async def _message_relay():
@@ -404,7 +404,7 @@ async def test_force_retry_with_listen(
             raise Retry("Simulated failure")
         retrieved_argument = person
 
-    emit(session, "routing_key", {"name": "MyName"})
+    await emit(session, "routing_key", {"name": "MyName"})
     await session.commit()
 
     async def _message_relay():
@@ -436,7 +436,7 @@ async def test_emit_and_consume_binary(
         callcount += 1
         retrieved_argument = person
 
-    emit(session, "routing_key", "hεllo".encode())
+    await emit(session, "routing_key", "hεllo".encode())
     await session.commit()
 
     async def _message_relay():
@@ -463,7 +463,7 @@ async def test_dead_letter(
     async def _(person):
         raise Reject("test")
 
-    emit(session, "routing_key", {})
+    await emit(session, "routing_key", {})
     await session.commit()
 
     async def _message_relay():
@@ -492,7 +492,7 @@ async def test_dead_letter_with_expiration(
     async def _(_):
         raise Retry("test")
 
-    emit(session, "routing_key", {}, expiration=0.01)
+    await emit(session, "routing_key", {}, expiration=0.01)
     await session.commit()
 
     async def _message_relay():
