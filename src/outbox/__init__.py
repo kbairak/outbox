@@ -4,10 +4,18 @@ import inspect
 import json
 import logging
 import signal
+from dataclasses import dataclass
 from typing import Any, Callable, Coroutine, Literal
 
 import aio_pika
-from aio_pika.abc import AbstractConnection, AbstractExchange, AbstractIncomingMessage, DateType
+from aio_pika.abc import (
+    AbstractConnection,
+    AbstractExchange,
+    AbstractIncomingMessage,
+    AbstractQueue,
+    ConsumerTag,
+    DateType,
+)
 from aio_pika.message import encode_expiration
 from pydantic import BaseModel
 from sqlalchemy import DateTime, Text, delete, func, select
@@ -48,6 +56,15 @@ class Reject(Exception):
     pass
 
 
+@dataclass
+class Listener:
+    queue_name: str
+    binding_key: str
+    handler: Callable[[AbstractIncomingMessage], Coroutine[None, None, None]]
+    queue: AbstractQueue | None = None
+    consumer_tag: ConsumerTag | None = None
+
+
 class Outbox:
     def __init__(self, **kwargs):
         self.db_engine: AsyncEngine | None = None
@@ -60,7 +77,7 @@ class Outbox:
         self.clean_up_after = "IMMEDIATELY"
         OutboxTable.__tablename__ = "outbox_table"
 
-        self._listeners = []
+        self._listeners: list[Listener] = []
         self._table_created = False
         self._tasks = set()
         self._shutdown_future: asyncio.Future | None = None
@@ -184,48 +201,59 @@ class Outbox:
             self.exchange_name, aio_pika.ExchangeType.TOPIC, durable=True
         )
         while True:
-            while True:
-                async with AsyncSession(self.db_engine) as session, session.begin():
-                    logger.debug("Checking for unsent messages...")
-                    stmt = (
-                        select(OutboxTable)
-                        .where(
-                            OutboxTable.sent_at.is_(None),
-                            OutboxTable.send_after <= datetime.datetime.now(datetime.UTC),
-                        )
-                        .order_by(OutboxTable.created_at)
-                        .limit(1)
-                        .with_for_update(skip_locked=True)
-                    )
-                    try:
-                        outbox_row = (await session.execute(stmt)).scalars().one()
-                    except NoResultFound:
-                        logger.debug("No unsent messages found, waiting...")
-                        break
-                    else:
-                        logger.debug(f"Processing message: {outbox_row}")
-                        expiration = outbox_row.expiration or self.expiration
-                        await exchange.publish(
-                            aio_pika.Message(
-                                outbox_row.body,
-                                content_type="application/json",
-                                expiration=expiration,
-                            ),
-                            outbox_row.routing_key,
-                        )
-                        logger.debug(f"Sent message: {outbox_row} to RabbitMQ")
-                        if self.clean_up_after == "IMMEDIATELY":
-                            await session.delete(outbox_row)
-                        else:
-                            outbox_row.sent_at = datetime.datetime.now(datetime.UTC)
-                        if isinstance(self.clean_up_after, datetime.timedelta):
-                            stmt = delete(OutboxTable).where(
-                                OutboxTable.sent_at.is_not(None),
-                                OutboxTable.sent_at
-                                < datetime.datetime.now(datetime.UTC) - self.clean_up_after,
-                            )
-                            await session.execute(stmt)
+            await self._consume_outbox_table(exchange)
             await asyncio.sleep(self.poll_interval)
+
+    async def _consume_outbox_table(self, exchange: AbstractExchange | None = None) -> None:
+        if exchange is None:
+            rmq_connection = await self._get_rmq_connection()
+            if rmq_connection is None:
+                raise ValueError("RabbitMQ connection is not set up.")
+            channel = await rmq_connection.channel()
+            exchange = await channel.declare_exchange(
+                self.exchange_name, aio_pika.ExchangeType.TOPIC, durable=True
+            )
+        while True:
+            async with AsyncSession(self.db_engine) as session, session.begin():
+                logger.debug("Checking for unsent messages...")
+                stmt = (
+                    select(OutboxTable)
+                    .where(
+                        OutboxTable.sent_at.is_(None),
+                        OutboxTable.send_after <= datetime.datetime.now(datetime.UTC),
+                    )
+                    .order_by(OutboxTable.created_at)
+                    .limit(1)
+                    .with_for_update(skip_locked=True)
+                )
+                try:
+                    outbox_row = (await session.execute(stmt)).scalars().one()
+                except NoResultFound:
+                    logger.debug("No unsent messages found, waiting...")
+                    break
+                else:
+                    logger.debug(f"Processing message: {outbox_row}")
+                    expiration = outbox_row.expiration or self.expiration
+                    await exchange.publish(
+                        aio_pika.Message(
+                            outbox_row.body,
+                            content_type="application/json",
+                            expiration=expiration,
+                        ),
+                        outbox_row.routing_key,
+                    )
+                    logger.debug(f"Sent message: {outbox_row} to RabbitMQ")
+                    if self.clean_up_after == "IMMEDIATELY":
+                        await session.delete(outbox_row)
+                    else:
+                        outbox_row.sent_at = datetime.datetime.now(datetime.UTC)
+                    if isinstance(self.clean_up_after, datetime.timedelta):
+                        stmt = delete(OutboxTable).where(
+                            OutboxTable.sent_at.is_not(None),
+                            OutboxTable.sent_at
+                            < datetime.datetime.now(datetime.UTC) - self.clean_up_after,
+                        )
+                        await session.execute(stmt)
 
     def listen(
         self, binding_key: str, queue_name: str | None = None, retry_on_error: bool | None = None
@@ -308,14 +336,12 @@ class Outbox:
                 task.add_done_callback(self._tasks.discard)
 
             logger.debug(f"Registering listener for {binding_key=}: {func=}")
-            self._listeners.append((queue_name, binding_key, _handler))
+            self._listeners.append(Listener(queue_name, binding_key, _handler))
 
         return decorator
 
     async def worker(self) -> None:
-        rmq_connection = await self._get_rmq_connection()
-        if rmq_connection is None:
-            raise ValueError("RabbitMQ connection is not set up.")
+        await self._set_up_queues()
 
         self._shutdown_future = asyncio.Future()
         loop = asyncio.get_event_loop()
@@ -323,6 +349,27 @@ class Outbox:
         loop.add_signal_handler(signal.SIGTERM, self._shutdown_future.set_result, None)
 
         logger.info(f"Starting worker on exchange: {self.exchange_name} ...")
+        for listener in self._listeners:
+            assert listener.queue is not None
+            listener.consumer_tag = await listener.queue.consume(listener.handler)
+
+        await self._shutdown_future
+
+        logger.info("Received shutdown signal, waiting or ongoing tasks and exiting...")
+
+        for listener in self._listeners:
+            assert listener.queue is not None
+            assert listener.consumer_tag is not None
+            await listener.queue.cancel(listener.consumer_tag)
+
+        if self._tasks:
+            await asyncio.wait(self._tasks)
+
+    async def _set_up_queues(self):
+        rmq_connection = await self._get_rmq_connection()
+        if rmq_connection is None:
+            raise ValueError("RabbitMQ connection is not set up.")
+
         channel = await rmq_connection.channel()
         exchange = await channel.declare_exchange(
             self.exchange_name, aio_pika.ExchangeType.TOPIC, durable=True
@@ -330,37 +377,25 @@ class Outbox:
         dead_letter_exchange = await channel.declare_exchange(
             f"dlx_{self.exchange_name}", aio_pika.ExchangeType.DIRECT, durable=True
         )
-        consumer_tags = []
-        for queue_name, binding_key, handler in self._listeners:
-            dead_letter_queue = await channel.declare_queue(f"dlq_{queue_name}", durable=True)
-            await dead_letter_queue.bind(dead_letter_exchange, queue_name)
+        for listener in self._listeners:
+            dead_letter_queue = await channel.declare_queue(
+                f"dlq_{listener.queue_name}", durable=True
+            )
+            await dead_letter_queue.bind(dead_letter_exchange, listener.queue_name)
 
             logger.debug(
-                f"Binding queue {queue_name} to exchange {self.exchange_name} with binding key "
-                f"{binding_key}"
+                f"Binding queue {listener.queue_name} to exchange {self.exchange_name} with "
+                f"binding key {listener.binding_key}"
             )
-            queue = await channel.declare_queue(
-                queue_name,
+            listener.queue = await channel.declare_queue(
+                listener.queue_name,
                 durable=True,
                 arguments={
                     "x-dead-letter-exchange": f"dlx_{self.exchange_name}",
-                    "x-dead-letter-routing-key": queue_name,
+                    "x-dead-letter-routing-key": listener.queue_name,
                 },
             )
-            await queue.bind(exchange, binding_key)
-
-            consumer_tag = await queue.consume(handler)
-            consumer_tags.append((queue, consumer_tag))
-
-        await self._shutdown_future
-
-        logger.info("Received shutdown signal, waiting or ongoing tasks and exiting...")
-
-        for queue, consumer_tag in consumer_tags:
-            await queue.cancel(consumer_tag)
-
-        if self._tasks:
-            await asyncio.wait(self._tasks)
+            await listener.queue.bind(exchange, listener.binding_key)
 
 
 outbox = Outbox()
