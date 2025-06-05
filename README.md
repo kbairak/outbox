@@ -107,7 +107,7 @@ async def on_user_event(user):
     # <<< {"id": 123, "username": "johndoe"}
 ```
 
-If you are using this and you want to know the routing key inside the body o the listener, you can add a `routing_key` argument to the listener:
+If you are using this and you want to know the routing key inside the body of the listener, you can add a `routing_key` argument to the listener:
 
 ```python
 # Main application
@@ -206,18 +206,8 @@ def on_user_created(user: User):
 
 ```mermaid
 flowchart LR
-    MA{Main app} -->|"emit()"| DB[Outbox table]
-    DB ~~~ MR{Mesage relay}
-    MR -->|SELECT FOR UPDATE| DB
-    MR ~~~ DB
-    MR --->|publish| ME["Main exchange (topic)"]
-
-    subgraph Database
-    DB
-    end
-
     subgraph RabbitMQ
-    ME -->|binding| Q1[Queue 1]
+    ME["Main exchange (topic)"] -->|binding| Q1[Queue 1]
     Q1 -->|reject| DLX["Dead Letter Exchange (direct)"]
     DLX --->|binding| DQ1[Dead Letter Queue]
     end
@@ -273,7 +263,7 @@ async with AsyncSession(db_engine) as session:
 </details>
 
 <details>
-    <Summary>Outbox table cleanup</summary>
+    <summary>Outbox table cleanup</summary>
 
 You can choose a strategy for when already sent messages from the outbox table should be cleaned up by passing the `clean_up_after` argument during setup:
 
@@ -286,6 +276,52 @@ The options are:
 - **`IMMEDIATELY` (the default)**: messages are cleaned up immediately after being sent to RabbitMQ.
 - **`NEVER`**: messages are never cleaned up, you will have to do it manually.
 - **Any `datetime.timedelta` instance**.
+
+</details>
+
+<details>
+    <summary>Graceful shutdown</summary>
+
+When the worker receives a SIGINT or SIGTERM, it will request a disconnect from all the queues. Any messages that are sent before the disconnect request is processed will be rejected by the worker with `requeue=True` (so they will be consumed by other workers, immediately or later). In the meantime, any messages that have already started being processed will keep being processed until the listener function terminates. When all pending tasks have finished, the worker will exit.
+
+Example sequence of events:
+
+```mermaid
+sequenceDiagram
+    participant Pub as Publisher
+    participant Q as RabbitMQ Queue
+    participant W as Worker
+    participant OW as Other Worker
+
+    W->>W: Start
+    Pub->>Q: Publish event 1
+    Q-->>W: Send event 1
+    W->>W: Start processing event 1
+
+    Note right of W: SIGINT or SIGTERM received
+    W->>Q: Request disconnect from all queues
+
+    Pub->>Q: Publish event 2
+    Q-->>W: Send event 2
+    W->>Q: Reject event 2 (requeue=True)
+
+    Q-->>W: Acknowledge disconnect request
+
+    Pub->>Q: Publish event 3
+    Note right of Q: Event 3 not sent to W
+
+    W->>W: Finish processing event 1
+    W->>Q: Ack event 1
+    W->>W: Exit
+
+    OW->>Q: Start and connect
+    Q-->>OW: Send event 2
+    Q-->>OW: Send event 3
+    OW->>OW: Process event 2
+    OW->>Q: Ack event 2
+    OW->>OW: Process event 3
+    OW->>Q: Ack event 3
+```
 
 </details>
 
@@ -351,9 +387,9 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ## TODOs
 
-- Graceful shutdown
 - Use pg notify/listen to avoid polling the database
 - Use msgpack (optionally) to reduce size
 - Dependency injection on listen
 - Don't retry immediately, implement a backoff strategy
 - Find a way to distribute multiple workers
+- Console scripts for message relay and worker

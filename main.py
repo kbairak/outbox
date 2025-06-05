@@ -3,33 +3,39 @@ import datetime
 import logging
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from testcontainers.core.utils import sys
 
 import outbox
 from outbox import emit, listen
 
+logger = logging.getLogger(__name__)
+
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("outbox").setLevel(logging.DEBUG)
+
 
 db_engine = create_async_engine("postgresql+asyncpg://postgres:postgres@localhost:5432/postgres")
 outbox.setup(
     db_engine=db_engine,
     rmq_connection_url="amqp://guest:guest@localhost:5672/",
-    expiration=datetime.timedelta(seconds=5),
+    poll_interval=0.1,
 )
 
 
 @listen("foo")
 async def foo(_):
-    pass
+    await asyncio.sleep(10)
 
 
 async def main():
-    asyncio.create_task(outbox.worker())
-    asyncio.create_task(outbox.message_relay())
     async with AsyncSession(db_engine) as session, session.begin():
         await emit(session, "foo", {"message": "Hello, World!"})
-    await asyncio.Future()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if sys.argv[1:] == ["worker"]:
+        asyncio.run(outbox.worker())
+    elif sys.argv[1:] == ["message_relay"]:
+        asyncio.run(outbox.message_relay())
+    else:
+        asyncio.run(main())

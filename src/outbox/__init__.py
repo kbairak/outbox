@@ -3,6 +3,7 @@ import datetime
 import inspect
 import json
 import logging
+import signal
 from typing import Any, Callable, Coroutine, Literal
 
 import aio_pika
@@ -61,6 +62,8 @@ class Outbox:
 
         self._listeners = []
         self._table_created = False
+        self._tasks = set()
+        self._shutdown_future: asyncio.Future | None = None
 
         self.setup(**kwargs)
 
@@ -250,11 +253,11 @@ class Outbox:
             annotation = parameters[body_arg].annotation
 
             async def _on_message(message: AbstractIncomingMessage) -> None:
-                logger.debug(
-                    f"Received message {message.message_id}: routing key: {message.routing_key}, "
-                    f"body: {message.body}"
-                )
                 try:
+                    logger.debug(
+                        f"Received message {message.message_id}: routing key: "
+                        f"{message.routing_key}, body: {message.body}"
+                    )
                     kwargs = {}
 
                     if provide_routing_key:
@@ -296,8 +299,16 @@ class Outbox:
                         f"{message.body}"
                     )
 
+            async def _handler(message: AbstractIncomingMessage) -> None:
+                if self._shutdown_future is not None and self._shutdown_future.done():
+                    await message.nack(requeue=True)
+                    return
+                task = asyncio.create_task(_on_message(message))
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
+
             logger.debug(f"Registering listener for {binding_key=}: {func=}")
-            self._listeners.append((queue_name, binding_key, _on_message))
+            self._listeners.append((queue_name, binding_key, _handler))
 
         return decorator
 
@@ -305,6 +316,11 @@ class Outbox:
         rmq_connection = await self._get_rmq_connection()
         if rmq_connection is None:
             raise ValueError("RabbitMQ connection is not set up.")
+
+        self._shutdown_future = asyncio.Future()
+        loop = asyncio.get_event_loop()
+        loop.add_signal_handler(signal.SIGINT, self._shutdown_future.set_result, None)
+        loop.add_signal_handler(signal.SIGTERM, self._shutdown_future.set_result, None)
 
         logger.info(f"Starting worker on exchange: {self.exchange_name} ...")
         channel = await rmq_connection.channel()
@@ -314,6 +330,7 @@ class Outbox:
         dead_letter_exchange = await channel.declare_exchange(
             f"dlx_{self.exchange_name}", aio_pika.ExchangeType.DIRECT, durable=True
         )
+        consumer_tags = []
         for queue_name, binding_key, handler in self._listeners:
             dead_letter_queue = await channel.declare_queue(f"dlq_{queue_name}", durable=True)
             await dead_letter_queue.bind(dead_letter_exchange, queue_name)
@@ -332,8 +349,18 @@ class Outbox:
             )
             await queue.bind(exchange, binding_key)
 
-            await queue.consume(handler)
-        await asyncio.Future()
+            consumer_tag = await queue.consume(handler)
+            consumer_tags.append((queue, consumer_tag))
+
+        await self._shutdown_future
+
+        logger.info("Received shutdown signal, waiting or ongoing tasks and exiting...")
+
+        for queue, consumer_tag in consumer_tags:
+            await queue.cancel(consumer_tag)
+
+        if self._tasks:
+            await asyncio.wait(self._tasks)
 
 
 outbox = Outbox()
