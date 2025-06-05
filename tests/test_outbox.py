@@ -118,10 +118,7 @@ async def test_message_relay(
     await session.commit()
 
     # test
-    try:
-        await asyncio.wait_for(outbox.message_relay(), timeout=0.2)
-    except asyncio.TimeoutError:
-        pass
+    await outbox._consume_outbox_table()
 
     # assert
     rmq_connection_mock.channel.assert_called_once_with()
@@ -146,9 +143,11 @@ async def test_register_listener(listen: ListenType, outbox: Outbox) -> None:
         pass
 
     # assert
-    ((queue_name, binding_key, _),) = outbox._listeners
-    assert queue_name == "test_queue_name"
-    assert binding_key == "test_binding_key"
+    (listener,) = outbox._listeners
+    assert listener.queue_name == "test_queue_name"
+    assert listener.binding_key == "test_binding_key"
+    assert listener.queue == None
+    assert listener.consumer_tag == None
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -167,14 +166,12 @@ async def test_worker(
 
     await emit(session, "routing_key", {"name": "MyName"})
     await session.commit()
-
-    async def _message_relay():
-        await asyncio.sleep(0.1)  # Give a small lead time for the worker to setup up the queue
-        await outbox.message_relay()
+    await outbox._set_up_queues()
+    await outbox._consume_outbox_table()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.2)
+        await asyncio.wait_for(outbox.worker(), timeout=0.2)
     except asyncio.TimeoutError:
         pass
 
@@ -199,14 +196,12 @@ async def test_worker_with_pydantic(
 
     await emit(session, "routing_key", Person(name="MyName"))
     await session.commit()
-
-    async def _message_relay():
-        await asyncio.sleep(0.1)  # Give a small lead time for the worker to setup up the queue
-        await outbox.message_relay()
+    await outbox._set_up_queues()
+    await outbox._consume_outbox_table()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.2)
+        await asyncio.wait_for(outbox.worker(), timeout=0.2)
     except asyncio.TimeoutError:
         pass
 
@@ -233,14 +228,12 @@ async def test_worker_with_wildcard(
 
     await emit(session, "routing_key.foo", {"name": "MyName"})
     await session.commit()
-
-    async def _message_relay():
-        await asyncio.sleep(0.1)  # Give a small lead time for the worker to setup up the queue
-        await outbox.message_relay()
+    await outbox._set_up_queues()
+    await outbox._consume_outbox_table()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.2)
+        await asyncio.wait_for(outbox.worker(), timeout=0.2)
     except asyncio.TimeoutError:
         pass
 
@@ -268,14 +261,12 @@ async def test_retry(
 
     await emit(session, "routing_key", {"name": "MyName"})
     await session.commit()
-
-    async def _message_relay():
-        await asyncio.sleep(0.1)  # Give a small lead time for the worker to setup up the queue
-        await outbox.message_relay()
+    await outbox._set_up_queues()
+    await outbox._consume_outbox_table()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.2)
+        await asyncio.wait_for(outbox.worker(), timeout=0.2)
     except asyncio.TimeoutError:
         pass
 
@@ -303,14 +294,12 @@ async def test_no_retry_with_setup(
 
     await emit(session, "routing_key", {"name": "MyName"})
     await session.commit()
-
-    async def _message_relay():
-        await asyncio.sleep(0.1)  # Give a small lead time for the worker to setup up the queue
-        await outbox.message_relay()
+    await outbox._set_up_queues()
+    await outbox._consume_outbox_table()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.2)
+        await asyncio.wait_for(outbox.worker(), timeout=0.2)
     except asyncio.TimeoutError:
         pass
 
@@ -337,14 +326,12 @@ async def test_no_retry_with_listen(
 
     await emit(session, "routing_key", {"name": "MyName"})
     await session.commit()
-
-    async def _message_relay():
-        await asyncio.sleep(0.1)  # Give a small lead time for the worker to setup up the queue
-        await outbox.message_relay()
+    await outbox._set_up_queues()
+    await outbox._consume_outbox_table()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.2)
+        await asyncio.wait_for(outbox.worker(), timeout=0.2)
     except asyncio.TimeoutError:
         pass
 
@@ -372,14 +359,12 @@ async def test_force_retry_with_setup(
 
     await emit(session, "routing_key", {"name": "MyName"})
     await session.commit()
-
-    async def _message_relay():
-        await asyncio.sleep(0.1)  # Give a small lead time for the worker to setup up the queue
-        await outbox.message_relay()
+    await outbox._set_up_queues()
+    await outbox._consume_outbox_table()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.2)
+        await asyncio.wait_for(outbox.worker(), timeout=0.2)
     except asyncio.TimeoutError:
         pass
 
@@ -406,14 +391,12 @@ async def test_force_retry_with_listen(
 
     await emit(session, "routing_key", {"name": "MyName"})
     await session.commit()
-
-    async def _message_relay():
-        await asyncio.sleep(0.1)  # Give a small lead time for the worker to setup up the queue
-        await outbox.message_relay()
+    await outbox._set_up_queues()
+    await outbox._consume_outbox_table()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.2)
+        await asyncio.wait_for(outbox.worker(), timeout=0.2)
     except asyncio.TimeoutError:
         pass
 
@@ -438,14 +421,12 @@ async def test_emit_and_consume_binary(
 
     await emit(session, "routing_key", "hεllo".encode())
     await session.commit()
-
-    async def _message_relay():
-        await asyncio.sleep(0.1)  # Give a small lead time for the worker to setup up the queue
-        await outbox.message_relay()
+    await outbox._set_up_queues()
+    await outbox._consume_outbox_table()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.2)
+        await asyncio.wait_for(outbox.worker(), timeout=0.2)
     except asyncio.TimeoutError:
         pass
 
@@ -465,14 +446,12 @@ async def test_dead_letter(
 
     await emit(session, "routing_key", {})
     await session.commit()
-
-    async def _message_relay():
-        await asyncio.sleep(0.1)  # Give a small lead time for the worker to setup up the queue
-        await outbox.message_relay()
+    await outbox._set_up_queues()
+    await outbox._consume_outbox_table()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.2)
+        await asyncio.wait_for(outbox.worker(), timeout=0.2)
     except asyncio.TimeoutError:
         pass
 
@@ -494,14 +473,12 @@ async def test_dead_letter_with_expiration(
 
     await emit(session, "routing_key", {}, expiration=0.02)
     await session.commit()
-
-    async def _message_relay():
-        await asyncio.sleep(0.1)  # Give a small lead time for the worker to setup up the queue
-        await outbox.message_relay()
+    await outbox._set_up_queues()
+    await outbox._consume_outbox_table()
 
     # test
     try:
-        await asyncio.wait_for(asyncio.gather(_message_relay(), outbox.worker()), timeout=0.2)
+        await asyncio.wait_for(outbox.worker(), timeout=0.2)
     except asyncio.TimeoutError:
         pass
 
@@ -526,14 +503,10 @@ async def test_graceful_shutdown(emit, session, outbox: Outbox, listen):
 
     await emit(session, "routing_key", {})
     await session.commit()
+    await outbox._set_up_queues()
+    await outbox._consume_outbox_table()
 
     worker_task = asyncio.create_task(outbox.worker())
-
-    await asyncio.sleep(0.1)  # Give lead time for the worker to set up queues
-    try:
-        await asyncio.wait_for(outbox.message_relay(), timeout=0.2)
-    except TimeoutError:
-        pass
 
     await asyncio.sleep(0.2)  # Give some time for the task to reach `sleep`
     assert (before, after) == (1, 0)
@@ -558,14 +531,10 @@ async def test_messages_not_lost_during_graceful_shutdown(emit, session, outbox:
 
     await emit(session, "routing_key", {})
     await session.commit()
+    await outbox._set_up_queues()
+    await outbox._consume_outbox_table()
 
     worker_task = asyncio.create_task(outbox.worker())
-
-    await asyncio.sleep(0.1)  # Give lead time for the worker to set up queues
-    try:
-        await asyncio.wait_for(outbox.message_relay(), timeout=0.2)
-    except TimeoutError:
-        pass
 
     await asyncio.sleep(0.2)  # Give some time for the task to reach `sleep`
     assert (before, after) == (1, 0)
@@ -577,17 +546,14 @@ async def test_messages_not_lost_during_graceful_shutdown(emit, session, outbox:
     await asyncio.sleep(0.2)
     await emit(session, "routing_key", {})
     await session.commit()
-    try:
-        await asyncio.wait_for(outbox.message_relay(), timeout=0.2)
-    except TimeoutError:
-        pass
+    await outbox._consume_outbox_table()
 
     await asyncio.wait((worker_task,))
     assert (before, after) == (1, 1)
 
     # Start the worker again
     worker_task = asyncio.create_task(outbox.worker())
-    await asyncio.sleep(0.2)  # Give some time for the task to reach `sleep`
+    await asyncio.sleep(0.4)  # Give some time for the task to reach `sleep`
     assert (before, after) == (2, 1)
 
     assert outbox._shutdown_future is not None
