@@ -20,7 +20,7 @@ from aio_pika.abc import (
     DateType,
 )
 from aio_pika.message import encode_expiration
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import JSON, DateTime, Text, delete, func, select
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
@@ -70,6 +70,7 @@ class Listener:
     queue_name: str
     binding_key: str
     handler: Callable[[AbstractIncomingMessage], Coroutine[None, None, None]]
+    tags: set[str]
     queue: AbstractQueue | None = None
     consumer_tag: ConsumerTag | None = None
 
@@ -278,10 +279,16 @@ class Outbox:
                         await session.execute(stmt)
 
     def listen(
-        self, binding_key: str, queue_name: str | None = None, retry_on_error: bool | None = None
+        self,
+        binding_key: str,
+        queue_name: str | None = None,
+        retry_on_error: bool | None = None,
+        tags: set[str] | None = None,
     ) -> Callable[[Callable[..., Coroutine[None, None, None]]], None]:
         if retry_on_error is None:
             retry_on_error = self.retry_on_error
+        if tags is None:
+            tags = set()
 
         def decorator(func: Callable):
             nonlocal queue_name
@@ -366,11 +373,11 @@ class Outbox:
                 task.add_done_callback(self._tasks.discard)
 
             logger.debug(f"Registering listener for {binding_key=}: {func=}")
-            self._listeners.append(Listener(queue_name, binding_key, _handler))
+            self._listeners.append(Listener(queue_name, binding_key, _handler, tags))
 
         return decorator
 
-    async def worker(self) -> None:
+    async def worker(self, tags: set[str] | None = None) -> None:
         await self._set_up_queues()
 
         self._shutdown_future = asyncio.Future()
@@ -380,6 +387,8 @@ class Outbox:
 
         logger.info(f"Starting worker on exchange: {self.exchange_name} ...")
         for listener in self._listeners:
+            if tags is not None and not (tags & listener.tags):
+                continue
             assert listener.queue is not None
             listener.consumer_tag = await listener.queue.consume(listener.handler)
 
@@ -388,6 +397,8 @@ class Outbox:
         logger.info("Received shutdown signal, waiting or ongoing tasks and exiting...")
 
         for listener in self._listeners:
+            if listener.consumer_tag is None:
+                continue
             assert listener.queue is not None
             assert listener.consumer_tag is not None
             await listener.queue.cancel(listener.consumer_tag)

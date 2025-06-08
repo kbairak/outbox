@@ -62,7 +62,11 @@ def emit(outbox: Outbox) -> EmitType:
 
 class ListenType(Protocol):
     def __call__(
-        self, binding_key: str, queue_name: str | None = None, retry_on_error: bool | None = None
+        self,
+        binding_key: str,
+        queue_name: str | None = None,
+        retry_on_error: bool | None = None,
+        tags: set[str] | None = None,
     ) -> Callable[[Callable[..., Coroutine[None, None, None]]], None]: ...
 
 
@@ -644,3 +648,32 @@ async def test_track_ids_with_parameter(
         pass
 
     assert logs == [("0",), ("0", "1"), ("0", "1", "2"), ("0", "1", "3")]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_tags(emit: EmitType, session: AsyncSession, listen: ListenType, outbox: Outbox):
+    await emit(session, "r1", {})
+    await emit(session, "r2", {})
+    await session.commit()
+
+    r1_called, r2_called = False, False
+
+    @listen("r1", tags={"r1"})
+    async def _(_):
+        nonlocal r1_called
+        r1_called = True
+
+    @listen("r2", tags={"r2"})
+    async def _(_):
+        nonlocal r2_called
+        r2_called = True
+
+    await outbox._set_up_queues()
+    await outbox._consume_outbox_table()
+
+    try:
+        await asyncio.wait_for(outbox.worker(tags={"r1"}), 0.4)
+    except asyncio.TimeoutError:
+        pass
+
+    assert (r1_called, r2_called) == (True, False)

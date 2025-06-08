@@ -384,6 +384,35 @@ Notification created for user 123, tracking IDs: ['uuid1', 'uuid2', 'uuid4']
 </details>
 
 <details>
+    <summary>Distribution of tasks to multiple workers</summary>
+
+By default, workers will consume messages from all queues (1 queue is defined per listener function). If you want more control on which workers will consume from which queues, you can assign a set of tags on each listener and a set of tags when invoking the worker itself:
+
+```python
+# Listeners
+
+@listen("binding_key_1", tags={"normal_priority"})
+async def on_normal_priority(obj):
+    ...
+
+@listen("binding_key_2", tags={"high_priority"})
+async def on_high_priority(obj):
+    ...
+
+# Worker 1
+
+# Lets add a worker for all tasks to make sure none are left behind
+asyncio.run(worker())
+
+# Worker 2
+
+# Lets add an extra worker just or the high-priority tasks
+asyncio.run(worker(tags={"high_priority"}))
+```
+
+</details>
+
+<details>
     <summary>Singleton vs multiple instances</summary>
 
 This library has been implemented in such a way that you can run single or multiple outbox setups. Most use-cases will use the singleton approach:
@@ -445,10 +474,10 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ## TODOs
 
-- Find a way to distribute multiple workers
 - Console scripts for message relay and worker
-- Don't retry immediately, implement a backoff strategy
 - Max retries
+- Don't retry immediately, implement a backoff strategy
 - Dependency injection on listen
+- uv cache for github actions
 - Use msgpack (optionally) to reduce size
 - Use pg notify/listen to avoid polling the database
