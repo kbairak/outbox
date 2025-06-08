@@ -4,8 +4,11 @@ import inspect
 import json
 import logging
 import signal
+import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Callable, Coroutine, Literal
+from typing import Any, Callable, Coroutine, Generator, Literal, cast
 
 import aio_pika
 from aio_pika.abc import (
@@ -18,7 +21,7 @@ from aio_pika.abc import (
 )
 from aio_pika.message import encode_expiration
 from pydantic import BaseModel
-from sqlalchemy import DateTime, Text, delete, func, select
+from sqlalchemy import JSON, DateTime, Text, delete, func, select
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -42,9 +45,15 @@ class OutboxTable(Base):
     send_after: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
     sent_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
     expiration: Mapped[datetime.timedelta | None] = mapped_column()
+    track_ids: Mapped[list[str]] = mapped_column(JSON)
 
     def __repr__(self):
-        routing_key, body = self.routing_key, self.body.decode()
+        routing_key, body, track_ids = self.routing_key, self.body.decode(), self.track_ids
+        args = [f"{routing_key=}", f"{body=}"]
+        if self.expiration:
+            expiration = self.expiration.total_seconds
+            args.append(f"{expiration=}")
+        args.append(f"{track_ids=}")
         return f"OutboxTable({routing_key=}, {body=})"
 
 
@@ -63,6 +72,9 @@ class Listener:
     handler: Callable[[AbstractIncomingMessage], Coroutine[None, None, None]]
     queue: AbstractQueue | None = None
     consumer_tag: ConsumerTag | None = None
+
+
+_track_ids: ContextVar[tuple[str, ...],] = ContextVar("track_ids", default=())
 
 
 class Outbox:
@@ -175,7 +187,11 @@ class Outbox:
         elif not isinstance(body, bytes):
             body = json.dumps(body).encode()
 
-        outbox_row = OutboxTable(routing_key=routing_key, body=body)
+        outbox_row = OutboxTable(
+            routing_key=routing_key,
+            body=body,
+            track_ids=list(self.get_track_ids() + (str(uuid.uuid4()),)),
+        )
         if expiration is not None:
             milliseconds = encode_expiration(expiration)
             assert milliseconds is not None
@@ -190,7 +206,7 @@ class Outbox:
             outbox_row.send_after = datetime.datetime.now(datetime.UTC)
         session.add(outbox_row)
 
-        logger.debug(f"Emitted message to outbox: {routing_key=}, {body=}")
+        logger.info(f"Emitted message to outbox: {outbox_row}")
 
     async def message_relay(self) -> None:
         if self.db_engine is None:
@@ -241,7 +257,10 @@ class Outbox:
                     expiration = outbox_row.expiration or self.expiration
                     await exchange.publish(
                         aio_pika.Message(
-                            outbox_row.body, content_type="application/json", expiration=expiration
+                            outbox_row.body,
+                            content_type="application/json",
+                            expiration=expiration,
+                            headers={"x-outbox-track-ids": json.dumps(outbox_row.track_ids)},
                         ),
                         outbox_row.routing_key,
                     )
@@ -272,63 +291,71 @@ class Outbox:
                 )
             parameters = dict(inspect.signature(func).parameters.items())
 
-            if "routing_key" in parameters:
-                provide_routing_key = True
-                del parameters["routing_key"]
-            else:
-                provide_routing_key = False
+            provide_routing_key = "routing_key" in parameters
+            parameters.pop("routing_key", None)
+            provide_message = "message" in parameters
+            parameters.pop("message", None)
+            provide_track_ids = "track_ids" in parameters
+            parameters.pop("track_ids", None)
 
-            if not len(parameters) == 1:
+            try:
+                ((body_param_key, body_param),) = list(parameters.items())
+            except ValueError:
                 raise ValueError("Worker functions must accept exactly one argument")
-            body_arg = list(parameters.keys())[0]
-            annotation = parameters[body_arg].annotation
 
             async def _on_message(message: AbstractIncomingMessage) -> None:
+                track_ids = json.loads(cast(str, message.headers.get("x-outbox-track-ids", "[]")))
+                token = _track_ids.set(tuple(track_ids))
+                routing_key, body = message.routing_key, message.body
                 try:
-                    logger.debug(
-                        f"Received message {message.message_id}: routing key: "
-                        f"{message.routing_key}, body: {message.body}"
-                    )
-                    kwargs = {}
-
-                    if provide_routing_key:
-                        kwargs["routing_key"] = message.routing_key
-
-                    if issubclass(annotation, BaseModel):
-                        kwargs[body_arg] = annotation.model_validate_json(message.body)
-                    elif issubclass(annotation, bytes):
-                        kwargs[body_arg] = message.body
+                    if issubclass(body_param.annotation, BaseModel):
+                        body = body_param.annotation.model_validate_json(message.body)
+                    elif issubclass(body_param.annotation, bytes):
+                        body = message.body
                     else:
-                        kwargs[body_arg] = json.loads(message.body)
+                        body = json.loads(message.body)
+                except Exception as exc:
+                    logger.error(
+                        f"Failed to deserialize mesage body {routing_key=}, {track_ids=}, "
+                        f"{body=}, {exc=}"
+                    )
+                    raise
+                else:
+                    logger.info(f"Procesing message {routing_key=}, {track_ids=}, {body=}")
 
+                kwargs = {}
+                if provide_routing_key:
+                    kwargs["routing_key"] = message.routing_key
+                if provide_message:
+                    kwargs["message"] = message
+                if provide_track_ids:
+                    kwargs["track_ids"] = tuple(track_ids)
+                kwargs[body_param_key] = body
+
+                try:
                     await func(**kwargs)
                 except Retry:
-                    logger.info(
-                        f"Retrying (forced) {message.message_id}: routing key: "
-                        f"{message.routing_key}, body: {message.body}"
-                    )
+                    logger.info(f"Retrying (forced) {routing_key=}, {track_ids=}, {body=}")
                     await message.nack(requeue=True)
                 except Reject:
-                    logger.info(
-                        f"Rejecting, this message will likely end up in DLX {message.message_id}: "
-                        f"routing key: {message.routing_key}, body: {message.body}"
+                    logger.warning(
+                        f"Rejecting, this message will likely end up in DLX {routing_key=}, "
+                        f"{track_ids=}, {body=}"
                     )
                     await message.nack(requeue=False)
                 except Exception:
-                    logger.info(
-                        f"{'Retrying' if retry_on_error else 'Aborting'} {message.message_id}: "
-                        f"routing key: {message.routing_key}, body: {message.body}"
+                    logger.warning(
+                        f"{'Retrying' if retry_on_error else 'Aborting'} {routing_key=}, "
+                        f"{track_ids=}, {body=}"
                     )
                     if retry_on_error:
                         await message.nack(requeue=True)
                     else:
                         await message.ack()
                 else:
+                    logger.info(f"Sucess {routing_key=}, {track_ids=}, {body=}")
                     await message.ack()
-                    logger.info(
-                        f"Sucess {message.message_id}: routing key: {message.routing_key}, body: "
-                        f"{message.body}"
-                    )
+                _track_ids.reset(token)
 
             async def _handler(message: AbstractIncomingMessage) -> None:
                 if self._shutdown_future is not None and self._shutdown_future.done():
@@ -400,6 +427,17 @@ class Outbox:
             )
             await listener.queue.bind(exchange, listener.binding_key)
 
+    @contextmanager
+    def tracking(self) -> Generator[None, None, None]:
+        track_ids = _track_ids.get()
+        track_ids = track_ids + (str(uuid.uuid4()),)
+        token = _track_ids.set(track_ids)
+        yield
+        _track_ids.reset(token)
+
+    def get_track_ids(self) -> tuple[str, ...]:
+        return _track_ids.get()
+
 
 outbox = Outbox()
 setup = outbox.setup
@@ -407,3 +445,5 @@ emit = outbox.emit
 message_relay = outbox.message_relay
 listen = outbox.listen
 worker = outbox.worker
+tracking = outbox.tracking
+get_track_ids = outbox.get_track_ids
