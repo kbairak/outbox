@@ -96,7 +96,7 @@ class Outbox:
         retry_on_error: bool | None = None,
         expiration: DateType | None = None,
         clean_up_after: (
-            Literal["IMMEDIATELY"] | Literal["NEVER"] | datetime.timedelta | None
+            Literal["IMMEDIATELY"] | Literal["NEVER"] | datetime.timedelta | int | float | None
         ) = None,
     ) -> None:
         if db_engine is not None and db_engine_url is not None:
@@ -137,6 +137,12 @@ class Outbox:
             logger.debug(f"Set up non-default expiration: {self.expiration}")
 
         if clean_up_after is not None:
+            if isinstance(clean_up_after, (int, float)) or (
+                isinstance(clean_up_after, str) and clean_up_after not in ("IMMEDIATELY", "NEVER")
+            ):
+                milliseconds = encode_expiration(clean_up_after)
+                assert milliseconds is not None
+                clean_up_after = datetime.timedelta(milliseconds=int(milliseconds))
             self.clean_up_after = clean_up_after
             logger.debug(f"Set up non-default clean_up_after: {self.clean_up_after}")
 
@@ -170,7 +176,6 @@ class Outbox:
             body = json.dumps(body).encode()
 
         outbox_row = OutboxTable(routing_key=routing_key, body=body)
-
         if expiration is not None:
             milliseconds = encode_expiration(expiration)
             assert milliseconds is not None
@@ -236,9 +241,7 @@ class Outbox:
                     expiration = outbox_row.expiration or self.expiration
                     await exchange.publish(
                         aio_pika.Message(
-                            outbox_row.body,
-                            content_type="application/json",
-                            expiration=expiration,
+                            outbox_row.body, content_type="application/json", expiration=expiration
                         ),
                         outbox_row.routing_key,
                     )

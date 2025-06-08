@@ -393,3 +393,5 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 - Don't retry immediately, implement a backoff strategy
 - Find a way to distribute multiple workers
 - Console scripts for message relay and worker
+- Max retries
+- track IDs

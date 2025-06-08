@@ -1,9 +1,8 @@
 import asyncio
-import datetime
 import logging
+import sys
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from testcontainers.core.utils import sys
 
 import outbox
 from outbox import emit, listen
