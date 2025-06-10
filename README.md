@@ -417,7 +417,6 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ## TODOs
 
-- Use dataclass for Outbox
 - Dependency injection on listen
 - Console scripts for message relay and worker
 - Don't retry immediately, implement a backoff strategy

@@ -8,7 +8,7 @@ import signal
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields
 from typing import Any, Callable, Coroutine, Generator, Literal, cast
 
 import aio_pika
@@ -92,105 +92,61 @@ _track_ids: ContextVar[tuple[str, ...],] = ContextVar(
 )
 
 
+@dataclass
 class Outbox:
-    def __init__(self, **kwargs):
-        self.db_engine: AsyncEngine | None = None
-        self._rmq_connection: AbstractConnection | None = None
-        self._rmq_connection_url: str | None = None
-        self.exchange_name = "outbox_exchange"
-        self.poll_interval = 1.0
-        self.retry_on_error = True
-        self.expiration = None
-        self.clean_up_after = "IMMEDIATELY"
-        self.retry_limit: int | None = None
-        OutboxTable.__tablename__ = "outbox_table"
+    db_engine: AsyncEngine | None = None
+    db_engine_url: str | None = None
+    rmq_connection: AbstractConnection | None = None
+    rmq_connection_url: str | None = None
+    exchange_name: str = "outbox_exchange"
+    poll_interval: float = 1.0
+    retry_on_error: bool = True
+    expiration: DateType | None = None
+    clean_up_after: (
+        Literal["IMMEDIATELY"] | Literal["NEVER"] | datetime.timedelta | int | float | None
+    ) = None
+    retry_limit: int | None = None
+    table_name: str = "outbox_table"
+    _listeners: list[Listener] = field(default_factory=list)
+    _table_created: bool = False
+    _tasks: set[asyncio.Task] = field(default_factory=set)
+    _shutdown_future: asyncio.Future | None = None
 
-        self._listeners: list[Listener] = []
-        self._table_created = False
-        self._tasks = set()
-        self._shutdown_future: asyncio.Future | None = None
-
-        self.setup(**kwargs)
-
-    def setup(
-        self,
-        db_engine: AsyncEngine | None = None,
-        db_engine_url: str | None = None,
-        table_name: str | None = None,
-        rmq_connection: AbstractConnection | None = None,
-        rmq_connection_url: str | None = None,
-        exchange_name: str | None = None,
-        poll_interval: float | None = None,
-        retry_limit: int | None = None,
-        expiration: DateType | None = None,
-        retry_on_error: bool | None = None,
-        clean_up_after: (
-            Literal["IMMEDIATELY"] | Literal["NEVER"] | datetime.timedelta | int | float | None
-        ) = None,
-    ) -> None:
-        if db_engine is not None and db_engine_url is not None:
+    def __post_init__(self):
+        if self.db_engine is not None and self.db_engine_url is not None:
             raise ValueError("You cannot set both db_engine and db_engine_url")
-        if rmq_connection is not None and rmq_connection_url is not None:
+        if self.rmq_connection is not None and self.rmq_connection_url is not None:
             raise ValueError("You cannot set both rmq_connection and rmq_connection_url")
-
-        if db_engine is not None:
-            self.db_engine = db_engine
-            logger.debug("Set up DB engine")
-        if db_engine_url is not None:
-            self.db_engine = create_async_engine(db_engine_url)
-            logger.debug("Set up DB engine")
-
-        if table_name is not None:
-            OutboxTable.__tablename__ = table_name
-
-        if rmq_connection is not None:
-            self._rmq_connection = rmq_connection
-            logger.debug("Set up RMQ connection")
-        if rmq_connection_url is not None:
-            self._rmq_connection_url = rmq_connection_url
-
-        if exchange_name is not None:
-            self.exchange_name = exchange_name
-            logger.debug(f"Set up non-deault exchange name: {self.exchange_name}")
-
-        if poll_interval is not None:
-            self.poll_interval = poll_interval
-            logger.debug(f"Set up non-deault poll interval: {self.poll_interval}")
-
-        if retry_on_error is not None:
-            self.retry_on_error = retry_on_error
-            logger.debug(f"Set up non-default retry_on_error: {self.retry_on_error}")
-
-        if expiration is not None:
-            self.expiration = expiration
-            logger.debug(f"Set up non-default expiration: {self.expiration}")
-
-        if clean_up_after is not None:
-            if isinstance(clean_up_after, (int, float)) or (
-                isinstance(clean_up_after, str) and clean_up_after not in ("IMMEDIATELY", "NEVER")
+        if self.db_engine_url is not None:
+            self.db_engine = create_async_engine(self.db_engine_url)
+        if self.table_name is not None:
+            OutboxTable.__tablename__ = self.table_name
+        if self.clean_up_after is not None:
+            if isinstance(self.clean_up_after, (int, float)) or (
+                isinstance(self.clean_up_after, str)
+                and self.clean_up_after not in ("IMMEDIATELY", "NEVER")
             ):
-                milliseconds = encode_expiration(clean_up_after)
+                milliseconds = encode_expiration(self.clean_up_after)
                 assert milliseconds is not None
-                clean_up_after = datetime.timedelta(milliseconds=int(milliseconds))
-            self.clean_up_after = clean_up_after
-            logger.debug(f"Set up non-default clean_up_after: {self.clean_up_after}")
+                self.clean_up_after = datetime.timedelta(milliseconds=int(milliseconds))
 
-        if retry_limit is not None:
-            self.retry_limit = retry_limit
-            logger.debug(f"Set up non-default retry_limit: {self.retry_limit}")
+    def setup(self, **kwargs):
+        field_names = {field.name for field in fields(self)}
+        for key, value in kwargs.items():
+            if key not in field_names:
+                raise ValueError(f"Invalid configuration key: {key}")
+            setattr(self, key, value)
 
-    async def _ensure_dataabase(self) -> None:
+    async def _ensure_database(self) -> None:
         if not self._table_created and self.db_engine:
             async with self.db_engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
             self._table_created = True
-            logger.debug("Created outbox table in the database")
 
     async def _get_rmq_connection(self) -> AbstractConnection | None:
-        if self._rmq_connection is None and self._rmq_connection_url is not None:
-            self._rmq_connection = await aio_pika.connect(self._rmq_connection_url)
-            logger.debug("Set up RMQ connection")
-        return self._rmq_connection
+        if self.rmq_connection is None and self.rmq_connection_url is not None:
+            self.rmq_connection = await aio_pika.connect(self.rmq_connection_url)
+        return self.rmq_connection
 
     async def emit(
         self,
@@ -202,7 +158,7 @@ class Outbox:
         expiration: DateType = None,
         eta: DateType | None = None,
     ) -> None:
-        await self._ensure_dataabase()
+        await self._ensure_database()
 
         if isinstance(body, BaseModel):
             body = body.model_dump_json().encode()
@@ -239,7 +195,7 @@ class Outbox:
         rmq_connection = await self._get_rmq_connection()
         if rmq_connection is None:
             raise ValueError("RabbitMQ connection is not set up.")
-        await self._ensure_dataabase()
+        await self._ensure_database()
 
         logger.info(f"Starting message relay on exchange: {self.exchange_name} ...")
         channel = await rmq_connection.channel()
