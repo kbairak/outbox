@@ -2,77 +2,17 @@ import asyncio
 import itertools
 import json
 import uuid
-from typing import Any, AsyncGenerator, Callable, Coroutine, Protocol
+from typing import Callable, Coroutine, Protocol
 from unittest.mock import AsyncMock
 
 import aio_pika
 import pytest
-import pytest_asyncio
-from aio_pika.abc import AbstractConnection, DateType
-from pydantic import BaseModel
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
-from testcontainers.rabbitmq import RabbitMqContainer
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from outbox import Outbox, OutboxTable, Reject, Retry
 
-
-class Person(BaseModel):
-    name: str
-
-
-@pytest.fixture
-def db_engine() -> AsyncEngine:
-    return create_async_engine("sqlite+aiosqlite://")
-
-
-@pytest_asyncio.fixture(loop_scope="session")
-async def session(db_engine: AsyncEngine) -> AsyncGenerator[AsyncSession, None]:
-    async with AsyncSession(db_engine) as session:
-        yield session
-
-
-@pytest_asyncio.fixture(scope="session", loop_scope="session")
-async def rmq_connection():
-    with RabbitMqContainer("rabbitmq:4.1") as rabbitmq:
-        connection = await aio_pika.connect(
-            f"amqp://{rabbitmq.username}:{rabbitmq.password}@{rabbitmq.get_container_host_ip()}:"
-            f"{rabbitmq.get_exposed_port(rabbitmq.port)}/"
-        )
-        async with connection:
-            yield connection
-
-
-@pytest_asyncio.fixture(loop_scope="session")
-async def outbox(db_engine: AsyncEngine, rmq_connection: AbstractConnection) -> Outbox:
-    outbox = Outbox(db_engine=db_engine, rmq_connection=rmq_connection, clean_up_after="NEVER")
-    return outbox
-
-
-class EmitType(Protocol):
-    async def __call__(
-        self, session: AsyncSession, routing_key: str, body: Any, *, expiration: DateType = None
-    ) -> None: ...
-
-
-@pytest.fixture
-def emit(outbox: Outbox) -> EmitType:
-    return outbox.emit
-
-
-class ListenType(Protocol):
-    def __call__(
-        self,
-        binding_key: str,
-        queue_name: str | None = None,
-        retry_on_error: bool | None = None,
-        tags: set[str] | None = None,
-    ) -> Callable[[Callable[..., Coroutine[None, None, None]]], None]: ...
-
-
-@pytest.fixture
-def listen(outbox: Outbox) -> ListenType:
-    return outbox.listen
+from .utils import EmitType, ListenType, Person, get_dlq_message_count, run_worker
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -144,14 +84,14 @@ async def test_message_relay(
 @pytest.mark.asyncio(loop_scope="session")
 async def test_register_listener(listen: ListenType, outbox: Outbox) -> None:
     # test
-    @listen("test_binding_key", queue_name="test_queue_name")
+    @listen("test_register_listener_binding_key", queue_name="test_register_listener_queue")
     async def _(_):  # pragma: no cover
         pass
 
     # assert
     (listener,) = outbox._listeners
-    assert listener.queue_name == "test_queue_name"
-    assert listener.binding_key == "test_binding_key"
+    assert listener.queue_name == "test_register_listener_queue"
+    assert listener.binding_key == "test_register_listener_binding_key"
     assert listener.queue == None
     assert listener.consumer_tag == None
 
@@ -160,7 +100,7 @@ async def test_register_listener(listen: ListenType, outbox: Outbox) -> None:
 async def test_worker(
     listen: ListenType, emit: EmitType, session: AsyncSession, outbox: Outbox
 ) -> None:
-    # setup
+    # arrange
     callcount = 0
     retrieved_argument = None
 
@@ -176,10 +116,7 @@ async def test_worker(
     await outbox._consume_outbox_table()
 
     # test
-    try:
-        await asyncio.wait_for(outbox.worker(), timeout=0.2)
-    except asyncio.TimeoutError:
-        pass
+    await run_worker(outbox, timeout=0.2)
 
     # assert
     assert callcount == 1
@@ -190,7 +127,7 @@ async def test_worker(
 async def test_worker_with_pydantic(
     listen: ListenType, emit: EmitType, session: AsyncSession, outbox: Outbox
 ) -> None:
-    # setup
+    # arrange
     callcount = 0
     retrieved_argument = None
 
@@ -206,10 +143,7 @@ async def test_worker_with_pydantic(
     await outbox._consume_outbox_table()
 
     # test
-    try:
-        await asyncio.wait_for(outbox.worker(), timeout=0.2)
-    except asyncio.TimeoutError:
-        pass
+    await run_worker(outbox, timeout=0.2)
 
     # assert
     assert callcount == 1
@@ -220,7 +154,7 @@ async def test_worker_with_pydantic(
 async def test_worker_with_wildcard(
     listen: ListenType, emit: EmitType, outbox: Outbox, session: AsyncSession
 ) -> None:
-    # setup
+    # arrange
     callcount = 0
     retrieved_routing_key = None
     retrieved_argument = None
@@ -238,10 +172,7 @@ async def test_worker_with_wildcard(
     await outbox._consume_outbox_table()
 
     # test
-    try:
-        await asyncio.wait_for(outbox.worker(), timeout=0.2)
-    except asyncio.TimeoutError:
-        pass
+    await run_worker(outbox, timeout=0.2)
 
     # assert
     assert callcount == 1
@@ -253,7 +184,7 @@ async def test_worker_with_wildcard(
 async def test_retry(
     listen: ListenType, emit: EmitType, outbox: Outbox, session: AsyncSession
 ) -> None:
-    # setup
+    # arrange
     callcount = 0
     retrieved_argument = None
 
@@ -271,10 +202,7 @@ async def test_retry(
     await outbox._consume_outbox_table()
 
     # test
-    try:
-        await asyncio.wait_for(outbox.worker(), timeout=0.2)
-    except asyncio.TimeoutError:
-        pass
+    await run_worker(outbox, timeout=0.2)
 
     # assert
     assert callcount == 3
@@ -285,7 +213,7 @@ async def test_retry(
 async def test_no_retry_with_setup(
     listen: ListenType, emit: EmitType, outbox: Outbox, session: AsyncSession
 ) -> None:
-    # setup
+    # arrange
     outbox.setup(retry_on_error=False)
     callcount = 0
     retrieved_argument = None
@@ -304,10 +232,7 @@ async def test_no_retry_with_setup(
     await outbox._consume_outbox_table()
 
     # test
-    try:
-        await asyncio.wait_for(outbox.worker(), timeout=0.2)
-    except asyncio.TimeoutError:
-        pass
+    await run_worker(outbox, timeout=0.2)
 
     # assert
     assert callcount == 1
@@ -318,7 +243,7 @@ async def test_no_retry_with_setup(
 async def test_no_retry_with_listen(
     listen: ListenType, emit: EmitType, outbox: Outbox, session: AsyncSession
 ) -> None:
-    # setup
+    # arrange
     callcount = 0
     retrieved_argument = None
 
@@ -336,10 +261,7 @@ async def test_no_retry_with_listen(
     await outbox._consume_outbox_table()
 
     # test
-    try:
-        await asyncio.wait_for(outbox.worker(), timeout=0.2)
-    except asyncio.TimeoutError:
-        pass
+    await run_worker(outbox, timeout=0.2)
 
     # assert
     assert callcount == 1
@@ -350,7 +272,7 @@ async def test_no_retry_with_listen(
 async def test_force_retry_with_setup(
     listen: ListenType, emit: EmitType, session: AsyncSession, outbox: Outbox
 ) -> None:
-    # setup
+    # arrange
     outbox.setup(retry_on_error=False)
     callcount = 0
     retrieved_argument = None
@@ -369,10 +291,7 @@ async def test_force_retry_with_setup(
     await outbox._consume_outbox_table()
 
     # test
-    try:
-        await asyncio.wait_for(outbox.worker(), timeout=0.2)
-    except asyncio.TimeoutError:
-        pass
+    await run_worker(outbox, timeout=0.2)
 
     # assert
     assert callcount == 3
@@ -383,7 +302,7 @@ async def test_force_retry_with_setup(
 async def test_force_retry_with_listen(
     listen: ListenType, emit: EmitType, outbox: Outbox, session: AsyncSession
 ) -> None:
-    # setup
+    # arrange
     callcount = 0
     retrieved_argument = None
 
@@ -401,10 +320,7 @@ async def test_force_retry_with_listen(
     await outbox._consume_outbox_table()
 
     # test
-    try:
-        await asyncio.wait_for(outbox.worker(), timeout=0.2)
-    except asyncio.TimeoutError:
-        pass
+    await run_worker(outbox, timeout=0.2)
 
     # assert
     assert callcount == 3
@@ -415,7 +331,7 @@ async def test_force_retry_with_listen(
 async def test_emit_and_consume_binary(
     listen: ListenType, emit: EmitType, outbox: Outbox, session: AsyncSession
 ) -> None:
-    # setup
+    # arrange
     callcount = 0
     retrieved_argument = None
 
@@ -431,10 +347,7 @@ async def test_emit_and_consume_binary(
     await outbox._consume_outbox_table()
 
     # test
-    try:
-        await asyncio.wait_for(outbox.worker(), timeout=0.2)
-    except asyncio.TimeoutError:
-        pass
+    await run_worker(outbox, timeout=0.2)
 
     # assert
     assert callcount == 1
@@ -446,7 +359,8 @@ async def test_emit_and_consume_binary(
 async def test_dead_letter(
     listen: ListenType, emit: EmitType, session: AsyncSession, outbox: Outbox
 ):
-    @listen("routing_key", queue_name="test_queue_name")
+    # arrange
+    @listen("routing_key", queue_name="test_dead_letter_queue_name")
     async def _(person):
         raise Reject("test")
 
@@ -456,24 +370,18 @@ async def test_dead_letter(
     await outbox._consume_outbox_table()
 
     # test
-    try:
-        await asyncio.wait_for(outbox.worker(), timeout=0.2)
-    except asyncio.TimeoutError:
-        pass
+    await run_worker(outbox, timeout=0.2)
 
-    # get queue info
-    connection = await outbox._get_rmq_connection()
-    assert connection is not None
-    channel = await connection.channel()
-    dlq = await channel.get_queue("dlq_test_queue_name")
-    assert dlq.declaration_result.message_count == 1
+    # assert
+    assert (await get_dlq_message_count(outbox, "test_dead_letter_queue_name")) == 1
 
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_dead_letter_with_expiration(
     listen: ListenType, emit: EmitType, session: AsyncSession, outbox: Outbox
 ):
-    @listen("routing_key", queue_name="test_queue_name2")
+    # arrange
+    @listen("routing_key", queue_name="test_dead_letter_with_expiration_queue_name2")
     async def _(_):
         raise Retry("test")
 
@@ -483,21 +391,17 @@ async def test_dead_letter_with_expiration(
     await outbox._consume_outbox_table()
 
     # test
-    try:
-        await asyncio.wait_for(outbox.worker(), timeout=0.2)
-    except asyncio.TimeoutError:
-        pass
+    await run_worker(outbox, timeout=0.2)
 
-    # get queue info
-    connection = await outbox._get_rmq_connection()
-    assert connection is not None
-    channel = await connection.channel()
-    dlq = await channel.get_queue("dlq_test_queue_name2")
-    assert dlq.declaration_result.message_count == 1
+    # assert
+    assert (
+        await get_dlq_message_count(outbox, "test_dead_letter_with_expiration_queue_name2")
+    ) == 1
 
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_graceful_shutdown(emit, session, outbox: Outbox, listen):
+    # arrange
     before, after = 0, 0
 
     @listen("routing_key")
@@ -517,15 +421,18 @@ async def test_graceful_shutdown(emit, session, outbox: Outbox, listen):
     await asyncio.sleep(0.2)  # Give some time for the task to reach `sleep`
     assert (before, after) == (1, 0)
 
+    # test
     assert outbox._shutdown_future is not None
     outbox._shutdown_future.set_result(None)  # Simulate SIGINT/TERM
-
     await asyncio.wait((worker_task,))
+
+    # assert
     assert (before, after) == (1, 1)
 
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_messages_not_lost_during_graceful_shutdown(emit, session, outbox: Outbox, listen):
+    # arrange
     before, after = 0, 0
 
     @listen("routing_key")
@@ -557,11 +464,13 @@ async def test_messages_not_lost_during_graceful_shutdown(emit, session, outbox:
     await asyncio.wait((worker_task,))
     assert (before, after) == (1, 1)
 
+    # test
     # Start the worker again
     worker_task = asyncio.create_task(outbox.worker())
     await asyncio.sleep(0.4)  # Give some time for the task to reach `sleep`
     assert (before, after) == (2, 1)
 
+    # assert
     assert outbox._shutdown_future is not None
     outbox._shutdown_future.set_result(None)  # Simulate SIGINT/TERM
     await asyncio.wait((worker_task,))
@@ -576,6 +485,7 @@ async def test_track_ids(
     session: AsyncSession,
     listen: ListenType,
 ):
+    # arrange
     counter = itertools.count(0)
     monkeypatch.setattr(uuid, "uuid4", lambda: next(counter))
 
@@ -586,7 +496,7 @@ async def test_track_ids(
         await emit(session, "r1", {})
         await session.commit()
 
-    @listen("r1", queue_name="r1")
+    @listen("r1", queue_name="test_track_ids_queue_1")
     async def _(_) -> None:
         logs.append(outbox.get_track_ids())
         await emit(session, "r2", {})
@@ -594,18 +504,17 @@ async def test_track_ids(
         await session.commit()
         await outbox._consume_outbox_table()
 
-    @listen("r2", queue_name="r2")
+    @listen("r2", queue_name="test_track_ids_queue_2")
     async def _(_) -> None:
         logs.append(outbox.get_track_ids())
 
     await outbox._set_up_queues()
     await outbox._consume_outbox_table()
 
-    try:
-        await asyncio.wait_for(outbox.worker(), 0.6)
-    except asyncio.TimeoutError:
-        pass
+    # test
+    await run_worker(outbox, timeout=0.6)
 
+    # assert
     assert logs == [("0",), ("0", "1"), ("0", "1", "2"), ("0", "1", "3")]
 
 
@@ -617,6 +526,7 @@ async def test_track_ids_with_parameter(
     session: AsyncSession,
     listen: ListenType,
 ):
+    # arrange
     counter = itertools.count(0)
     monkeypatch.setattr(uuid, "uuid4", lambda: next(counter))
 
@@ -627,7 +537,7 @@ async def test_track_ids_with_parameter(
         await emit(session, "r1", {})
         await session.commit()
 
-    @listen("r1", queue_name="r1")
+    @listen("r1", queue_name="test_track_ids_with_parameter_queue1")
     async def _(_, track_ids: list[str]) -> None:
         logs.append(track_ids)
         await emit(session, "r2", {})
@@ -635,23 +545,23 @@ async def test_track_ids_with_parameter(
         await session.commit()
         await outbox._consume_outbox_table()
 
-    @listen("r2", queue_name="r2")
+    @listen("r2", queue_name="test_track_ids_with_parameter_queue2")
     async def _(_, track_ids: list[str]) -> None:
         logs.append(track_ids)
 
     await outbox._set_up_queues()
     await outbox._consume_outbox_table()
 
-    try:
-        await asyncio.wait_for(outbox.worker(), 0.6)
-    except asyncio.TimeoutError:
-        pass
+    # test
+    await run_worker(outbox, timeout=0.6)
 
+    # assert
     assert logs == [("0",), ("0", "1"), ("0", "1", "2"), ("0", "1", "3")]
 
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_tags(emit: EmitType, session: AsyncSession, listen: ListenType, outbox: Outbox):
+    # arrange
     await emit(session, "r1", {})
     await emit(session, "r2", {})
     await session.commit()
@@ -671,9 +581,91 @@ async def test_tags(emit: EmitType, session: AsyncSession, listen: ListenType, o
     await outbox._set_up_queues()
     await outbox._consume_outbox_table()
 
-    try:
-        await asyncio.wait_for(outbox.worker(tags={"r1"}), 0.4)
-    except asyncio.TimeoutError:
-        pass
+    # test
+    await run_worker(outbox, timeout=0.4, tags={"r1"})
 
+    # assert
     assert (r1_called, r2_called) == (True, False)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_emit_retry_limit(
+    emit: EmitType, session: AsyncSession, listen: ListenType, outbox: Outbox
+):
+    # arrange
+    await emit(session, "r1", {}, retry_limit=3)
+    await session.commit()
+
+    callcount = 0
+
+    @listen("r1", queue_name="test_emit_retry_limit_queue")
+    async def _(_):
+        nonlocal callcount
+        callcount += 1
+        _ = 3 / 0
+
+    await outbox._set_up_queues()
+    await outbox._consume_outbox_table()
+
+    # test
+    await run_worker(outbox, timeout=0.4)
+
+    # assert
+    assert callcount == 3
+    assert (await get_dlq_message_count(outbox, "test_emit_retry_limit_queue")) == 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_listen_retry_limit(
+    emit: EmitType, session: AsyncSession, listen: ListenType, outbox: Outbox
+):
+    # arrange
+    await emit(session, "r1", {})
+    await session.commit()
+
+    callcount = 0
+
+    @listen("r1", retry_limit=3, queue_name="test_listen_retry_limit_queue")
+    async def _(_):
+        nonlocal callcount
+        callcount += 1
+        _ = 3 / 0
+
+    await outbox._set_up_queues()
+    await outbox._consume_outbox_table()
+
+    # test
+    await run_worker(outbox, timeout=0.4)
+
+    # assert
+    assert callcount == 3
+    assert (await get_dlq_message_count(outbox, "test_listen_retry_limit_queue")) == 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_setup_retry_limit(
+    emit: EmitType, session: AsyncSession, listen: ListenType, outbox: Outbox
+):
+    # arrange
+    outbox.setup(retry_limit=3)
+
+    await emit(session, "r1", {})
+    await session.commit()
+
+    callcount = 0
+
+    @listen("r1", queue_name="test_setup_retry_limit_queue")
+    async def _(_):
+        nonlocal callcount
+        callcount += 1
+        _ = 3 / 0
+
+    await outbox._set_up_queues()
+    await outbox._consume_outbox_table()
+
+    # test
+    await run_worker(outbox, timeout=0.4)
+
+    # assert
+    assert callcount == 3
+    assert (await get_dlq_message_count(outbox, "test_setup_retry_limit_queue")) == 1

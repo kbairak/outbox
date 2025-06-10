@@ -3,6 +3,7 @@ import datetime
 import inspect
 import json
 import logging
+import reprlib
 import signal
 import uuid
 from contextlib import contextmanager
@@ -18,9 +19,10 @@ from aio_pika.abc import (
     AbstractQueue,
     ConsumerTag,
     DateType,
+    HeadersType,
 )
 from aio_pika.message import encode_expiration
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlalchemy import JSON, DateTime, Text, delete, func, select
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
@@ -39,22 +41,31 @@ class OutboxTable(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     routing_key: Mapped[str] = mapped_column(Text)
     body: Mapped[bytes] = mapped_column()
+    track_ids: Mapped[list[str]] = mapped_column(JSON)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    retry_limit: Mapped[int | None] = mapped_column()
+    expiration: Mapped[datetime.timedelta | None] = mapped_column()
     send_after: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
     sent_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
-    expiration: Mapped[datetime.timedelta | None] = mapped_column()
-    track_ids: Mapped[list[str]] = mapped_column(JSON)
 
     def __repr__(self):
-        routing_key, body, track_ids = self.routing_key, self.body.decode(), self.track_ids
-        args = [f"{routing_key=}", f"{body=}"]
+        routing_key = self.routing_key
+        body = reprlib.repr(self.body)
+        track_ids = self.track_ids
+        created_at = self.created_at
+        args = [f"{routing_key=}", f"{body=}", f"{track_ids=}", f"{created_at=}"]
+        if self.send_after != self.created_at:
+            send_after = self.send_after
+            args.append(f"{send_after=}")
+        if self.retry_limit is not None:
+            retry_limit = self.retry_limit
+            args.append(f"{retry_limit=}")
         if self.expiration:
             expiration = self.expiration.total_seconds
             args.append(f"{expiration=}")
-        args.append(f"{track_ids=}")
-        return f"OutboxTable({routing_key=}, {body=})"
+        return f"OutboxTable({', '.join(args)})"
 
 
 class Retry(Exception):
@@ -75,7 +86,10 @@ class Listener:
     consumer_tag: ConsumerTag | None = None
 
 
-_track_ids: ContextVar[tuple[str, ...],] = ContextVar("track_ids", default=())
+_track_ids: ContextVar[tuple[str, ...],] = ContextVar(
+    "track_ids",
+    default=(),
+)
 
 
 class Outbox:
@@ -88,6 +102,7 @@ class Outbox:
         self.retry_on_error = True
         self.expiration = None
         self.clean_up_after = "IMMEDIATELY"
+        self.retry_limit: int | None = None
         OutboxTable.__tablename__ = "outbox_table"
 
         self._listeners: list[Listener] = []
@@ -106,8 +121,9 @@ class Outbox:
         rmq_connection_url: str | None = None,
         exchange_name: str | None = None,
         poll_interval: float | None = None,
-        retry_on_error: bool | None = None,
+        retry_limit: int | None = None,
         expiration: DateType | None = None,
+        retry_on_error: bool | None = None,
         clean_up_after: (
             Literal["IMMEDIATELY"] | Literal["NEVER"] | datetime.timedelta | int | float | None
         ) = None,
@@ -159,6 +175,10 @@ class Outbox:
             self.clean_up_after = clean_up_after
             logger.debug(f"Set up non-default clean_up_after: {self.clean_up_after}")
 
+        if retry_limit is not None:
+            self.retry_limit = retry_limit
+            logger.debug(f"Set up non-default retry_limit: {self.retry_limit}")
+
     async def _ensure_dataabase(self) -> None:
         if not self._table_created and self.db_engine:
             async with self.db_engine.begin() as conn:
@@ -178,6 +198,7 @@ class Outbox:
         routing_key: str,
         body: Any,
         *,
+        retry_limit: int | None = None,
         expiration: DateType = None,
         eta: DateType | None = None,
     ) -> None:
@@ -188,10 +209,13 @@ class Outbox:
         elif not isinstance(body, bytes):
             body = json.dumps(body).encode()
 
+        now = datetime.datetime.now(datetime.UTC)
         outbox_row = OutboxTable(
             routing_key=routing_key,
             body=body,
             track_ids=list(self.get_track_ids() + (str(uuid.uuid4()),)),
+            retry_limit=retry_limit,
+            created_at=now,
         )
         if expiration is not None:
             milliseconds = encode_expiration(expiration)
@@ -204,7 +228,7 @@ class Outbox:
                 milliseconds=int(milliseconds)
             )
         else:
-            outbox_row.send_after = datetime.datetime.now(datetime.UTC)
+            outbox_row.send_after = outbox_row.created_at
         session.add(outbox_row)
 
         logger.info(f"Emitted message to outbox: {outbox_row}")
@@ -253,35 +277,40 @@ class Outbox:
                 except NoResultFound:
                     logger.debug("No unsent messages found, waiting...")
                     break
+
+                logger.debug(f"Processing message: {outbox_row}")
+                expiration = outbox_row.expiration or self.expiration
+                headers = {"x-outbox-track-ids": json.dumps(outbox_row.track_ids)}
+                if outbox_row.retry_limit is not None:
+                    headers["x-outbox-retry-limit"] = str(outbox_row.retry_limit)
+                headers = cast(HeadersType, headers)
+                await exchange.publish(
+                    aio_pika.Message(
+                        outbox_row.body,
+                        content_type="application/json",
+                        expiration=expiration,
+                        headers=headers,
+                    ),
+                    outbox_row.routing_key,
+                )
+                logger.debug(f"Sent message: {outbox_row} to RabbitMQ")
+                if self.clean_up_after == "IMMEDIATELY":
+                    await session.delete(outbox_row)
                 else:
-                    logger.debug(f"Processing message: {outbox_row}")
-                    expiration = outbox_row.expiration or self.expiration
-                    await exchange.publish(
-                        aio_pika.Message(
-                            outbox_row.body,
-                            content_type="application/json",
-                            expiration=expiration,
-                            headers={"x-outbox-track-ids": json.dumps(outbox_row.track_ids)},
-                        ),
-                        outbox_row.routing_key,
+                    outbox_row.sent_at = datetime.datetime.now(datetime.UTC)
+                if isinstance(self.clean_up_after, datetime.timedelta):
+                    stmt = delete(OutboxTable).where(
+                        OutboxTable.sent_at.is_not(None),
+                        OutboxTable.sent_at
+                        < datetime.datetime.now(datetime.UTC) - self.clean_up_after,
                     )
-                    logger.debug(f"Sent message: {outbox_row} to RabbitMQ")
-                    if self.clean_up_after == "IMMEDIATELY":
-                        await session.delete(outbox_row)
-                    else:
-                        outbox_row.sent_at = datetime.datetime.now(datetime.UTC)
-                    if isinstance(self.clean_up_after, datetime.timedelta):
-                        stmt = delete(OutboxTable).where(
-                            OutboxTable.sent_at.is_not(None),
-                            OutboxTable.sent_at
-                            < datetime.datetime.now(datetime.UTC) - self.clean_up_after,
-                        )
-                        await session.execute(stmt)
+                    await session.execute(stmt)
 
     def listen(
         self,
         binding_key: str,
         queue_name: str | None = None,
+        retry_limit: int | None = None,
         retry_on_error: bool | None = None,
         tags: set[str] | None = None,
     ) -> Callable[[Callable[..., Coroutine[None, None, None]]], None]:
@@ -296,23 +325,53 @@ class Outbox:
                 queue_name = f"{func.__module__}.{func.__qualname__}".replace("<", "").replace(
                     ">", ""
                 )
-            parameters = dict(inspect.signature(func).parameters.items())
-
-            provide_routing_key = "routing_key" in parameters
-            parameters.pop("routing_key", None)
-            provide_message = "message" in parameters
-            parameters.pop("message", None)
-            provide_track_ids = "track_ids" in parameters
-            parameters.pop("track_ids", None)
-
-            try:
-                ((body_param_key, body_param),) = list(parameters.items())
-            except ValueError:
+            parameters = inspect.signature(func).parameters
+            parameter_keys = set(parameters.keys()) - {
+                "routing_key",
+                "message",
+                "track_ids",
+                "retry_limit",
+                "retry_on_error",
+                "queue_name",
+                "attempt_count",
+            }
+            if len(parameter_keys) != 1:
                 raise ValueError("Worker functions must accept exactly one argument")
+            body_param_key = parameter_keys.pop()
+            body_param = parameters[body_param_key]
 
             async def _on_message(message: AbstractIncomingMessage) -> None:
-                track_ids = json.loads(cast(str, message.headers.get("x-outbox-track-ids", "[]")))
-                token = _track_ids.set(tuple(track_ids))
+                track_ids = tuple(
+                    json.loads(cast(str, message.headers.get("x-outbox-track-ids", "[]")))
+                )
+                token = _track_ids.set(track_ids)
+
+                nonlocal retry_limit
+                retry_limit = (
+                    cast(int | None, message.headers.get("x-outbox-retry-limit"))
+                    or retry_limit
+                    or self.retry_limit
+                )
+                if retry_limit is not None:
+                    retry_limit = int(retry_limit)
+
+                attempt_count = cast(str | None, message.headers.get("x-delivery-count"))
+                if attempt_count is not None:
+                    attempt_count = int(attempt_count)
+
+                if (
+                    retry_limit is not None
+                    and attempt_count is not None
+                    and attempt_count >= retry_limit
+                ):
+                    logger.warning(
+                        f"Message {message.routing_key} with track IDs {track_ids} "
+                        f"exceeded retry limit {retry_limit}, rejecting"
+                    )
+                    await message.nack(requeue=False)
+                    _track_ids.reset(token)
+                    return
+
                 routing_key, body = message.routing_key, message.body
                 try:
                     if issubclass(body_param.annotation, BaseModel):
@@ -330,14 +389,18 @@ class Outbox:
                 else:
                     logger.info(f"Procesing message {routing_key=}, {track_ids=}, {body=}")
 
-                kwargs = {}
-                if provide_routing_key:
-                    kwargs["routing_key"] = message.routing_key
-                if provide_message:
-                    kwargs["message"] = message
-                if provide_track_ids:
-                    kwargs["track_ids"] = tuple(track_ids)
-                kwargs[body_param_key] = body
+                kwargs = {body_param_key: body}
+                for attr in (
+                    "routing_key",
+                    "message",
+                    "track_ids",
+                    "retry_limit",
+                    "retry_on_error",
+                    "queue_name",
+                    "attempt_count",
+                ):
+                    if attr in parameters:
+                        kwargs[attr] = locals()[attr]
 
                 try:
                     await func(**kwargs)
@@ -420,7 +483,7 @@ class Outbox:
         )
         for listener in self._listeners:
             dead_letter_queue = await channel.declare_queue(
-                f"dlq_{listener.queue_name}", durable=True
+                f"dlq_{listener.queue_name}", durable=True, arguments={"x-queue-type": "quorum"}
             )
             await dead_letter_queue.bind(dead_letter_exchange, listener.queue_name)
 
@@ -434,6 +497,7 @@ class Outbox:
                 arguments={
                     "x-dead-letter-exchange": f"dlx_{self.exchange_name}",
                     "x-dead-letter-routing-key": listener.queue_name,
+                    "x-queue-type": "quorum",
                 },
             )
             await listener.queue.bind(exchange, listener.binding_key)
