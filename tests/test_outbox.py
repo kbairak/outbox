@@ -2,7 +2,7 @@ import asyncio
 import itertools
 import json
 import uuid
-from typing import Callable, Coroutine, Protocol
+from typing import Annotated
 from unittest.mock import AsyncMock
 
 import aio_pika
@@ -10,7 +10,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from outbox import Outbox, OutboxTable, Reject, Retry
+from outbox import Depends, Outbox, OutboxTable, Reject, Retry
 
 from .utils import EmitType, ListenType, Person, get_dlq_message_count, run_worker
 
@@ -669,3 +669,49 @@ async def test_setup_retry_limit(
     # assert
     assert callcount == 3
     assert (await get_dlq_message_count(outbox, "test_setup_retry_limit_queue")) == 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_annotations(
+    emit: EmitType, session: AsyncSession, listen: ListenType, outbox: Outbox
+):
+    await emit(session, "r1", {})
+    await session.commit()
+
+    startups, captured, cleanups = set(), set(), set()
+
+    def normal_dependency():
+        startups.add(1)
+        return 2
+
+    async def async_dependency():
+        startups.add(3)
+        return 4
+
+    def generator_dependency():
+        startups.add(5)
+        yield 6
+        cleanups.add(7)
+
+    async def async_generator_dependency():
+        startups.add(8)
+        yield 9
+        cleanups.add(10)
+
+    @listen("r1")
+    async def _(
+        _,
+        normal: Annotated[int, Depends(normal_dependency)],
+        asyn: Annotated[int, Depends(async_dependency)],
+        generator: Annotated[int, Depends(generator_dependency)],
+        async_generator: Annotated[int, Depends(async_generator_dependency)],
+    ):
+        captured.update([normal, asyn, generator, async_generator])
+
+    await outbox._set_up_queues()
+    await outbox._consume_outbox_table()
+    await run_worker(outbox, timeout=0.2)
+
+    assert startups == {1, 3, 5, 8}
+    assert captured == {2, 4, 6, 9}
+    assert cleanups == {7, 10}

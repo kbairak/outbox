@@ -9,7 +9,17 @@ import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields
-from typing import Any, Callable, Coroutine, Generator, Literal, cast
+from typing import (
+    Annotated,
+    Any,
+    Callable,
+    Coroutine,
+    Generator,
+    Literal,
+    cast,
+    get_args,
+    get_origin,
+)
 
 import aio_pika
 from aio_pika.abc import (
@@ -90,6 +100,11 @@ _track_ids: ContextVar[tuple[str, ...],] = ContextVar(
     "track_ids",
     default=(),
 )
+
+
+@dataclass
+class Depends:
+    func: Callable[[], Any]
 
 
 @dataclass
@@ -282,15 +297,28 @@ class Outbox:
                     ">", ""
                 )
             parameters = inspect.signature(func).parameters
-            parameter_keys = set(parameters.keys()) - {
-                "routing_key",
-                "message",
-                "track_ids",
-                "retry_limit",
-                "retry_on_error",
-                "queue_name",
-                "attempt_count",
-            }
+            parameter_keys = (
+                set(parameters.keys())
+                - {
+                    "routing_key",
+                    "message",
+                    "track_ids",
+                    "retry_limit",
+                    "retry_on_error",
+                    "queue_name",
+                    "attempt_count",
+                }
+                - {
+                    param_key
+                    for param_key, param_value in parameters.items()
+                    if (
+                        get_origin(param_value.annotation) is Annotated
+                        and len(args := get_args(param_value.annotation)) == 2
+                        and isinstance(args[1], Depends)
+                    )
+                }
+            )
+
             if len(parameter_keys) != 1:
                 raise ValueError("Worker functions must accept exactly one argument")
             body_param_key = parameter_keys.pop()
@@ -358,6 +386,29 @@ class Outbox:
                     if attr in parameters:
                         kwargs[attr] = locals()[attr]
 
+                generators, async_generators = [], []
+                for param_key, param_value in parameters.items():
+                    annotation = param_value.annotation
+                    if not (
+                        get_origin(annotation) is Annotated
+                        and len(args := get_args(annotation)) == 2
+                        and isinstance(args[1], Depends)
+                    ):
+                        continue
+                    dependency_func = args[1].func
+                    if inspect.isgeneratorfunction(dependency_func):
+                        generator = dependency_func()
+                        generators.append(generator)
+                        kwargs[param_key] = next(generator)
+                    elif inspect.isasyncgenfunction(dependency_func):
+                        generator = dependency_func()
+                        async_generators.append(generator)
+                        kwargs[param_key] = await anext(generator)
+                    elif inspect.iscoroutinefunction(dependency_func):
+                        kwargs[param_key] = await dependency_func()
+                    else:
+                        kwargs[param_key] = dependency_func()
+
                 try:
                     await func(**kwargs)
                 except Retry:
@@ -381,6 +432,12 @@ class Outbox:
                 else:
                     logger.info(f"Sucess {routing_key=}, {track_ids=}, {body=}")
                     await message.ack()
+                finally:
+                    for generator in generators:
+                        list(generator)
+                    for async_generator in async_generators:
+                        async for _ in async_generator:
+                            pass
                 _track_ids.reset(token)
 
             async def _handler(message: AbstractIncomingMessage) -> None:

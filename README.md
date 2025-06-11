@@ -270,6 +270,44 @@ async def on_user_event(routing_key: str, user):
 </details>
 
 <details>
+    <summary><h3>Dependency injection</h3></summary>
+
+Inspired by [FastAPI's dependecy injection](https://fastapi.tiangolo.com/tutorial/dependencies/), listener functions can use `outbox.Depends` to provide dependencies:
+
+```python
+from outbox import Depends
+
+async def get_session():
+    async with AsyncSession(db_engine) as session:
+        yield session
+
+@listen('user.created')
+async def on_user_created(
+    user: User, session: Annotated[AsyncSession, Depends(get_session)]
+):
+    session.add(Log(text=f"User {user.id} created"))
+    await session.commit()
+```
+
+Or, if you intend to use this often:
+
+```python
+from outbox import Depends
+
+async def get_session():
+    ...
+
+GetSession = Annotated[AsyncSession, Depends(get_session)]
+
+@listen('user.created')
+async def on_user_created(user: User, session: GetSession):
+    ...
+```
+
+For dependencies, you can use regular functions, async functions, regular generator functions and async generator functions.
+</details>
+
+<details>
     <summary><h3>Distribution of tasks to multiple workers</h3></summary>
 
 By default, workers will consume messages from all queues (1 queue is defined per listener function). If you want more control on which workers will consume from which queues, you can assign a set of tags on each listener and a set of tags when invoking the worker itself:
@@ -417,7 +455,6 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ## TODOs
 
-- Dependency injection on listen
 - Console scripts for message relay and worker
 - Don't retry immediately, implement a backoff strategy
 - uv cache for github actions
