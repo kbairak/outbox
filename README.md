@@ -557,6 +557,5 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 ## TODOs
 
 - Don't retry immediately, implement a backoff strategy
-- uv cache for github actions
 - Use msgpack (optionally) to reduce size
 - Use pg notify/listen to avoid polling the database
