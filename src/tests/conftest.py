@@ -14,7 +14,7 @@ from .utils import EmitType, ListenType
 
 @pytest.fixture
 def db_engine() -> AsyncEngine:
-    return create_async_engine("sqlite+aiosqlite://")
+    return create_async_engine("sqlite+aiosqlite:///:memory:")
 
 
 @pytest_asyncio.fixture(loop_scope="session")

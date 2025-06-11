@@ -394,6 +394,107 @@ The options are:
 </details>
 
 <details>
+    <summary><h3>Command line scripts for message relay and worker</h3></summary>
+
+#### Message relay
+
+  ```
+$ message_relay -h
+usage: message_relay [-h] --db-engine-url DB_ENGINE_URL
+                     --rmq-connection-url RMQ_CONNECTION_URL
+                     [--exchange-name EXCHANGE_NAME]
+                     [--poll-interval POLL_INTERVAL]
+                     [--expiration EXPIRATION]
+                     [--clean-up-after CLEAN_UP_AFTER]
+                     [--table-name TABLE_NAME] [-v]
+
+Polls the outbox database table, consumes unsent messages, and sends them
+to RabbitMQ
+
+options:
+  -h, --help            show this help message and exit
+  --db-engine-url DB_ENGINE_URL
+                        A string that indicates database dialect and
+                        connection arguments. Will be passed to
+                        SQLAlchemy. Follows the pattern
+                        '<database_type>+<dbapi>://<username>:<password>@<host>:<port>/<db_name>'.
+                        Make sure you use a DBAPI that supports async
+                        operations, like `asyncpg` for PostgreSQL or
+                        `aiosqlite` for SQLite. Examples:
+                        'postgresql+asyncpg://postgres:postgres@localhost:5432/postgres'
+                        or 'sqlite+aiosqlite:///:memory:'
+  --rmq-connection-url RMQ_CONNECTION_URL
+                        A string that indicates RabbitMQ connection
+                        parameters. Follows the pattern
+                        'amqp[s]://<username>:<password>@<host>:(<port>)/(virtualhost)'.
+                        Example: 'amqp://guest:guest@localhost:5672/'
+  --exchange-name EXCHANGE_NAME
+                        Name of the RabbitMQ exchange to use
+  --poll-interval POLL_INTERVAL
+                        Interval in seconds to poll the outbox table
+  --expiration EXPIRATION
+                        Expiration time in seconds for messages in
+                        RabbitMQ
+  --clean-up-after CLEAN_UP_AFTER
+                        How long to keep messages in the outbox table
+                        after they are sent. Can be 'IMMEDIATELY',
+                        'NEVER', or a float representing seconds.
+  --table-name TABLE_NAME
+                        Name of the outbox table to use. Defaults to
+                        'outbox'.
+  -v, --verbose         Increase verbosity
+```
+
+#### Worker
+
+  ```
+usage: worker [-h] --rmq-connection-url RMQ_CONNECTION_URL
+              [--db-engine-url DB_ENGINE_URL]
+              [--exchange-name EXCHANGE_NAME] [--no-retry-on-error]
+              [--retry-limit RETRY_LIMIT] [--tags TAGS] [-v]
+              module [module ...]
+
+Worker process for processing outbox messages
+
+positional arguments:
+  module                Import path of the module to load listeners from
+
+options:
+  -h, --help            show this help message and exit
+  --rmq-connection-url RMQ_CONNECTION_URL
+                        A string that indicates RabbitMQ connection
+                        parameters. Follows the pattern
+                        'amqp[s]://<username>:<password>@<host>:(<port>)/(virtualhost)'.
+                        Example: 'amqp://guest:guest@localhost:5672/'
+  --db-engine-url DB_ENGINE_URL
+                        A string that indicates database dialect and
+                        connection arguments. Will be passed to
+                        SQLAlchemy. Not necessary unless you plan to
+                        invoke `emit` from within the listeners (which is
+                        highly probable). Follows the pattern
+                        '<database_type>+<dbapi>://<username>:<password>@<host>:<port>/<db_name>'.
+                        Make sure you use a DBAPI that supports async
+                        operations, like `asyncpg` for PostgreSQL or
+                        `aiosqlite` for SQLite. Examples:
+                        'postgresql+asyncpg://postgres:postgres@localhost:5432/postgres'
+                        or 'sqlite+aiosqlite:///:memory:'
+  --exchange-name EXCHANGE_NAME
+                        Name of the RabbitMQ exchange to use
+  --no-retry-on-error   Disable retry on error. Exceptions raised within
+                        listeners will result in the messages being dead-
+                        lettered (unless an `outbox.Retry` is raised)
+  --retry-limit RETRY_LIMIT
+                        Default maximum number of retries for a message
+  --tags TAGS           Comma-separated list of tags to limit which queues
+                        this worker will consume
+  -v, --verbose         Increase verbosity
+```
+
+If you use the worker this way, instead of with a custom Python script, make sure the files that contain the listeners (the positional arguments to `worker`) simply import `listen` (and `emit`) and use them. Do not setup the outbox instance since it will be setup by the options passed to the command-line `worker`.
+
+</details>
+
+<details>
     <summary><h3>Singleton vs multiple instances</h3></summary>
 
 This library has been implemented in such a way that you can run single or multiple outbox setups. Most use-cases will use the singleton approach:
@@ -455,7 +556,6 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ## TODOs
 
-- Console scripts for message relay and worker
 - Don't retry immediately, implement a backoff strategy
 - uv cache for github actions
 - Use msgpack (optionally) to reduce size

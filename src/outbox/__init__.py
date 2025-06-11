@@ -150,7 +150,9 @@ class Outbox:
         for key, value in kwargs.items():
             if key not in field_names:
                 raise ValueError(f"Invalid configuration key: {key}")
-            setattr(self, key, value)
+            if value is not None:
+                setattr(self, key, value)
+        self.__post_init__()
 
     async def _ensure_database(self) -> None:
         if not self._table_created and self.db_engine:

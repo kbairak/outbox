@@ -11,9 +11,9 @@ dependencies = [
   "sqlalchemy[asyncio]>=2.0.41",
 ]
 
-# [project.scripts]
-# outbox_message_relay = "outbox.message_relay:main"
-# outbox_worker = "outbox.worker:main"
+[project.scripts]
+message_relay = "outbox.scripts.message_relay:main"
+worker = "outbox.scripts.worker:main"
 
 [build-system]
 requires = ["hatchling"]
