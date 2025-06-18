@@ -104,7 +104,7 @@ async def test_worker(
     callcount = 0
     retrieved_argument = None
 
-    @listen("routing_key")
+    @listen("routing_key", queue_name="test_worker_queue")
     async def _(person):
         nonlocal callcount, retrieved_argument
         callcount += 1
@@ -131,7 +131,7 @@ async def test_worker_with_pydantic(
     callcount = 0
     retrieved_argument = None
 
-    @listen("routing_key")
+    @listen("routing_key", queue_name="test_worker_with_pydantic_queue")
     async def _(person: Person):
         nonlocal callcount, retrieved_argument
         callcount += 1
@@ -159,7 +159,7 @@ async def test_worker_with_wildcard(
     retrieved_routing_key = None
     retrieved_argument = None
 
-    @listen("routing_key.*")
+    @listen("routing_key.*", queue_name="test_worker_with_wildcard_queue")
     async def _(routing_key: str, person):
         nonlocal callcount, retrieved_routing_key, retrieved_argument
         callcount += 1
@@ -188,7 +188,7 @@ async def test_retry(
     callcount = 0
     retrieved_argument = None
 
-    @listen("routing_key")
+    @listen("routing_key", queue_name="test_retry_queue")
     async def _(person):
         nonlocal callcount, retrieved_argument
         callcount += 1
@@ -218,7 +218,7 @@ async def test_no_retry_with_setup(
     callcount = 0
     retrieved_argument = None
 
-    @listen("routing_key")
+    @listen("routing_key", queue_name="test_no_retry_with_setup_queue")
     async def _(person):
         nonlocal callcount, retrieved_argument
         callcount += 1
@@ -247,7 +247,7 @@ async def test_no_retry_with_listen(
     callcount = 0
     retrieved_argument = None
 
-    @listen("routing_key", retry_on_error=False)
+    @listen("routing_key", retry_on_error=False, queue_name="test_no_retry_with_listen_queue")
     async def _(person):
         nonlocal callcount, retrieved_argument
         callcount += 1
@@ -277,7 +277,7 @@ async def test_force_retry_with_setup(
     callcount = 0
     retrieved_argument = None
 
-    @listen("routing_key")
+    @listen("routing_key", queue_name="test_force_retry_with_setup_queue")
     async def _(person):
         nonlocal callcount, retrieved_argument
         callcount += 1
@@ -306,7 +306,7 @@ async def test_force_retry_with_listen(
     callcount = 0
     retrieved_argument = None
 
-    @listen("routing_key", retry_on_error=False)
+    @listen("routing_key", retry_on_error=False, queue_name="test_force_retry_with_listen_queue")
     async def _(person):
         nonlocal callcount, retrieved_argument
         callcount += 1
@@ -335,7 +335,7 @@ async def test_emit_and_consume_binary(
     callcount = 0
     retrieved_argument = None
 
-    @listen("routing_key")
+    @listen("routing_key", queue_name="test_emit_and_consume_binary_queue")
     async def _(person: bytes):
         nonlocal callcount, retrieved_argument
         callcount += 1
@@ -400,11 +400,11 @@ async def test_dead_letter_with_expiration(
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_graceful_shutdown(emit, session, outbox: Outbox, listen):
+async def test_graceful_shutdown(emit, session, outbox: Outbox, listen: ListenType):
     # arrange
     before, after = 0, 0
 
-    @listen("routing_key")
+    @listen("routing_key", queue_name="test_graceful_shutdown_queue")
     async def _(_):
         nonlocal before, after
         before += 1
@@ -431,11 +431,13 @@ async def test_graceful_shutdown(emit, session, outbox: Outbox, listen):
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_messages_not_lost_during_graceful_shutdown(emit, session, outbox: Outbox, listen):
+async def test_messages_not_lost_during_graceful_shutdown(
+    emit, session, outbox: Outbox, listen: ListenType
+):
     # arrange
     before, after = 0, 0
 
-    @listen("routing_key")
+    @listen("routing_key", queue_name="test_messages_not_lost_during_graceful_shutdown_queue")
     async def _(_):
         nonlocal before, after
         before += 1
@@ -568,12 +570,12 @@ async def test_tags(emit: EmitType, session: AsyncSession, listen: ListenType, o
 
     r1_called, r2_called = False, False
 
-    @listen("r1", tags={"r1"})
+    @listen("r1", tags={"r1"}, queue_name="test_tags_queue_1")
     async def _(_):
         nonlocal r1_called
         r1_called = True
 
-    @listen("r2", tags={"r2"})
+    @listen("r2", tags={"r2"}, queue_name="test_tags_queue_2")
     async def _(_):
         nonlocal r2_called
         r2_called = True
@@ -698,7 +700,7 @@ async def test_annotations(
         yield 9
         cleanups.add(10)
 
-    @listen("r1")
+    @listen("r1", queue_name="test_annotations_queue")
     async def _(
         _,
         normal: Annotated[int, Depends(normal_dependency)],

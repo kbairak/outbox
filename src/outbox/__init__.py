@@ -282,6 +282,7 @@ class Outbox:
     def listen(
         self,
         binding_key: str,
+        *,
         queue_name: str | None = None,
         retry_limit: int | None = None,
         retry_on_error: bool | None = None,
