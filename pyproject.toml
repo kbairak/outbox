@@ -1,7 +1,7 @@
 [project]
 name = "outbox"
 version = "0.1.0"
-description = "Add your description here"
+description = "Transactional outbox pattern implementation for async Python with SQLAlchemy and RabbitMQ"
 readme = "README.md"
 authors = [{ name = "Konstantinos Bairaktaris", email = "ikijob@gmail.com" }]
 requires-python = ">=3.13"

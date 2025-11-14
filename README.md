@@ -415,6 +415,96 @@ The options are:
 </details>
 
 <details>
+    <summary><h3>CPU-bound work</h3></summary>
+
+The outbox pattern is designed for I/O-bound operations like sending emails, calling external APIs, or writing to databases. For these tasks, the library's async approach using `asyncio.create_task()` provides excellent concurrency without blocking.
+
+However, if your listener needs to perform CPU-intensive work (image processing, data transformations, heavy computations), you should offload it to a process pool. **This is intentionally not built into the library** because:
+
+1. Most outbox use cases are I/O-bound, not CPU-bound
+2. Users have different needs (process pools, thread pools, custom executors)
+3. Python's standard library already makes this trivial
+
+Here's how to handle CPU-bound work in your listeners:
+
+```python
+import asyncio
+from concurrent.futures import ProcessPoolExecutor
+from outbox import listen
+
+# Create a process pool (do this once at startup)
+process_pool = ProcessPoolExecutor(max_workers=4)
+
+def cpu_intensive_task(image_data: bytes) -> bytes:
+    """This runs in a separate process, doesn't block the event loop"""
+    # Expensive CPU work: resize, filter, transform, etc.
+    from PIL import Image
+    import io
+
+    image = Image.open(io.BytesIO(image_data))
+    image.thumbnail((800, 600))
+
+    output = io.BytesIO()
+    image.save(output, format='JPEG')
+    return output.getvalue()
+
+@listen("image.uploaded")
+async def process_image(image_data: bytes):
+    """Listener remains async and non-blocking"""
+    loop = asyncio.get_event_loop()
+
+    # Offload CPU work to process pool
+    processed_data = await loop.run_in_executor(
+        process_pool,
+        cpu_intensive_task,
+        image_data
+    )
+
+    # Continue with I/O-bound work
+    await upload_to_storage(processed_data)
+```
+
+This pattern gives you complete control over parallelism while keeping the library focused and simple.
+
+</details>
+
+<details>
+    <summary><h3>Logging</h3></summary>
+
+The library logs important events (emitted messages, processing results, retries, errors) using Python's standard logging module under the logger name `"outbox"`. Since the outbox pattern handles critical infrastructure (message processing, retries, dead-letter queues), **logs are enabled by default** to ensure you're aware of any issues.
+
+If you haven't configured logging in your application, you'll see log output automatically. To control the log level or disable logs entirely:
+
+```python
+import logging
+
+# Configure logging for your entire application
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+# Or control just the outbox logger
+logging.getLogger("outbox").setLevel(logging.WARNING)  # Only warnings and errors
+
+# Or disable outbox logs entirely
+logging.getLogger("outbox").setLevel(logging.CRITICAL)
+
+# Or disable propagation to root logger
+logging.getLogger("outbox").propagate = False
+```
+
+The library logs at these levels:
+- **DEBUG**: Detailed information about queue bindings, message polling
+- **INFO**: Normal operations (messages emitted, processed successfully)
+- **WARNING**: Retries, rejections, messages sent to dead-letter queues
+- **ERROR**: Failures during deserialization or unexpected errors
+
+For production, `logging.INFO` is recommended so you can track message flow without excessive noise.
+
+</details>
+
+<details>
     <summary><h3>API</h3></summary>
 
 #### `setup()`
@@ -524,7 +614,22 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ## TODOs
 
-- Add `queue_prefix` setup arg
-- Don't retry immediately, implement a backoff strategy
-- Use msgpack (optionally) to reduce size
-- Use pg notify/listen to avoid polling the database
+### High priority
+
+- [ ] Don't retry immediately, implement a backoff strategy
+- [ ] Refactor away `@listen` decorator, implement more explicit alternative
+
+### Medium priority
+
+- [ ] Observability (prometheus)
+- [ ] Better/more error messages
+- [ ] Mypy
+- [ ] Performance tests/benchmarks
+- [ ] Heartbeat to verify connection to RabbitMQ is alive
+
+### Low priority
+
+- [ ] Add `queue_prefix` setup arg
+- [ ] Use msgpack (optionally) to reduce size
+- [ ] Use pg notify/listen to avoid polling the database
+- [ ] Nested dependencies
