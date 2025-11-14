@@ -96,10 +96,7 @@ class Listener:
     consumer_tag: ConsumerTag | None = None
 
 
-_track_ids: ContextVar[tuple[str, ...],] = ContextVar(
-    "track_ids",
-    default=(),
-)
+_track_ids: ContextVar[tuple[str, ...],] = ContextVar("track_ids", default=())
 
 
 @dataclass
@@ -369,12 +366,12 @@ class Outbox:
                         body = json.loads(message.body)
                 except Exception as exc:
                     logger.error(
-                        f"Failed to deserialize mesage body {routing_key=}, {track_ids=}, "
+                        f"Failed to deserialize message body {routing_key=}, {track_ids=}, "
                         f"{body=}, {exc=}"
                     )
                     raise
                 else:
-                    logger.info(f"Procesing message {routing_key=}, {track_ids=}, {body=}")
+                    logger.info(f"Processing message {routing_key=}, {track_ids=}, {body=}")
 
                 kwargs = {body_param_key: body}
                 for attr in (
@@ -433,7 +430,7 @@ class Outbox:
                     else:
                         await message.ack()
                 else:
-                    logger.info(f"Sucess {routing_key=}, {track_ids=}, {body=}")
+                    logger.info(f"Success {routing_key=}, {track_ids=}, {body=}")
                     await message.ack()
                 finally:
                     for generator in generators:
