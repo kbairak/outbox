@@ -561,35 +561,6 @@ async def test_track_ids_with_parameter(
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_tags(emit: EmitType, session: AsyncSession, listen: ListenType, outbox: Outbox):
-    # arrange
-    await emit(session, "r1", {})
-    await emit(session, "r2", {})
-    await session.commit()
-
-    r1_called, r2_called = False, False
-
-    @listen("r1", tags={"r1"}, queue_name="test_tags_queue_1")
-    async def _(_):
-        nonlocal r1_called
-        r1_called = True
-
-    @listen("r2", tags={"r2"}, queue_name="test_tags_queue_2")
-    async def _(_):
-        nonlocal r2_called
-        r2_called = True
-
-    await outbox._set_up_queues()
-    await outbox._consume_outbox_table()
-
-    # test
-    await run_worker(outbox, timeout=0.4, tags={"r1"})
-
-    # assert
-    assert (r1_called, r2_called) == (True, False)
-
-
-@pytest.mark.asyncio(loop_scope="session")
 async def test_emit_retry_limit(
     emit: EmitType, session: AsyncSession, listen: ListenType, outbox: Outbox
 ):
@@ -670,5 +641,3 @@ async def test_setup_retry_limit(
     # assert
     assert callcount == 3
     assert (await get_dlq_message_count(outbox, "test_setup_retry_limit_queue")) == 1
-
-

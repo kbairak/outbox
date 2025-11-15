@@ -30,13 +30,12 @@ class ListenType(Protocol):
         queue_name: str | None = None,
         retry_limit: int | None = None,
         retry_on_error: bool | None = None,
-        tags: set[str] | None = None,
     ) -> Callable[[Callable[..., Coroutine[None, None, None]]], None]: ...
 
 
-async def run_worker(outbox, timeout, tags=None):
+async def run_worker(outbox, timeout):
     try:
-        await asyncio.wait_for(outbox.worker(tags=tags), timeout=timeout)
+        await asyncio.wait_for(outbox.worker(), timeout=timeout)
     except asyncio.TimeoutError:
         pass
 

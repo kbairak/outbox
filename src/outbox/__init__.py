@@ -88,7 +88,6 @@ class Listener:
     queue_name: str
     binding_key: str
     handler: Callable[[AbstractIncomingMessage], Coroutine[None, None, None]]
-    tags: set[str]
     queue: AbstractQueue | None = None
     consumer_tag: ConsumerTag | None = None
 
@@ -275,12 +274,9 @@ class Outbox:
         queue_name: str | None = None,
         retry_limit: int | None = None,
         retry_on_error: bool | None = None,
-        tags: set[str] | None = None,
     ) -> Callable[[Callable[..., Coroutine[None, None, None]]], None]:
         if retry_on_error is None:
             retry_on_error = self.retry_on_error
-        if tags is None:
-            tags = set()
 
         def decorator(func: Callable):
             nonlocal queue_name
@@ -349,7 +345,7 @@ class Outbox:
                         f"Failed to deserialize message body {routing_key=}, {track_ids=}, "
                         f"{body=}, {exc=}"
                     )
-                    raise
+                    raise  # TODO: Will (should) this crash the worker?
                 else:
                     logger.info(f"Processing message {routing_key=}, {track_ids=}, {body=}")
 
@@ -401,11 +397,11 @@ class Outbox:
                 task.add_done_callback(self._tasks.discard)
 
             logger.debug(f"Registering listener for {binding_key=}: {func=}")
-            self._listeners.append(Listener(queue_name, binding_key, _handler, tags))
+            self._listeners.append(Listener(queue_name, binding_key, _handler))
 
         return decorator
 
-    async def worker(self, tags: set[str] | None = None) -> None:
+    async def worker(self) -> None:
         await self._set_up_queues()
 
         self._shutdown_future = asyncio.Future()
@@ -415,8 +411,6 @@ class Outbox:
 
         logger.info(f"Starting worker on exchange: {self.exchange_name} ...")
         for listener in self._listeners:
-            if tags is not None and not (tags & listener.tags):
-                continue
             assert listener.queue is not None
             listener.consumer_tag = await listener.queue.consume(listener.handler)
 

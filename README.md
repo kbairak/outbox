@@ -289,35 +289,6 @@ You must have exactly **one** argument that doesn't meet the above criteria, whi
 </details>
 
 <details>
-    <summary><h3>Distribution of tasks to multiple workers</h3></summary>
-
-By default, workers will consume messages from all queues (1 queue is defined per listener function). If you want more control on which workers will consume from which queues, you can assign a set of tags on each listener and a set of tags when invoking the worker itself:
-
-```python
-# Listeners
-
-@listen("binding_key_1", tags={"normal_priority"})
-async def on_normal_priority(obj):
-    ...
-
-@listen("binding_key_2", tags={"high_priority"})
-async def on_high_priority(obj):
-    ...
-
-# Worker 1
-
-# Lets add a worker for all tasks to make sure none are left behind
-asyncio.run(worker())
-
-# Worker 2
-
-# Lets add an extra worker just or the high-priority tasks
-asyncio.run(worker(tags={"high_priority"}))
-```
-
-</details>
-
-<details>
     <summary><h3>Delayed execution</h3></summary>
 
 You can cause an event to be sent some time in the future by setting the `eta` argument during `emit`:
