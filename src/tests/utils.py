@@ -1,5 +1,5 @@
 import asyncio
-from typing import Any, Callable, Coroutine, Protocol
+from typing import Any, Protocol
 
 from aio_pika.abc import DateType
 from pydantic import BaseModel
@@ -23,19 +23,9 @@ class EmitType(Protocol):
     ) -> None: ...
 
 
-class ListenType(Protocol):
-    def __call__(
-        self,
-        binding_key: str,
-        queue_name: str | None = None,
-        retry_limit: int | None = None,
-        retry_on_error: bool | None = None,
-    ) -> Callable[[Callable[..., Coroutine[None, None, None]]], None]: ...
-
-
-async def run_worker(outbox, timeout):
+async def run_worker(outbox, listeners, timeout):
     try:
-        await asyncio.wait_for(outbox.worker(), timeout=timeout)
+        await asyncio.wait_for(outbox.worker(listeners), timeout=timeout)
     except asyncio.TimeoutError:
         pass
 
@@ -44,5 +34,5 @@ async def get_dlq_message_count(outbox, queue_name):
     connection = await outbox._get_rmq_connection()
     assert connection is not None
     channel = await connection.channel()
-    dlq = await channel.get_queue(f"dlq_{queue_name}")
+    dlq = await channel.get_queue(f"{queue_name}.dlq")
     return dlq.declaration_result.message_count

@@ -9,7 +9,7 @@ from testcontainers.rabbitmq import RabbitMqContainer
 
 from outbox import Outbox
 
-from .utils import EmitType, ListenType
+from .utils import EmitType
 
 
 @pytest.fixture
@@ -43,8 +43,3 @@ async def outbox(db_engine: AsyncEngine, rmq_connection: AbstractConnection) -> 
 @pytest.fixture
 def emit(outbox: Outbox) -> EmitType:
     return outbox.emit
-
-
-@pytest.fixture
-def listen(outbox: Outbox) -> ListenType:
-    return outbox.listen

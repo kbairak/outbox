@@ -6,6 +6,7 @@ import logging
 import reprlib
 import signal
 import uuid
+from collections.abc import Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields
@@ -85,11 +86,126 @@ class Reject(Exception):
 
 @dataclass
 class Listener:
-    queue_name: str
     binding_key: str
-    handler: Callable[[AbstractIncomingMessage], Coroutine[None, None, None]]
-    queue: AbstractQueue | None = None
+    callback: Callable[..., Coroutine[Any, Any, None]]
+    queue: str = ""
+    retry_on_error: bool | None = None
+    retry_limit: int | None = None
+    queue_obj: AbstractQueue | None = None
     consumer_tag: ConsumerTag | None = None
+
+    def __post_init__(self):
+        if not self.queue:
+            self.queue = f"{self.callback.__module__}.{self.callback.__qualname__}".replace(
+                "<", ""
+            ).replace(">", "")
+
+    def __call__(self, *args, **kwargs) -> Coroutine[Any, Any, None]:
+        return self.callback(*args, **kwargs)
+
+    async def _handle(self, message: AbstractIncomingMessage) -> None:
+        parameters = inspect.signature(self.callback).parameters
+        parameter_keys = set(parameters.keys()) - {
+            "routing_key",
+            "message",
+            "track_ids",
+            "retry_limit",
+            "retry_on_error",
+            "queue_name",
+            "attempt_count",
+        }
+        if len(parameter_keys) != 1:
+            raise ValueError("Worker functions must accept exactly one argument")
+        body_param_key = parameter_keys.pop()
+        body_param = parameters[body_param_key]
+
+        track_ids = tuple(json.loads(cast(str, message.headers.get("x-outbox-track-ids", "[]"))))
+        token = _track_ids.set(track_ids)
+
+        retry_limit = (
+            cast(int | None, message.headers.get("x-outbox-retry-limit")) or self.retry_limit
+        )
+        if retry_limit is not None:
+            retry_limit = int(retry_limit)
+        attempt_count = cast(str | None, message.headers.get("x-delivery-count"))
+        if attempt_count is not None:
+            attempt_count = int(attempt_count)
+
+        if retry_limit is not None and attempt_count is not None and attempt_count >= retry_limit:
+            logger.warning(
+                f"Message {message.routing_key} with track IDs {track_ids} exceeded retry limit "
+                f"{retry_limit}, rejecting"
+            )
+            await message.nack(requeue=False)
+            _track_ids.reset(token)
+            return
+
+        routing_key, body = message.routing_key, message.body
+        try:
+            if issubclass(body_param.annotation, BaseModel):
+                body = body_param.annotation.model_validate_json(message.body)
+            elif issubclass(body_param.annotation, bytes):
+                body = message.body
+            else:
+                body = json.loads(message.body)
+        except Exception as exc:
+            logger.error(
+                f"Failed to deserialize message body {routing_key=}, {track_ids=}, {body=}, {exc=}"
+            )
+            raise  # TODO: Will (should) this crash the worker?
+        else:
+            logger.info(f"Processing message {routing_key=}, {track_ids=}, {body=}")
+
+        kwargs = {body_param_key: body}
+        for attr in (
+            "routing_key",
+            "message",
+            "track_ids",
+            "retry_limit",
+            "retry_on_error",
+            "queue_name",
+            "attempt_count",
+        ):
+            if attr in parameters:
+                kwargs[attr] = locals()[attr]
+
+        try:
+            await self.callback(**kwargs)
+        except Retry:
+            logger.info(f"Retrying (forced) {routing_key=}, {track_ids=}, {body=}")
+            await message.nack(requeue=True)
+        except Reject:
+            logger.warning(
+                f"Rejecting, this message will likely end up in DLX {routing_key=}, "
+                f"{track_ids=}, {body=}"
+            )
+            await message.nack(requeue=False)
+        except Exception:
+            logger.warning(
+                f"{'Retrying' if self.retry_on_error else 'Aborting'} {routing_key=}, "
+                f"{track_ids=}, {body=}"
+            )
+            if self.retry_on_error:
+                await message.nack(requeue=True)
+            else:
+                await message.ack()
+        else:
+            logger.info(f"Success {routing_key=}, {track_ids=}, {body=}")
+            await message.ack()
+        finally:
+            _track_ids.reset(token)
+
+
+def listen(
+    binding_key: str,
+    queue: str = "",
+    retry_on_error: bool | None = None,
+    retry_limit: int | None = None,
+):
+    def decorator(func: Callable[..., Coroutine[Any, Any, None]]) -> Listener:
+        return Listener(binding_key, func, queue, retry_on_error, retry_limit)
+
+    return decorator
 
 
 _track_ids: ContextVar[tuple[str, ...],] = ContextVar("track_ids", default=())
@@ -110,9 +226,7 @@ class Outbox:
     ) = None
     retry_limit: int | None = None
     table_name: str = "outbox_table"
-    _listeners: list[Listener] = field(default_factory=list)
     _table_created: bool = False
-    _tasks: set[asyncio.Task] = field(default_factory=set)
     _shutdown_future: asyncio.Future | None = None
 
     def __post_init__(self):
@@ -267,168 +381,51 @@ class Outbox:
                     )
                     await session.execute(stmt)
 
-    def listen(
-        self,
-        binding_key: str,
-        *,
-        queue_name: str | None = None,
-        retry_limit: int | None = None,
-        retry_on_error: bool | None = None,
-    ) -> Callable[[Callable[..., Coroutine[None, None, None]]], None]:
-        if retry_on_error is None:
-            retry_on_error = self.retry_on_error
-
-        def decorator(func: Callable):
-            nonlocal queue_name
-            if queue_name is None:
-                queue_name = f"{func.__module__}.{func.__qualname__}".replace("<", "").replace(
-                    ">", ""
-                )
-            parameters = inspect.signature(func).parameters
-            parameter_keys = set(parameters.keys()) - {
-                "routing_key",
-                "message",
-                "track_ids",
-                "retry_limit",
-                "retry_on_error",
-                "queue_name",
-                "attempt_count",
-            }
-
-            if len(parameter_keys) != 1:
-                raise ValueError("Worker functions must accept exactly one argument")
-            body_param_key = parameter_keys.pop()
-            body_param = parameters[body_param_key]
-
-            async def _on_message(message: AbstractIncomingMessage) -> None:
-                track_ids = tuple(
-                    json.loads(cast(str, message.headers.get("x-outbox-track-ids", "[]")))
-                )
-                token = _track_ids.set(track_ids)
-
-                nonlocal retry_limit
-                retry_limit = (
-                    cast(int | None, message.headers.get("x-outbox-retry-limit"))
-                    or retry_limit
-                    or self.retry_limit
-                )
-                if retry_limit is not None:
-                    retry_limit = int(retry_limit)
-
-                attempt_count = cast(str | None, message.headers.get("x-delivery-count"))
-                if attempt_count is not None:
-                    attempt_count = int(attempt_count)
-
-                if (
-                    retry_limit is not None
-                    and attempt_count is not None
-                    and attempt_count >= retry_limit
-                ):
-                    logger.warning(
-                        f"Message {message.routing_key} with track IDs {track_ids} "
-                        f"exceeded retry limit {retry_limit}, rejecting"
-                    )
-                    await message.nack(requeue=False)
-                    _track_ids.reset(token)
-                    return
-
-                routing_key, body = message.routing_key, message.body
-                try:
-                    if issubclass(body_param.annotation, BaseModel):
-                        body = body_param.annotation.model_validate_json(message.body)
-                    elif issubclass(body_param.annotation, bytes):
-                        body = message.body
-                    else:
-                        body = json.loads(message.body)
-                except Exception as exc:
-                    logger.error(
-                        f"Failed to deserialize message body {routing_key=}, {track_ids=}, "
-                        f"{body=}, {exc=}"
-                    )
-                    raise  # TODO: Will (should) this crash the worker?
-                else:
-                    logger.info(f"Processing message {routing_key=}, {track_ids=}, {body=}")
-
-                kwargs = {body_param_key: body}
-                for attr in (
-                    "routing_key",
-                    "message",
-                    "track_ids",
-                    "retry_limit",
-                    "retry_on_error",
-                    "queue_name",
-                    "attempt_count",
-                ):
-                    if attr in parameters:
-                        kwargs[attr] = locals()[attr]
-
-                try:
-                    await func(**kwargs)
-                except Retry:
-                    logger.info(f"Retrying (forced) {routing_key=}, {track_ids=}, {body=}")
-                    await message.nack(requeue=True)
-                except Reject:
-                    logger.warning(
-                        f"Rejecting, this message will likely end up in DLX {routing_key=}, "
-                        f"{track_ids=}, {body=}"
-                    )
-                    await message.nack(requeue=False)
-                except Exception:
-                    logger.warning(
-                        f"{'Retrying' if retry_on_error else 'Aborting'} {routing_key=}, "
-                        f"{track_ids=}, {body=}"
-                    )
-                    if retry_on_error:
-                        await message.nack(requeue=True)
-                    else:
-                        await message.ack()
-                else:
-                    logger.info(f"Success {routing_key=}, {track_ids=}, {body=}")
-                    await message.ack()
-                finally:
-                    _track_ids.reset(token)
-
-            async def _handler(message: AbstractIncomingMessage) -> None:
-                if self._shutdown_future is not None and self._shutdown_future.done():
-                    await message.nack(requeue=True)
-                    return
-                task = asyncio.create_task(_on_message(message))
-                self._tasks.add(task)
-                task.add_done_callback(self._tasks.discard)
-
-            logger.debug(f"Registering listener for {binding_key=}: {func=}")
-            self._listeners.append(Listener(queue_name, binding_key, _handler))
-
-        return decorator
-
-    async def worker(self) -> None:
-        await self._set_up_queues()
+    async def worker(self, listeners: Sequence[Listener]) -> None:
+        await self._set_up_queues(listeners)
 
         self._shutdown_future = asyncio.Future()
         loop = asyncio.get_event_loop()
         loop.add_signal_handler(signal.SIGINT, self._shutdown_future.set_result, None)
         loop.add_signal_handler(signal.SIGTERM, self._shutdown_future.set_result, None)
 
+        tasks = set()
+
         logger.info(f"Starting worker on exchange: {self.exchange_name} ...")
-        for listener in self._listeners:
-            assert listener.queue is not None
-            listener.consumer_tag = await listener.queue.consume(listener.handler)
+        for listener in listeners:
+            assert listener.queue_obj is not None
+            if listener.retry_on_error is None:
+                listener.retry_on_error = self.retry_on_error
+            if listener.retry_limit is None:
+                listener.retry_limit = self.retry_limit
+
+            async def _task(
+                message: AbstractIncomingMessage, listener: Listener = listener
+            ) -> None:
+                if self._shutdown_future is not None and self._shutdown_future.done():
+                    await message.nack(requeue=True)
+                    return
+                task = asyncio.create_task(listener._handle(message))
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
+
+            listener.consumer_tag = await listener.queue_obj.consume(_task)
 
         await self._shutdown_future
 
         logger.info("Received shutdown signal, waiting or ongoing tasks and exiting...")
 
-        for listener in self._listeners:
+        for listener in listeners:
             if listener.consumer_tag is None:
                 continue
-            assert listener.queue is not None
+            assert listener.queue_obj is not None
             assert listener.consumer_tag is not None
-            await listener.queue.cancel(listener.consumer_tag)
+            await listener.queue_obj.cancel(listener.consumer_tag)
 
-        if self._tasks:
-            await asyncio.wait(self._tasks)
+        if tasks:
+            await asyncio.wait(tasks)
 
-    async def _set_up_queues(self):
+    async def _set_up_queues(self, listeners: Sequence[Listener]) -> None:
         rmq_connection = await self._get_rmq_connection()
         if rmq_connection is None:
             raise ValueError("RabbitMQ connection is not set up.")
@@ -438,28 +435,28 @@ class Outbox:
             self.exchange_name, aio_pika.ExchangeType.TOPIC, durable=True
         )
         dead_letter_exchange = await channel.declare_exchange(
-            f"dlx_{self.exchange_name}", aio_pika.ExchangeType.DIRECT, durable=True
+            f"{self.exchange_name}.dlx", aio_pika.ExchangeType.DIRECT, durable=True
         )
-        for listener in self._listeners:
-            dead_letter_queue = await channel.declare_queue(
-                f"dlq_{listener.queue_name}", durable=True, arguments={"x-queue-type": "quorum"}
+        for listener in listeners:
+            dead_letter_queue_obj = await channel.declare_queue(
+                f"{listener.queue}.dlq", durable=True, arguments={"x-queue-type": "quorum"}
             )
-            await dead_letter_queue.bind(dead_letter_exchange, listener.queue_name)
+            await dead_letter_queue_obj.bind(dead_letter_exchange, listener.queue)
 
             logger.debug(
-                f"Binding queue {listener.queue_name} to exchange {self.exchange_name} with "
+                f"Binding queue {listener.queue} to exchange {self.exchange_name} with "
                 f"binding key {listener.binding_key}"
             )
-            listener.queue = await channel.declare_queue(
-                listener.queue_name,
+            listener.queue_obj = await channel.declare_queue(
+                listener.queue,
                 durable=True,
                 arguments={
-                    "x-dead-letter-exchange": f"dlx_{self.exchange_name}",
-                    "x-dead-letter-routing-key": listener.queue_name,
+                    "x-dead-letter-exchange": f"{self.exchange_name}.dlx",
+                    "x-dead-letter-routing-key": listener.queue,
                     "x-queue-type": "quorum",
                 },
             )
-            await listener.queue.bind(exchange, listener.binding_key)
+            await listener.queue_obj.bind(exchange, listener.binding_key)
 
     @contextmanager
     def tracking(self) -> Generator[None, None, None]:
@@ -477,7 +474,6 @@ outbox = Outbox()
 setup = outbox.setup
 emit = outbox.emit
 message_relay = outbox.message_relay
-listen = outbox.listen
 worker = outbox.worker
 tracking = outbox.tracking
 get_track_ids = outbox.get_track_ids

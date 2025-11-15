@@ -62,6 +62,10 @@ asyncio.run(message_relay())
 
 ### Worker process
 
+You can define handlers using either decorators or by creating `Listener` instances directly.
+
+**Option 1: Using the `@listen` decorator:**
+
 ```python
 import asyncio
 
@@ -74,7 +78,37 @@ async def on_user_created(user):
     print(user)
     # <<< {"id": 123, "username": "johndoe"}
 
-asyncio.run(worker())
+asyncio.run(worker([on_user_created]))
+```
+
+**Option 2: Using `Listener` directly:**
+
+```python
+import asyncio
+
+from outbox import setup, Listener, worker
+
+setup(rabbitmq_url="amqp://user:password@localhost:5672/")
+
+async def on_user_created(user):
+    print(user)
+
+handlers = [
+    Listener(
+        binding_key="user.created",
+        callback=on_user_created,
+        queue="analytics_service.on_user_created",  # optional, auto-generated if not provided
+    )
+]
+
+asyncio.run(worker(handlers))
+```
+
+Both approaches are equivalent. The decorator is more concise, while the explicit `Listener` instantiation gives you more control and makes it clear which handlers are registered. Essentially, these are identical:
+
+```python
+Listener("binding_key", callback, ...)
+listen("binding_key", ...)(callback)
 ```
 
 ## Features
@@ -469,16 +503,43 @@ Keyword-only arguments:
 
 #### `listen()`
 
+A decorator that creates a `Listener` instance from a function.
+
 Positional arguments:
 
 - `binding_key`: The binding key to use for the listener. Supports wildcards, e.g. `user.*` will match `user.created`, `user.updated`, etc, according to RabbitMQ's topic exchange rules
 
 Keyword-only arguments:
 
-- `queue_name`: The name of the queue to use for the listener. If not provided, a name based on the current module and the function's name will be used
+- `queue`: The name of the queue to use for the listener. If not provided (empty string), a name based on the callback's module and qualname will be auto-generated
 - `retry_limit`: The maximum number of retries for the message. Overrides the default set during `setup`
 - `retry_on_error`: Whether to retry messages that fail to be processed by the listener. Overrides the default set during `setup`
-- `tags`: A set of tags to use for the listener. This can be used to limit which queues this listener will consume from when the worker is started with a set of tags
+
+Returns a `Listener` instance that is also callable (delegates to the original function).
+
+#### `Listener`
+
+A dataclass representing a message handler.
+
+Fields:
+
+- `binding_key`: The binding key pattern to match messages against
+- `callback`: The async function to call when a message is received
+- `queue`: The queue name (auto-generated from callback if empty string)
+- `retry_on_error`: Whether to retry on errors (None means use global default)
+- `retry_limit`: Maximum retry attempts (None means use global default)
+- `queue_obj`: Internal runtime state (RabbitMQ queue object)
+- `consumer_tag`: Internal runtime state (RabbitMQ consumer tag)
+
+The `Listener` instance is callable and will delegate to the `callback` function, making it transparent for testing.
+
+#### `worker()`
+
+Positional arguments:
+
+- `listeners`: A sequence of `Listener` instances to consume messages for
+
+Starts the worker that consumes messages from RabbitMQ and dispatches them to the appropriate listeners. Blocks until SIGINT/SIGTERM is received.
 
 </details>
 
@@ -549,7 +610,6 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 ### High priority
 
 - [ ] Don't retry immediately, implement a backoff strategy
-- [ ] Refactor away `@listen` decorator, implement more explicit alternative
 
 ### Medium priority
 
