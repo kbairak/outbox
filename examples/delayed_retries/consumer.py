@@ -6,16 +6,16 @@ This script sets up workers that handle messages with different retry behaviors:
 2. Successful processing
 3. Permanent errors that go directly to DLQ
 """
+
 import asyncio
 import logging
 from datetime import datetime
 
-from outbox import setup, listen, worker, Reject
+from outbox import Reject, listen, setup, worker
 
 # Configure logging to see retry behavior
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ async def process_order(order, attempt_count: int):
         attempt_counts[order_id] = 0
     attempt_counts[order_id] += 1
 
-    current_time = datetime.now().strftime('%H:%M:%S')
+    current_time = datetime.now().strftime("%H:%M:%S")
 
     logger.info(
         f"[{current_time}] 📦 Processing order {order_id} "
@@ -72,7 +72,7 @@ async def notify_customer(order):
     """
     Simulates a reliable service that always succeeds.
     """
-    current_time = datetime.now().strftime('%H:%M:%S')
+    current_time = datetime.now().strftime("%H:%M:%S")
     logger.info(
         f"[{current_time}] 📧 Sending notification to {order.get('customer')} "
         f"for order {order['order_id']}"
@@ -89,7 +89,7 @@ async def validate_order(order, attempt_count: int):
 
     Uses the Reject exception to bypass retries and send directly to DLQ.
     """
-    current_time = datetime.now().strftime('%H:%M:%S')
+    current_time = datetime.now().strftime("%H:%M:%S")
     logger.warning(
         f"[{current_time}] ❌ Order {order['order_id']} has invalid data. "
         f"Rejecting to DLQ (no retries)."
@@ -99,14 +99,14 @@ async def validate_order(order, attempt_count: int):
 
 
 async def main():
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("Consumer - Waiting for messages with delayed retry demonstration")
-    print("="*70 + "\n")
+    print("=" * 70 + "\n")
 
     # Setup outbox with default retry delays
     setup(
         rmq_connection_url=RABBITMQ_URL,
-        retry_delays=(2, 5, 15)  # Default: 2s, 5s, 15s delays
+        retry_delays=(2, 5, 15),  # Default: 2s, 5s, 15s delays
     )
 
     print("🎧 Listening for messages...")

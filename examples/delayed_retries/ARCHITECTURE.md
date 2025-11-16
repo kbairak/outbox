@@ -155,7 +155,7 @@ Headers used for retry tracking:
 |--------|---------|---------|
 | `x-delivery-count` | Track retry attempts | `"2"`, `"3"`, `"4"` |
 | `x-original-routing-key` | Preserve original routing key | `"order.process"` |
-| `x-outbox-track-ids` | Distributed tracing | `["uuid1", "uuid2"]` |
+| `x-outbox-tracking-ids` | Distributed tracing | `["uuid1", "uuid2"]` |
 
 ### 5. Retry Attempt Calculation
 

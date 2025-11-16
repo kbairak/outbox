@@ -4,18 +4,18 @@ Producer example - Emits messages to demonstrate delayed retries.
 This script emits various types of messages that will be processed by the consumer
 with different retry behaviors.
 """
+
 import asyncio
 import logging
 from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
-from outbox import setup, emit
+from outbox import emit, setup
 
 # Configure logging to see what's happening
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 
 # Database and RabbitMQ connection strings
@@ -31,36 +31,37 @@ async def main():
     setup(
         db_engine=db_engine,
         rmq_connection_url=RABBITMQ_URL,
-        retry_delays=(2, 5, 15)  # 3 retry attempts with increasing delays
+        retry_delays=(2, 5, 15),  # 3 retry attempts with increasing delays
     )
 
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("Producer - Emitting test messages")
-    print("="*70 + "\n")
+    print("=" * 70 + "\n")
 
     async with AsyncSession(db_engine) as session:
         # Message 1: Will fail and retry with exponential backoff
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Emitting 'order.process' - will fail and retry")
-        await emit(session, "order.process", {
-            "order_id": 123,
-            "customer": "John Doe",
-            "total": 99.99
-        })
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S')}] Emitting 'order.process' - will fail and retry"
+        )
+        await emit(
+            session, "order.process", {"order_id": 123, "customer": "John Doe", "total": 99.99}
+        )
 
         # Message 2: Will succeed on first attempt
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Emitting 'order.notify' - will succeed immediately")
-        await emit(session, "order.notify", {
-            "order_id": 456,
-            "customer": "Jane Smith",
-            "email": "jane@example.com"
-        })
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S')}] Emitting 'order.notify' - will succeed immediately"
+        )
+        await emit(
+            session,
+            "order.notify",
+            {"order_id": 456, "customer": "Jane Smith", "email": "jane@example.com"},
+        )
 
         # Message 3: Will be rejected immediately
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Emitting 'order.invalid' - will be rejected to DLQ")
-        await emit(session, "order.invalid", {
-            "order_id": 999,
-            "bad_data": True
-        })
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S')}] Emitting 'order.invalid' - will be rejected to DLQ"
+        )
+        await emit(session, "order.invalid", {"order_id": 999, "bad_data": True})
 
         await session.commit()
 

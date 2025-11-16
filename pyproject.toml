@@ -19,6 +19,7 @@ build-backend = "hatchling.build"
 dev = [
   "aiosqlite>=0.21.0",
   "asyncpg>=0.30.0",
+  "mypy>=1.18.2",
   "ptipython>=1.0.1",
   "pudb>=2025.1",
   "pynvim>=0.5.2",
@@ -27,6 +28,7 @@ dev = [
   "pytest-cov>=6.1.1",
   "ruff>=0.11.12",
   "testcontainers[rabbitmq]>=4.10.0",
+  "ty>=0.0.1a26",
 ]
 
 [tool.ruff]

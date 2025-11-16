@@ -178,7 +178,7 @@ async def test_retry(emit: EmitType, outbox: Outbox, session: AsyncSession) -> N
     callcount = 0
     retrieved_argument = None
 
-    @listen("routing_key", queue="test_retry_queue", retry_delays=(0.1, 0.1))
+    @listen("routing_key", queue="test_retry_queue", retry_delays=(1, 1))
     async def handler(person):
         nonlocal callcount, retrieved_argument
         callcount += 1
@@ -278,7 +278,9 @@ async def test_no_retry_with_empty_delays_setup(
 
     # assert - only 1 attempt, then goes to DLQ
     assert callcount == 1
-    assert (await get_dlq_message_count(outbox, "test_no_retry_with_empty_delays_setup_queue")) == 1
+    assert (
+        await get_dlq_message_count(outbox, "test_no_retry_with_empty_delays_setup_queue")
+    ) == 1
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -304,7 +306,9 @@ async def test_no_retry_with_empty_delays_listen(
 
     # assert - only 1 attempt, then goes to DLQ
     assert callcount == 1
-    assert (await get_dlq_message_count(outbox, "test_no_retry_with_empty_delays_listen_queue")) == 1
+    assert (
+        await get_dlq_message_count(outbox, "test_no_retry_with_empty_delays_listen_queue")
+    ) == 1
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -454,7 +458,7 @@ async def test_messages_not_lost_during_graceful_shutdown(emit, session, outbox:
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_track_ids(
+async def test_tracking_ids(
     monkeypatch: pytest.MonkeyPatch,
     outbox: Outbox,
     emit: EmitType,
@@ -467,21 +471,21 @@ async def test_track_ids(
     logs = []
 
     with outbox.tracking():
-        logs.append(outbox.get_track_ids())
+        logs.append(outbox.get_tracking_ids())
         await emit(session, "r1", {})
         await session.commit()
 
-    @listen("r1", queue="test_track_ids_queue_1")
+    @listen("r1", queue="test_tracking_ids_queue_1")
     async def handler1(_) -> None:
-        logs.append(outbox.get_track_ids())
+        logs.append(outbox.get_tracking_ids())
         await emit(session, "r2", {})
         await emit(session, "r2", {})
         await session.commit()
         await outbox._consume_outbox_table()
 
-    @listen("r2", queue="test_track_ids_queue_2")
+    @listen("r2", queue="test_tracking_ids_queue_2")
     async def handler2(_) -> None:
-        logs.append(outbox.get_track_ids())
+        logs.append(outbox.get_tracking_ids())
 
     await outbox._set_up_queues([handler1, handler2])
     await outbox._consume_outbox_table()
@@ -494,7 +498,7 @@ async def test_track_ids(
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_track_ids_with_parameter(
+async def test_tracking_ids_with_parameter(
     monkeypatch: pytest.MonkeyPatch,
     outbox: Outbox,
     emit: EmitType,
@@ -507,21 +511,21 @@ async def test_track_ids_with_parameter(
     logs = []
 
     with outbox.tracking():
-        logs.append(outbox.get_track_ids())
+        logs.append(outbox.get_tracking_ids())
         await emit(session, "r1", {})
         await session.commit()
 
-    @listen("r1", queue="test_track_ids_with_parameter_queue1")
-    async def handler1(_, track_ids: list[str]) -> None:
-        logs.append(track_ids)
+    @listen("r1", queue="test_tracking_ids_with_parameter_queue1")
+    async def handler1(_, tracking_ids: list[str]) -> None:
+        logs.append(tracking_ids)
         await emit(session, "r2", {})
         await emit(session, "r2", {})
         await session.commit()
         await outbox._consume_outbox_table()
 
-    @listen("r2", queue="test_track_ids_with_parameter_queue2")
-    async def handler2(_, track_ids: list[str]) -> None:
-        logs.append(track_ids)
+    @listen("r2", queue="test_tracking_ids_with_parameter_queue2")
+    async def handler2(_, tracking_ids: list[str]) -> None:
+        logs.append(tracking_ids)
 
     await outbox._set_up_queues([handler1, handler2])
     await outbox._consume_outbox_table()
@@ -567,7 +571,7 @@ async def test_listen_retry_delays(emit: EmitType, session: AsyncSession, outbox
 
     callcount = 0
 
-    @listen("r1", retry_delays=(0.1,) * 2, queue="test_listen_retry_delays_queue")
+    @listen("r1", retry_delays=(1,) * 2, queue="test_listen_retry_delays_queue")
     async def handler(_):
         nonlocal callcount
         callcount += 1
@@ -619,7 +623,7 @@ async def test_wildcard_routing_key_preserved_through_retries(
     callcount = 0
     retrieved_routing_keys = []
 
-    @listen("order.*", queue="test_wildcard_retry_queue", retry_delays=(0.1, 0.1))
+    @listen("order.*", queue="test_wildcard_retry_queue", retry_delays=(1, 1))
     async def handler(routing_key: str, person):
         nonlocal callcount
         callcount += 1

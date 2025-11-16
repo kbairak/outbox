@@ -49,7 +49,7 @@ class OutboxTable(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     routing_key: Mapped[str] = mapped_column(Text)
     body: Mapped[bytes] = mapped_column()
-    track_ids: Mapped[list[str]] = mapped_column(JSON)
+    tracking_ids: Mapped[list[str]] = mapped_column(JSON)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -61,9 +61,9 @@ class OutboxTable(Base):
     def __repr__(self):
         routing_key = self.routing_key
         body = reprlib.repr(self.body)
-        track_ids = self.track_ids
+        tracking_ids = self.tracking_ids
         created_at = self.created_at
-        args = [f"{routing_key=}", f"{body=}", f"{track_ids=}", f"{created_at=}"]
+        args = [f"{routing_key=}", f"{body=}", f"{tracking_ids=}", f"{created_at=}"]
         if self.send_after != self.created_at:
             send_after = self.send_after
             args.append(f"{send_after=}")
@@ -104,7 +104,7 @@ class Listener:
         parameter_keys = set(parameters.keys()) - {
             "routing_key",
             "message",
-            "track_ids",
+            "tracking_ids",
             "queue_name",
             "attempt_count",
         }
@@ -113,8 +113,10 @@ class Listener:
         body_param_key = parameter_keys.pop()
         body_param = parameters[body_param_key]
 
-        track_ids = tuple(json.loads(cast(str, message.headers.get("x-outbox-track-ids", "[]"))))
-        token = _track_ids.set(track_ids)
+        tracking_ids = tuple(
+            json.loads(cast(str, message.headers.get("x-outbox-tracking-ids", "[]")))
+        )
+        token = _tracking_ids.set(tracking_ids)
 
         attempt_count_header = cast(str | None, message.headers.get("x-delivery-count"))
         retry_delays = self.retry_delays or ()
@@ -127,11 +129,11 @@ class Listener:
             # If retry_delays is empty, messages go to DLQ (see exception handler below)
             if retry_delays and attempt_count > len(retry_delays) + 1:
                 logger.warning(
-                    f"Message {message.routing_key} with track IDs {track_ids} exceeded retry attempts "
-                    f"({attempt_count} > {len(retry_delays) + 1}), sending to DLQ"
+                    f"Message {message.routing_key} with tracking IDs {tracking_ids} exceeded "
+                    f"retry attempts ({attempt_count} > {len(retry_delays) + 1}), sending to DLQ"
                 )
                 await message.nack(requeue=False)
-                _track_ids.reset(token)
+                _tracking_ids.reset(token)
                 return
         else:
             attempt_count = 1
@@ -148,17 +150,18 @@ class Listener:
                 body = json.loads(message.body)
         except Exception as exc:
             logger.error(
-                f"Failed to deserialize message body {routing_key=}, {track_ids=}, {body=}, {exc=}"
+                f"Failed to deserialize message body {routing_key=}, {tracking_ids=}, {body=}, "
+                f"{exc=}"
             )
             raise  # TODO: Will (should) this crash the worker?
         else:
-            logger.info(f"Processing message {routing_key=}, {track_ids=}, {body=}")
+            logger.info(f"Processing message {routing_key=}, {tracking_ids=}, {body=}")
 
         kwargs = {body_param_key: body}
         for attr in (
             "routing_key",
             "message",
-            "track_ids",
+            "tracking_ids",
             "queue_name",
             "attempt_count",
         ):
@@ -169,30 +172,32 @@ class Listener:
             await self.callback(**kwargs)
         except Reject:
             logger.warning(
-                f"Rejecting, this message will end up in DLQ {routing_key=}, {track_ids=}, {body=}"
+                f"Rejecting, this message will end up in DLQ {routing_key=}, {tracking_ids=}, "
+                f"{body=}"
             )
             await message.nack(requeue=False)
         except Exception:
             if retry_delays:
-                logger.warning(f"Retrying {routing_key=}, {track_ids=}, {body=}")
-                await self._delayed_retry(message, attempt_count, track_ids)
+                logger.warning(f"Retrying {routing_key=}, {tracking_ids=}, {body=}")
+                await self._delayed_retry(message, attempt_count, tracking_ids)
             else:
                 # TODO: Check if this is really needed, maybe _delayed_retry() will take care of it
                 logger.warning(
-                    f"No retries configured, sending to DLQ {routing_key=}, {track_ids=}, {body=}"
+                    f"No retries configured, sending to DLQ {routing_key=}, {tracking_ids=}, "
+                    f"{body=}"
                 )
                 await message.nack(requeue=False)
         else:
-            logger.info(f"Success {routing_key=}, {track_ids=}, {body=}")
+            logger.info(f"Success {routing_key=}, {tracking_ids=}, {body=}")
             await message.ack()
         finally:
-            _track_ids.reset(token)
+            _tracking_ids.reset(token)
 
     async def _delayed_retry(
         self,
         message: AbstractIncomingMessage,
         attempt_count: int,
-        track_ids: tuple[str, ...],
+        tracking_ids: tuple[str, ...],
     ) -> None:
         """Publish message to delay queue for retry after backoff period."""
         retry_delays = self.retry_delays or ()
@@ -227,7 +232,7 @@ class Listener:
         await message.ack()
         logger.info(
             f"Message sent to delay exchange (attempt {attempt_count}/{len(retry_delays)}, "
-            f"delay {delay}s) routing_key={message.routing_key}, {track_ids=}"
+            f"delay {delay}s) routing_key={message.routing_key}, {tracking_ids=}"
         )
 
 
@@ -242,7 +247,7 @@ def listen(
     return decorator
 
 
-_track_ids: ContextVar[tuple[str, ...],] = ContextVar("track_ids", default=())
+_tracking_ids: ContextVar[tuple[str, ...],] = ContextVar("tracking_ids", default=())
 
 
 @dataclass
@@ -251,7 +256,7 @@ class Outbox:
     db_engine_url: str | None = None
     rmq_connection: AbstractConnection | None = None
     rmq_connection_url: str | None = None
-    exchange_name: str = "outbox_exchange"
+    exchange_name: str = "outbox"
     poll_interval: float = 1.0
     expiration: DateType | None = None
     clean_up_after: (
@@ -321,7 +326,7 @@ class Outbox:
         outbox_row = OutboxTable(
             routing_key=routing_key,
             body=body,
-            track_ids=list(self.get_track_ids() + (str(uuid.uuid4()),)),
+            tracking_ids=list(self.get_tracking_ids() + (str(uuid.uuid4()),)),
             retry_limit=retry_limit,
             created_at=now,
         )
@@ -370,7 +375,7 @@ class Outbox:
         while True:
             async with AsyncSession(self.db_engine) as session, session.begin():
                 logger.debug("Checking for unsent messages...")
-                stmt = (
+                select_stmt = (
                     select(OutboxTable)
                     .where(
                         OutboxTable.sent_at.is_(None),
@@ -381,7 +386,7 @@ class Outbox:
                     .with_for_update(skip_locked=True)
                 )
                 try:
-                    outbox_row = (await session.execute(stmt)).scalars().one()
+                    outbox_row = (await session.execute(select_stmt)).scalars().one()
                 except NoResultFound:
                     logger.debug("No unsent messages found, waiting...")
                     break
@@ -389,7 +394,7 @@ class Outbox:
                 logger.debug(f"Processing message: {outbox_row}")
                 expiration = outbox_row.expiration or self.expiration
                 headers = cast(
-                    HeadersType, {"x-outbox-track-ids": json.dumps(outbox_row.track_ids)}
+                    HeadersType, {"x-outbox-tracking-ids": json.dumps(outbox_row.tracking_ids)}
                 )
                 await exchange.publish(
                     aio_pika.Message(
@@ -406,12 +411,12 @@ class Outbox:
                 else:
                     outbox_row.sent_at = datetime.datetime.now(datetime.UTC)
                 if isinstance(self.clean_up_after, datetime.timedelta):
-                    stmt = delete(OutboxTable).where(
+                    delete_stmt = delete(OutboxTable).where(
                         OutboxTable.sent_at.is_not(None),
                         OutboxTable.sent_at
                         < datetime.datetime.now(datetime.UTC) - self.clean_up_after,
                     )
-                    await session.execute(stmt)
+                    await session.execute(delete_stmt)
 
     async def worker(self, listeners: Sequence[Listener]) -> None:
         await self._set_up_queues(listeners)
@@ -523,14 +528,14 @@ class Outbox:
 
     @contextmanager
     def tracking(self) -> Generator[None, None, None]:
-        track_ids = _track_ids.get()
-        track_ids = track_ids + (str(uuid.uuid4()),)
-        token = _track_ids.set(track_ids)
+        tracking_ids = _tracking_ids.get()
+        tracking_ids = tracking_ids + (str(uuid.uuid4()),)
+        token = _tracking_ids.set(tracking_ids)
         yield
-        _track_ids.reset(token)
+        _tracking_ids.reset(token)
 
-    def get_track_ids(self) -> tuple[str, ...]:
-        return _track_ids.get()
+    def get_tracking_ids(self) -> tuple[str, ...]:
+        return _tracking_ids.get()
 
 
 outbox = Outbox()
@@ -539,4 +544,4 @@ emit = outbox.emit
 message_relay = outbox.message_relay
 worker = outbox.worker
 tracking = outbox.tracking
-get_track_ids = outbox.get_track_ids
+get_tracking_ids = outbox.get_tracking_ids

@@ -3,7 +3,7 @@ from typing import AsyncGenerator
 import aio_pika
 import pytest
 import pytest_asyncio
-from aiormq.abc import AbstractConnection
+from aio_pika.abc import AbstractConnection
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from testcontainers.rabbitmq import RabbitMqContainer
 

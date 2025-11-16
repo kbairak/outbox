@@ -4,15 +4,15 @@ Message Relay - Transfers messages from the database outbox to RabbitMQ.
 This process continuously polls the outbox table and publishes messages to RabbitMQ.
 It's a separate process from the producer and consumer.
 """
+
 import asyncio
 import logging
 
-from outbox import setup, message_relay
+from outbox import message_relay, setup
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 
 # Database and RabbitMQ connection strings
@@ -21,9 +21,9 @@ RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
 
 
 async def main():
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("Message Relay - Transferring messages from database to RabbitMQ")
-    print("="*70 + "\n")
+    print("=" * 70 + "\n")
 
     # Setup outbox
     setup(
