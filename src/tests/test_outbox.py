@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from outbox import Outbox, OutboxTable, Reject, Retry, listen
+from outbox import Outbox, OutboxTable, Reject, listen
 
 from .utils import EmitType, Person, get_dlq_message_count, run_worker
 
@@ -178,7 +178,7 @@ async def test_retry(emit: EmitType, outbox: Outbox, session: AsyncSession) -> N
     callcount = 0
     retrieved_argument = None
 
-    @listen("routing_key", queue="test_retry_queue")
+    @listen("routing_key", queue="test_retry_queue", retry_delays=(0.1, 0.1))
     async def handler(person):
         nonlocal callcount, retrieved_argument
         callcount += 1
@@ -192,7 +192,7 @@ async def test_retry(emit: EmitType, outbox: Outbox, session: AsyncSession) -> N
     await outbox._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=0.2)
+    await run_worker(outbox, [handler], timeout=1.0)
 
     # assert
     assert callcount == 3
@@ -202,7 +202,7 @@ async def test_retry(emit: EmitType, outbox: Outbox, session: AsyncSession) -> N
 @pytest.mark.asyncio(loop_scope="session")
 async def test_no_retry_with_setup(emit: EmitType, outbox: Outbox, session: AsyncSession) -> None:
     # arrange
-    outbox.setup(retry_on_error=False)
+    outbox.setup(retry_delays=())
     callcount = 0
     retrieved_argument = None
 
@@ -233,7 +233,7 @@ async def test_no_retry_with_listen(emit: EmitType, outbox: Outbox, session: Asy
     callcount = 0
     retrieved_argument = None
 
-    @listen("routing_key", retry_on_error=False, queue="test_no_retry_with_listen_queue")
+    @listen("routing_key", retry_delays=(), queue="test_no_retry_with_listen_queue")
     async def handler(person):
         nonlocal callcount, retrieved_argument
         callcount += 1
@@ -255,21 +255,18 @@ async def test_no_retry_with_listen(emit: EmitType, outbox: Outbox, session: Asy
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_force_retry_with_setup(
+async def test_no_retry_with_empty_delays_setup(
     emit: EmitType, session: AsyncSession, outbox: Outbox
 ) -> None:
-    # arrange
-    outbox.setup(retry_on_error=False)
+    # arrange - empty retry_delays means no retries, go to DLQ
+    outbox.setup(retry_delays=())
     callcount = 0
-    retrieved_argument = None
 
-    @listen("routing_key", queue="test_force_retry_with_setup_queue")
+    @listen("routing_key", queue="test_no_retry_with_empty_delays_setup_queue")
     async def handler(person):
-        nonlocal callcount, retrieved_argument
+        nonlocal callcount
         callcount += 1
-        if callcount < 3:
-            raise Retry("Simulated failure")
-        retrieved_argument = person
+        raise Exception("Simulated failure")
 
     await emit(session, "routing_key", {"name": "MyName"})
     await session.commit()
@@ -279,26 +276,23 @@ async def test_force_retry_with_setup(
     # test
     await run_worker(outbox, [handler], timeout=0.2)
 
-    # assert
-    assert callcount == 3
-    assert retrieved_argument == {"name": "MyName"}
+    # assert - only 1 attempt, then goes to DLQ
+    assert callcount == 1
+    assert (await get_dlq_message_count(outbox, "test_no_retry_with_empty_delays_setup_queue")) == 1
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_force_retry_with_listen(
+async def test_no_retry_with_empty_delays_listen(
     emit: EmitType, outbox: Outbox, session: AsyncSession
 ) -> None:
-    # arrange
+    # arrange - empty retry_delays on listener means no retries, go to DLQ
     callcount = 0
-    retrieved_argument = None
 
-    @listen("routing_key", retry_on_error=False, queue="test_force_retry_with_listen_queue")
+    @listen("routing_key", retry_delays=(), queue="test_no_retry_with_empty_delays_listen_queue")
     async def handler(person):
-        nonlocal callcount, retrieved_argument
+        nonlocal callcount
         callcount += 1
-        if callcount < 3:
-            raise Retry("Simulated failure")
-        retrieved_argument = person
+        raise Exception("Simulated failure")
 
     await emit(session, "routing_key", {"name": "MyName"})
     await session.commit()
@@ -308,9 +302,9 @@ async def test_force_retry_with_listen(
     # test
     await run_worker(outbox, [handler], timeout=0.2)
 
-    # assert
-    assert callcount == 3
-    assert retrieved_argument == {"name": "MyName"}
+    # assert - only 1 attempt, then goes to DLQ
+    assert callcount == 1
+    assert (await get_dlq_message_count(outbox, "test_no_retry_with_empty_delays_listen_queue")) == 1
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -365,7 +359,7 @@ async def test_dead_letter_with_expiration(emit: EmitType, session: AsyncSession
     # arrange
     @listen("routing_key", queue="test_dead_letter_with_expiration_queue_name2")
     async def handler(_):
-        raise Retry("test")
+        raise Exception("test")
 
     await emit(session, "routing_key", {}, expiration=0.02)
     await session.commit()
@@ -540,14 +534,15 @@ async def test_track_ids_with_parameter(
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_emit_retry_limit(emit: EmitType, session: AsyncSession, outbox: Outbox):
-    # arrange
-    await emit(session, "r1", {}, retry_limit=3)
+async def test_emit_retry_delays(emit: EmitType, session: AsyncSession, outbox: Outbox):
+    # arrange - test that default retry_delays from Outbox are used
+    outbox.setup(retry_delays=(0.1,) * 2)
+    await emit(session, "r1", {})
     await session.commit()
 
     callcount = 0
 
-    @listen("r1", queue="test_emit_retry_limit_queue")
+    @listen("r1", queue="test_emit_retry_delays_queue")
     async def handler(_):
         nonlocal callcount
         callcount += 1
@@ -557,22 +552,22 @@ async def test_emit_retry_limit(emit: EmitType, session: AsyncSession, outbox: O
     await outbox._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=0.4)
+    await run_worker(outbox, [handler], timeout=1.0)
 
     # assert
     assert callcount == 3
-    assert (await get_dlq_message_count(outbox, "test_emit_retry_limit_queue")) == 1
+    assert (await get_dlq_message_count(outbox, "test_emit_retry_delays_queue")) == 1
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_listen_retry_limit(emit: EmitType, session: AsyncSession, outbox: Outbox):
+async def test_listen_retry_delays(emit: EmitType, session: AsyncSession, outbox: Outbox):
     # arrange
     await emit(session, "r1", {})
     await session.commit()
 
     callcount = 0
 
-    @listen("r1", retry_limit=3, queue="test_listen_retry_limit_queue")
+    @listen("r1", retry_delays=(0.1,) * 2, queue="test_listen_retry_delays_queue")
     async def handler(_):
         nonlocal callcount
         callcount += 1
@@ -582,24 +577,24 @@ async def test_listen_retry_limit(emit: EmitType, session: AsyncSession, outbox:
     await outbox._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=0.4)
+    await run_worker(outbox, [handler], timeout=1.0)
 
     # assert
     assert callcount == 3
-    assert (await get_dlq_message_count(outbox, "test_listen_retry_limit_queue")) == 1
+    assert (await get_dlq_message_count(outbox, "test_listen_retry_delays_queue")) == 1
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_setup_retry_limit(emit: EmitType, session: AsyncSession, outbox: Outbox):
+async def test_setup_retry_delays(emit: EmitType, session: AsyncSession, outbox: Outbox):
     # arrange
-    outbox.setup(retry_limit=3)
+    outbox.setup(retry_delays=(0.1,) * 2)
 
     await emit(session, "r1", {})
     await session.commit()
 
     callcount = 0
 
-    @listen("r1", queue="test_setup_retry_limit_queue")
+    @listen("r1", queue="test_setup_retry_delays_queue")
     async def handler(_):
         nonlocal callcount
         callcount += 1
@@ -609,8 +604,37 @@ async def test_setup_retry_limit(emit: EmitType, session: AsyncSession, outbox: 
     await outbox._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=0.4)
+    await run_worker(outbox, [handler], timeout=1.0)
 
     # assert
     assert callcount == 3
-    assert (await get_dlq_message_count(outbox, "test_setup_retry_limit_queue")) == 1
+    assert (await get_dlq_message_count(outbox, "test_setup_retry_delays_queue")) == 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_wildcard_routing_key_preserved_through_retries(
+    emit: EmitType, session: AsyncSession, outbox: Outbox
+):
+    # arrange - test that wildcard routing keys are preserved through delay exchange retries
+    callcount = 0
+    retrieved_routing_keys = []
+
+    @listen("order.*", queue="test_wildcard_retry_queue", retry_delays=(0.1, 0.1))
+    async def handler(routing_key: str, person):
+        nonlocal callcount
+        callcount += 1
+        retrieved_routing_keys.append(routing_key)
+        if callcount < 3:
+            raise ValueError("Simulated failure")
+
+    await emit(session, "order.created", {"name": "MyName"})
+    await session.commit()
+    await outbox._set_up_queues([handler])
+    await outbox._consume_outbox_table()
+
+    # test
+    await run_worker(outbox, [handler], timeout=1.0)
+
+    # assert - routing key should be preserved across all retry attempts
+    assert callcount == 3
+    assert retrieved_routing_keys == ["order.created", "order.created", "order.created"]

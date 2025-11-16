@@ -54,7 +54,7 @@ from outbox import setup, message_relay
 
 setup(
     db_engine_url="postgresql+asyncpg://user:password@localhost/dbname",
-    rabbitmq_url="amqp://user:password@localhost:5672/",
+    rabbitmq_url="amqp://guest:guest@localhost:5672/",
 )
 
 asyncio.run(message_relay())
@@ -71,7 +71,7 @@ import asyncio
 
 from outbox import setup, listen, worker
 
-setup(rabbitmq_url="amqp://user:password@localhost:5672/")
+setup(rabbitmq_url="amqp://guest:guest@localhost:5672/")
 
 @listen("user.created")
 async def on_user_created(user):
@@ -88,7 +88,7 @@ import asyncio
 
 from outbox import setup, Listener, worker
 
-setup(rabbitmq_url="amqp://user:password@localhost:5672/")
+setup(rabbitmq_url="amqp://guest:guest@localhost:5672/")
 
 async def on_user_created(user):
     print(user)
@@ -130,40 +130,73 @@ async with AsyncSession(db_engine) as session, session.begin():
 <details>
     <summary><h3>Retries and dead-lettering</h3></summary>
 
-If you take no precaution and your listener raises an exception, the event will be re-queued and run again as soon as possible. This is useful for transient errors, but can lead to infinite loops if the error is not transient. There are several ways you can control how an event will retry:
+When a listener raises an exception, the library implements **exponential backoff** with delayed retries using RabbitMQ's TTL-based delay queues. Messages that fail are sent to a delay queue, and after the configured delay expires, they are automatically routed back to the original queue for retry.
 
-- Setting a retry limit (integer)
-- Setting a message expiration (timedelta or datetime or number of milliseconds)
-- Setting `retry_on_error=False`
-- Explicitly raising the `outbox.Reject` exception
+**Configuring retry delays:**
 
-The first three options can be used with the following ways, in order of precedence:
+You can control retry behavior by configuring `retry_delays` - a sequence of delay times in seconds. For example, `retry_delays=(1, 10, 60, 300)` means:
 
-- As an argument during `emit` (except for `retry_on_error`, which is not supported here)
-- As an argument during `listen` (except for `expiration` which is not supported here)
-- As an argument during `setup`
+- First failure: wait 1 second before retry (attempt 2)
+- Second failure: wait 10 seconds before retry (attempt 3)
+- Third failure: wait 60 seconds before retry (attempt 4)
+- Fourth failure: wait 300 seconds before retry (attempt 5)
+- Fifth failure: send to dead-letter queue
+
+Configure retry delays at two levels, with per-listener overriding global:
 
 ```python
 from outbox import setup, emit, listen, Reject
 
-setup(..., retry_limit=5)  # or expiration or retry_on_error
+# Global default for all listeners
+setup(..., retry_delays=(1, 10, 60, 300))
 
-async def main():
-    async with AsyncSession(db_engine) as session:
-        await emit(..., retry_limit=4)  # or expiration
-        await session.commit()
+# Per-listener override
+@listen("user.created", retry_delays=(5, 30))  # Only 2 retries with these delays
+async def on_user_created(user):
+    if some_transient_error:
+        raise Exception("Will retry with configured delays")
+    if some_permanent_error:
+        raise Reject()  # Skip retries, send directly to DLQ
 
-@listen(..., retry_limit=5)  # or expiration or retry_on_error
-async def on_event(event):
-    if some_condition:
-        raise Reject()
+# Disable retries for a specific listener
+@listen("user.deleted", retry_delays=())  # No retries - straight to DLQ on failure
+async def on_user_deleted(user):
+    pass  # Failures go directly to DLQ
 ```
 
-If an event fails to be processed because of any of the reasons above, it will be sent to a dead-letter exchange and from there to a dead-letter queue. One dead-letter queue is created for each regular queue and its name is the same prefixed with `dlq_`. When you encounter messages in your dead-letter queues, you can inspect the logs, figure out what went wrong, fix the code, restart the worker and use the RabbitMQ shovel interface to move the messages back to their respective queues for re-processing.
+**Special cases:**
 
-If your listener function accepts arguments called `retry_limit`, `expiration` or `retry_on_error`, they will be populated by the values that are actually used for the event.
+- **Empty retry_delays (`()`)**: No retries - failures send message directly to dead-letter queue. Useful when you want failures to be handled manually.
+- **`Reject` exception**: Sends message directly to dead-letter queue, bypassing all retries. Same effect as raising any exception with `retry_delays=()`.
+- **Message expiration**: You can still set `expiration` during `emit()` to limit total processing time regardless of retries.
 
-One final note, even if you have set `retry_on_error=False`, you can still force a retry by raising the `outbox.Retry` exception.
+**Dead-letter queues:**
+
+If a message fails after exhausting all retry attempts (or is explicitly rejected), it's sent to a dead-letter exchange and then to a dead-letter queue. One dead-letter queue is created for each regular queue with the suffix `.dlq`. When you encounter messages in dead-letter queues, you can:
+
+1. Inspect logs to understand what went wrong
+2. Fix the code and restart the worker
+3. Use RabbitMQ's shovel interface to move messages back to their respective queues for reprocessing
+
+**Important - Idempotency:**
+
+The library implements **at-least-once delivery semantics**, meaning messages may be delivered multiple times. Your handlers **must be idempotent** to handle duplicate deliveries correctly. This can happen due to:
+
+- Retries after failures
+- Network issues or worker restarts
+- RabbitMQ redeliveries
+
+```python
+@listen("order.created")
+async def process_order(order_id: int):
+    # ✅ Good: Check if already processed
+    if await is_order_processed(order_id):
+        return  # Skip duplicate
+
+    await process_order_logic(order_id)
+    await mark_order_processed(order_id)
+```
+
 </details>
 
 <details>
@@ -313,8 +346,6 @@ If you arguments are named:
 - `routing_key`: it will be populated with the routing key of the message (this may be useful if the binding key of the queue uses wildcards)
 - `message`: it will be populated with the raw aio-pika message object
 - `track_ids`: it will be populated with the tracking IDs of the message
-- `retry_limit`: it will be populated with the retry limit that has been configured
-- `retry_on_error`: it will be populated with the retry_on_error setting that has been configured
 - `queue_name`: it will be populated with the name of the queue that the listener is consuming from (may be useful if it was automatically generated by the library)
 - `attempt_count`: it will be populated with the number of attempts that have been made to process the message (starting from 1)
 
@@ -481,10 +512,9 @@ For production, `logging.INFO` is recommended so you can track message flow with
 - `rmq_connection`: If you already have a aio-pika connection, you can pass it here instead of `rmq_connection_url` (you must pass either one or the other)
 - `exchange_name`: Name of the RabbitMQ exchange to use. Defaults to `outbox_exchange`
 - `poll_interval`: How often to poll the outbox table for unsent messages. Defaults to `1` second
-- `retry_on_error`: Whether to retry messages that fail to be processed by the listener. Defaults to `True`
 - `expiration`: Expiration time in seconds for messages in RabbitMQ. Defaults to `None` (no expiration)
-- `clean_up_after`: How long to keep messages in the outbox table after they are sent. Can be `IMMEDIATELY`, `NEVER`, or a float representing seconds
-- `retry_limit`: Default maximum number of retries for a message. Defaults to `3`
+- `clean_up_after`: How long to keep messages in the outbox table after they are sent. Can be `IMMEDIATELY`, `NEVER`, or a `timedelta`
+- `retry_delays`: Default retry delays (in seconds) for all listeners. A sequence of delay times for exponential backoff. Defaults to `(1, 10, 60, 300)` (1s, 10s, 1m, 5m). Set to `()` for unlimited immediate retries.
 - `table_name`: Name of the outbox table to use. Defaults to `outbox_table`
 
 #### `emit()`
@@ -497,7 +527,6 @@ Positional arguments:
 
 Keyword-only arguments:
 
-- `retry_limit`: The maximum number of retries for the message. Overrides the default set during `setup`
 - `expiration`: The expiration time in seconds for the message. Overrides the default set during `setup`
 - `eta`: The time at which the message should be sent. Can be a `datetime`, a `timedelta` or an interval in milliseconds
 
@@ -512,8 +541,7 @@ Positional arguments:
 Keyword-only arguments:
 
 - `queue`: The name of the queue to use for the listener. If not provided (empty string), a name based on the callback's module and qualname will be auto-generated
-- `retry_limit`: The maximum number of retries for the message. Overrides the default set during `setup`
-- `retry_on_error`: Whether to retry messages that fail to be processed by the listener. Overrides the default set during `setup`
+- `retry_delays`: Retry delays (in seconds) for this listener. Overrides the default set during `setup`. Set to `()` for unlimited immediate retries.
 
 Returns a `Listener` instance that is also callable (delegates to the original function).
 
@@ -526,8 +554,7 @@ Fields:
 - `binding_key`: The binding key pattern to match messages against
 - `callback`: The async function to call when a message is received
 - `queue`: The queue name (auto-generated from callback if empty string)
-- `retry_on_error`: Whether to retry on errors (None means use global default)
-- `retry_limit`: Maximum retry attempts (None means use global default)
+- `retry_delays`: Retry delays in seconds for this listener (None means use global default)
 - `queue_obj`: Internal runtime state (RabbitMQ queue object)
 - `consumer_tag`: Internal runtime state (RabbitMQ consumer tag)
 
@@ -607,10 +634,6 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ## TODOs
 
-### High priority
-
-- [ ] Don't retry immediately, implement a backoff strategy
-
 ### Medium priority
 
 - [ ] Observability (prometheus)
@@ -620,6 +643,7 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 - [ ] Heartbeat to verify connection to RabbitMQ is alive
 - [ ] Fetch multiple messages at once from outbox table
 - [ ] Channel/connection pooling
+- [ ] Option to not create new exchanges/queues/bindings but raise error if they don't exist and configured the same way
 
 ### Low priority
 
@@ -628,3 +652,4 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 - [ ] Use pg notify/listen to avoid polling the database
 - [ ] Nested dependencies
 - [ ] No 'application/json' content type if body is bytes
+- [ ] Delay exchange/queue names to include minutes and/or hours (`XmYYs` instead of `XXXXs`)

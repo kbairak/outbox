@@ -1,0 +1,12 @@
+# Required dependencies for the delayed retries example
+
+# Install the outbox library from the parent directory:
+# pip install -e ../../
+
+# Or install from PyPI once published:
+# outbox
+
+# Additional dependencies (should be installed with outbox)
+sqlalchemy[asyncio]>=2.0
+aiosqlite>=0.20
+aio-pika>=9.0

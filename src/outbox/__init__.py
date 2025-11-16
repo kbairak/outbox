@@ -76,10 +76,6 @@ class OutboxTable(Base):
         return f"OutboxTable({', '.join(args)})"
 
 
-class Retry(Exception):
-    pass
-
-
 class Reject(Exception):
     pass
 
@@ -89,10 +85,10 @@ class Listener:
     binding_key: str
     callback: Callable[..., Coroutine[Any, Any, None]]
     queue: str = ""
-    retry_on_error: bool | None = None
-    retry_limit: int | None = None
+    retry_delays: Sequence[int] | None = None
     queue_obj: AbstractQueue | None = None
     consumer_tag: ConsumerTag | None = None
+    _delay_exchanges: dict[int, AbstractExchange] = field(default_factory=dict)
 
     def __post_init__(self):
         if not self.queue:
@@ -109,8 +105,6 @@ class Listener:
             "routing_key",
             "message",
             "track_ids",
-            "retry_limit",
-            "retry_on_error",
             "queue_name",
             "attempt_count",
         }
@@ -122,25 +116,29 @@ class Listener:
         track_ids = tuple(json.loads(cast(str, message.headers.get("x-outbox-track-ids", "[]"))))
         token = _track_ids.set(track_ids)
 
-        retry_limit = (
-            cast(int | None, message.headers.get("x-outbox-retry-limit")) or self.retry_limit
-        )
-        if retry_limit is not None:
-            retry_limit = int(retry_limit)
-        attempt_count = cast(str | None, message.headers.get("x-delivery-count"))
-        if attempt_count is not None:
-            attempt_count = int(attempt_count)
+        attempt_count_header = cast(str | None, message.headers.get("x-delivery-count"))
+        retry_delays = self.retry_delays or ()
 
-        if retry_limit is not None and attempt_count is not None and attempt_count >= retry_limit:
-            logger.warning(
-                f"Message {message.routing_key} with track IDs {track_ids} exceeded retry limit "
-                f"{retry_limit}, rejecting"
-            )
-            await message.nack(requeue=False)
-            _track_ids.reset(token)
-            return
+        if attempt_count_header is not None:
+            attempt_count = int(attempt_count_header)
 
-        routing_key, body = message.routing_key, message.body
+            # TODO: check if this is really needed
+            # Check if retries are exhausted (only check if retry_delays is configured)
+            # If retry_delays is empty, messages go to DLQ (see exception handler below)
+            if retry_delays and attempt_count > len(retry_delays) + 1:
+                logger.warning(
+                    f"Message {message.routing_key} with track IDs {track_ids} exceeded retry attempts "
+                    f"({attempt_count} > {len(retry_delays) + 1}), sending to DLQ"
+                )
+                await message.nack(requeue=False)
+                _track_ids.reset(token)
+                return
+        else:
+            attempt_count = 1
+
+        routing_key = message.routing_key
+        assert routing_key is not None
+        body = message.body
         try:
             if issubclass(body_param.annotation, BaseModel):
                 body = body_param.annotation.model_validate_json(message.body)
@@ -161,49 +159,85 @@ class Listener:
             "routing_key",
             "message",
             "track_ids",
-            "retry_limit",
-            "retry_on_error",
             "queue_name",
             "attempt_count",
         ):
             if attr in parameters:
-                kwargs[attr] = locals()[attr]
+                kwargs[attr] = locals()[attr]  # TODO: This is ugly, do it more explicitly
 
         try:
             await self.callback(**kwargs)
-        except Retry:
-            logger.info(f"Retrying (forced) {routing_key=}, {track_ids=}, {body=}")
-            await message.nack(requeue=True)
         except Reject:
             logger.warning(
-                f"Rejecting, this message will likely end up in DLX {routing_key=}, "
-                f"{track_ids=}, {body=}"
+                f"Rejecting, this message will end up in DLQ {routing_key=}, {track_ids=}, {body=}"
             )
             await message.nack(requeue=False)
         except Exception:
-            logger.warning(
-                f"{'Retrying' if self.retry_on_error else 'Aborting'} {routing_key=}, "
-                f"{track_ids=}, {body=}"
-            )
-            if self.retry_on_error:
-                await message.nack(requeue=True)
+            if retry_delays:
+                logger.warning(f"Retrying {routing_key=}, {track_ids=}, {body=}")
+                await self._delayed_retry(message, attempt_count, track_ids)
             else:
-                await message.ack()
+                # TODO: Check if this is really needed, maybe _delayed_retry() will take care of it
+                logger.warning(
+                    f"No retries configured, sending to DLQ {routing_key=}, {track_ids=}, {body=}"
+                )
+                await message.nack(requeue=False)
         else:
             logger.info(f"Success {routing_key=}, {track_ids=}, {body=}")
             await message.ack()
         finally:
             _track_ids.reset(token)
 
+    async def _delayed_retry(
+        self,
+        message: AbstractIncomingMessage,
+        attempt_count: int,
+        track_ids: tuple[str, ...],
+    ) -> None:
+        """Publish message to delay queue for retry after backoff period."""
+        retry_delays = self.retry_delays or ()
+
+        if attempt_count > len(retry_delays):
+            logger.warning(
+                f"Exceeded retry attempts ({attempt_count} > {len(retry_delays)}), sending to DLQ"
+            )
+            await message.nack(requeue=False)
+            return
+
+        # Get delay for this attempt
+        delay = retry_delays[attempt_count - 1]
+        delay_exchange = self._delay_exchanges[delay]
+
+        # Prepare new headers with incremented delivery count
+        new_headers = dict(message.headers) if message.headers else {}
+        new_headers["x-delivery-count"] = str(attempt_count + 1)
+
+        # Publish to delay exchange with original routing key preserved
+        assert message.routing_key is not None
+        await delay_exchange.publish(
+            aio_pika.Message(
+                body=message.body,
+                content_type=message.content_type,
+                headers=new_headers,
+            ),
+            routing_key=message.routing_key,
+        )
+
+        # Ack original message
+        await message.ack()
+        logger.info(
+            f"Message sent to delay exchange (attempt {attempt_count}/{len(retry_delays)}, "
+            f"delay {delay}s) routing_key={message.routing_key}, {track_ids=}"
+        )
+
 
 def listen(
     binding_key: str,
     queue: str = "",
-    retry_on_error: bool | None = None,
-    retry_limit: int | None = None,
+    retry_delays: Sequence[int] | None = None,
 ):
     def decorator(func: Callable[..., Coroutine[Any, Any, None]]) -> Listener:
-        return Listener(binding_key, func, queue, retry_on_error, retry_limit)
+        return Listener(binding_key, func, queue, retry_delays)
 
     return decorator
 
@@ -219,12 +253,11 @@ class Outbox:
     rmq_connection_url: str | None = None
     exchange_name: str = "outbox_exchange"
     poll_interval: float = 1.0
-    retry_on_error: bool = True
     expiration: DateType | None = None
     clean_up_after: (
         Literal["IMMEDIATELY"] | Literal["NEVER"] | datetime.timedelta | int | float | None
     ) = None
-    retry_limit: int | None = None
+    retry_delays: Sequence[int] = (1, 10, 60, 300)
     table_name: str = "outbox_table"
     _table_created: bool = False
     _shutdown_future: asyncio.Future | None = None
@@ -355,10 +388,9 @@ class Outbox:
 
                 logger.debug(f"Processing message: {outbox_row}")
                 expiration = outbox_row.expiration or self.expiration
-                headers = {"x-outbox-track-ids": json.dumps(outbox_row.track_ids)}
-                if outbox_row.retry_limit is not None:
-                    headers["x-outbox-retry-limit"] = str(outbox_row.retry_limit)
-                headers = cast(HeadersType, headers)
+                headers = cast(
+                    HeadersType, {"x-outbox-track-ids": json.dumps(outbox_row.track_ids)}
+                )
                 await exchange.publish(
                     aio_pika.Message(
                         outbox_row.body,
@@ -394,10 +426,6 @@ class Outbox:
         logger.info(f"Starting worker on exchange: {self.exchange_name} ...")
         for listener in listeners:
             assert listener.queue_obj is not None
-            if listener.retry_on_error is None:
-                listener.retry_on_error = self.retry_on_error
-            if listener.retry_limit is None:
-                listener.retry_limit = self.retry_limit
 
             async def _task(
                 message: AbstractIncomingMessage, listener: Listener = listener
@@ -419,7 +447,6 @@ class Outbox:
             if listener.consumer_tag is None:
                 continue
             assert listener.queue_obj is not None
-            assert listener.consumer_tag is not None
             await listener.queue_obj.cancel(listener.consumer_tag)
 
         if tasks:
@@ -437,7 +464,43 @@ class Outbox:
         dead_letter_exchange = await channel.declare_exchange(
             f"{self.exchange_name}.dlx", aio_pika.ExchangeType.DIRECT, durable=True
         )
+
+        # Collect all unique delay values across all listeners
+        # TODO: Minor: Use a reduce statement to create all_delays faster (with fewer LOC)
+        all_delays = set(self.retry_delays)
         for listener in listeners:
+            if listener.retry_delays:
+                all_delays.update(listener.retry_delays)
+
+        # Create delay exchanges (fanout type) and their queues
+        delay_exchanges = {}
+        for delay in all_delays:
+            exchange_and_queue_name = f"{self.exchange_name}.delay_{delay}s"
+            delay_exchange = await channel.declare_exchange(
+                exchange_and_queue_name, aio_pika.ExchangeType.FANOUT, durable=True
+            )
+            delay_exchanges[delay] = delay_exchange
+
+            # Create delay queue and bind to delay exchange
+            delay_queue = await channel.declare_queue(
+                exchange_and_queue_name,
+                durable=True,
+                arguments={
+                    "x-message-ttl": int(delay * 1000),
+                    "x-dead-letter-exchange": self.exchange_name,  # Dead-letter to main exchange
+                    "x-queue-type": "quorum",
+                },
+            )
+            # Bind to fanout exchange (no routing key needed)
+            await delay_queue.bind(delay_exchange)
+
+        # Set up listener queues and inject configuration
+        for listener in listeners:
+            # Inject default retry_delays and delay exchanges
+            if listener.retry_delays is None:
+                listener.retry_delays = self.retry_delays
+            listener._delay_exchanges = delay_exchanges
+
             dead_letter_queue_obj = await channel.declare_queue(
                 f"{listener.queue}.dlq", durable=True, arguments={"x-queue-type": "quorum"}
             )
