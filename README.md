@@ -205,13 +205,15 @@ async def process_order(order_id: int):
 While using the outbox pattern, you will be emitting messages from an entrypoint (usually and API endpoint) which will be picked up by listeners which will in turn emit their own messages and so on. It can be beneficial to assign tracking IDs so that you can track the entire history of emissions. This library assigns a UUID every time you emit, then the listener will get the tracking history of the current event and then, when it emits, will append its own UUID. You can get the whole list of UUIDs by invoking `outbox.get_tracking_ids()` inside the listener or by passing a `tracking_ids` parameter to the listener:
 
 ```python
+from collections.abc import Sequence
+
 async def entrypoint():
     async with AsyncSession(db_engine) as session:
         await emit(session, "user.created", {"id": 123, "username": "johndoe"})
         await session.commit()
 
 @listen("user.created")
-async def on_user_created(user, tracking_ids: tuple[str, ...]):
+async def on_user_created(user, tracking_ids: Sequence[str]):
     logger.info(f"User created {user.id}, tracking IDs: {tracking_ids}")
     async with AsyncSession(db_engine) as session:
         await emit(session, "user.welcome_email", {"id": user.id})
@@ -219,7 +221,7 @@ async def on_user_created(user, tracking_ids: tuple[str, ...]):
         await session.commit()
 
 @listen("user.welcome_email")
-async def on_user_welcome_email(user, tracking_ids: tuple[str, ...]):
+async def on_user_welcome_email(user, tracking_ids: Sequence[str]):
     logger.info(f"Welcome email sent for user {user.id}, tracking IDs: {tracking_ids}")
 
 @listen("user.created_notification")
@@ -988,7 +990,7 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ### Medium priority
 
-- [ ] Mypy
+- [ ] See what Python versions are supported
 - [ ] RabbitMQ prefetch
 - [ ] Fetch multiple messages at once from outbox table
 - [ ] Channel/connection pooling

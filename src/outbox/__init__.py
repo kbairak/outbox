@@ -58,7 +58,7 @@ class OutboxTable(Base):
     send_after: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
     sent_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         routing_key = self.routing_key
         body = reprlib.repr(self.body)
         tracking_ids = self.tracking_ids
@@ -90,13 +90,15 @@ class Listener:
     consumer_tag: ConsumerTag | None = None
     _delay_exchanges: dict[int, AbstractExchange] = field(default_factory=dict)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not self.queue:
-            self.queue = f"{self.callback.__module__}.{self.callback.__qualname__}".replace(
+            # callback is always a function (decorated), safe to access __module__ and __qualname__
+            callback_func = cast(Any, self.callback)
+            self.queue = f"{callback_func.__module__}.{callback_func.__qualname__}".replace(
                 "<", ""
             ).replace(">", "")
 
-    def __call__(self, *args, **kwargs) -> Coroutine[Any, Any, None]:
+    def __call__(self, *args: Any, **kwargs: Any) -> Coroutine[Any, Any, None]:
         return self.callback(*args, **kwargs)
 
     async def _handle(self, message: AbstractIncomingMessage) -> None:
@@ -240,14 +242,16 @@ def listen(
     binding_key: str,
     queue: str = "",
     retry_delays: Sequence[int] | None = None,
-):
+) -> Callable[[Callable[..., Coroutine[Any, Any, None]]], Listener]:
     def decorator(func: Callable[..., Coroutine[Any, Any, None]]) -> Listener:
         return Listener(binding_key, func, queue, retry_delays)
 
     return decorator
 
 
-_tracking_ids: ContextVar[tuple[str, ...],] = ContextVar("tracking_ids", default=())
+_tracking_ids: ContextVar[tuple[str, ...]] = ContextVar[tuple[str, ...]](
+    "tracking_ids", default=()
+)
 
 
 @dataclass
@@ -265,9 +269,10 @@ class Outbox:
     retry_delays: Sequence[int] = (1, 10, 60, 300)
     table_name: str = "outbox_table"
     _table_created: bool = False
-    _shutdown_future: asyncio.Future | None = None
+    # Instance attribute (not just local var) to allow tests to simulate shutdown signals
+    _shutdown_future: asyncio.Future[None] | None = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.db_engine is not None and self.db_engine_url is not None:
             raise ValueError("You cannot set both db_engine and db_engine_url")
         if self.rmq_connection is not None and self.rmq_connection_url is not None:
@@ -285,7 +290,7 @@ class Outbox:
                 assert milliseconds is not None
                 self.clean_up_after = datetime.timedelta(milliseconds=int(milliseconds))
 
-    def setup(self, **kwargs):
+    def setup(self, **kwargs: Any) -> None:
         field_names = {field.name for field in fields(self)}
         for key, value in kwargs.items():
             if key not in field_names:

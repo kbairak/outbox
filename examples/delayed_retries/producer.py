@@ -23,7 +23,7 @@ DB_URL = "sqlite+aiosqlite:///outbox_delayed_retries_demo.db"
 RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
 
 
-async def main():
+async def main() -> None:
     # Create database engine
     db_engine = create_async_engine(DB_URL, echo=False)
 

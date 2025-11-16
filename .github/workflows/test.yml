@@ -7,8 +7,34 @@ on:
     branches: [master]
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.7.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+
+      - name: uv sync
+        run: uv sync
+
+      - name: Run linters
+        run: make lint
+
   test:
     runs-on: ubuntu-latest
+    needs: lint
     services:
       docker:
         image: docker:dind
@@ -32,11 +58,8 @@ jobs:
       - name: uv sync
         run: uv sync
 
-      - name: Run checks
-        run: uv run ruff format && uv run ruff check
-
       - name: Pull RabbitMQ Docker image
         run: docker pull rabbitmq:4.1
 
       - name: Run tests
-        run: uv run pytest -vv --cov --cov-report=term-missing
+        run: make test

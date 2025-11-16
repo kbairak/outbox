@@ -5,7 +5,7 @@ import pytest
 import pytest_asyncio
 from aio_pika.abc import AbstractConnection
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
-from testcontainers.rabbitmq import RabbitMqContainer
+from testcontainers.rabbitmq import RabbitMqContainer  # type: ignore[import-untyped]
 
 from outbox import Outbox
 
@@ -24,7 +24,7 @@ async def session(db_engine: AsyncEngine) -> AsyncGenerator[AsyncSession, None]:
 
 
 @pytest_asyncio.fixture(scope="session", loop_scope="session")
-async def rmq_connection():
+async def rmq_connection() -> AsyncGenerator[AbstractConnection, None]:
     with RabbitMqContainer("rabbitmq:4.1") as rabbitmq:
         connection = await aio_pika.connect(
             f"amqp://{rabbitmq.username}:{rabbitmq.password}@{rabbitmq.get_container_host_ip()}:"

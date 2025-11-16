@@ -27,7 +27,7 @@ dev = [
   "pytest-asyncio>=1.0.0",
   "pytest-cov>=6.1.1",
   "ruff>=0.11.12",
-  "testcontainers[rabbitmq]>=4.10.0",
+  "testcontainers[rabbitmq]>=4.13.3",
   "ty>=0.0.1a26",
 ]
 
@@ -36,3 +36,7 @@ line-length = 99
 
 [tool.ruff.lint]
 select = ["I"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true

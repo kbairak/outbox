@@ -20,7 +20,7 @@ DB_URL = "sqlite+aiosqlite:///outbox_delayed_retries_demo.db"
 RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
 
 
-async def main():
+async def main() -> None:
     print("\n" + "=" * 70)
     print("Message Relay - Transferring messages from database to RabbitMQ")
     print("=" * 70 + "\n")

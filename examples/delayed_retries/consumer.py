@@ -9,6 +9,7 @@ This script sets up workers that handle messages with different retry behaviors:
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from datetime import datetime
 
 from outbox import Reject, listen, setup, worker
@@ -28,7 +29,7 @@ attempt_counts = {}
 
 
 @listen("order.process", queue="demo.order_processor", retry_delays=(2, 5, 15))
-async def process_order(order, attempt_count: int):
+async def process_order(order: Mapping[str, object], attempt_count: int) -> None:
     """
     Simulates a flaky service that fails a few times before succeeding.
 
@@ -68,7 +69,7 @@ async def process_order(order, attempt_count: int):
 
 
 @listen("order.notify", queue="demo.order_notifier")
-async def notify_customer(order):
+async def notify_customer(order: Mapping[str, object]) -> None:
     """
     Simulates a reliable service that always succeeds.
     """
@@ -83,7 +84,7 @@ async def notify_customer(order):
 
 
 @listen("order.invalid", queue="demo.order_validator", retry_delays=(1, 2))
-async def validate_order(order, attempt_count: int):
+async def validate_order(order: Mapping[str, object], attempt_count: int) -> None:
     """
     Simulates a validator that rejects invalid data immediately.
 
@@ -98,7 +99,7 @@ async def validate_order(order, attempt_count: int):
     raise Reject("Invalid order data - cannot be processed")
 
 
-async def main():
+async def main() -> None:
     print("\n" + "=" * 70)
     print("Consumer - Waiting for messages with delayed retry demonstration")
     print("=" * 70 + "\n")
