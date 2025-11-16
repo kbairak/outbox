@@ -910,8 +910,6 @@ Fields:
 - `callback`: The async function to call when a message is received
 - `queue`: The queue name (auto-generated from callback if empty string)
 - `retry_delays`: Retry delays in seconds for this listener (None means use global default)
-- `queue_obj`: Internal runtime state (RabbitMQ queue object)
-- `consumer_tag`: Internal runtime state (RabbitMQ consumer tag)
 
 The `Listener` instance is callable and will delegate to the `callback` function, making it transparent for testing.
 
@@ -1011,3 +1009,4 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 - [ ] Nested dependencies
 - [ ] No 'application/json' content type if body is bytes
 - [ ] Delay exchange/queue names to include minutes and/or hours (`XmYYs` instead of `XXXXs`)
+- [ ] Maybe not everything quorum-able should be quorum. Perhaps configuration

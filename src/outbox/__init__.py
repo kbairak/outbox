@@ -88,8 +88,8 @@ class Listener:
     callback: Callable[..., Coroutine[Any, Any, None]]
     queue: str = ""
     retry_delays: Optional[Sequence[int]] = None
-    queue_obj: Optional[AbstractQueue] = None
-    consumer_tag: Optional[ConsumerTag] = None
+    _queue_obj: Optional[AbstractQueue] = None
+    _consumer_tag: Optional[ConsumerTag] = None
     _delay_exchanges: dict[int, AbstractExchange] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -438,7 +438,7 @@ class Outbox:
 
         logger.info(f"Starting worker on exchange: {self.exchange_name} ...")
         for listener in listeners:
-            assert listener.queue_obj is not None
+            assert listener._queue_obj is not None
 
             async def _task(
                 message: AbstractIncomingMessage, listener: Listener = listener
@@ -450,17 +450,17 @@ class Outbox:
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
 
-            listener.consumer_tag = await listener.queue_obj.consume(_task)
+            listener._consumer_tag = await listener._queue_obj.consume(_task)
 
         await self._shutdown_future
 
         logger.info("Received shutdown signal, waiting or ongoing tasks and exiting...")
 
         for listener in listeners:
-            if listener.consumer_tag is None:
+            if listener._consumer_tag is None:
                 continue
-            assert listener.queue_obj is not None
-            await listener.queue_obj.cancel(listener.consumer_tag)
+            assert listener._queue_obj is not None
+            await listener._queue_obj.cancel(listener._consumer_tag)
 
         if tasks:
             await asyncio.wait(tasks)
@@ -524,7 +524,7 @@ class Outbox:
                 f"Binding queue {listener.queue} to exchange {self.exchange_name} with "
                 f"binding key {listener.binding_key}"
             )
-            listener.queue_obj = await channel.declare_queue(
+            listener._queue_obj = await channel.declare_queue(
                 listener.queue,
                 durable=True,
                 arguments={
@@ -533,7 +533,7 @@ class Outbox:
                     "x-queue-type": "quorum",
                 },
             )
-            await listener.queue_obj.bind(exchange, listener.binding_key)
+            await listener._queue_obj.bind(exchange, listener.binding_key)
 
     @contextmanager
     def tracking(self) -> Generator[None, None, None]:

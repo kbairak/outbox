@@ -91,8 +91,8 @@ async def test_register_listener() -> None:
     # assert
     assert handler.queue == "test_register_listener_queue"
     assert handler.binding_key == "test_register_listener_binding_key"
-    assert handler.queue_obj is None
-    assert handler.consumer_tag is None
+    assert handler._queue_obj is None
+    assert handler._consumer_tag is None
 
 
 @pytest.mark.asyncio(loop_scope="session")
