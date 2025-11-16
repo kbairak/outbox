@@ -502,6 +502,358 @@ For production, `logging.INFO` is recommended so you can track message flow with
 </details>
 
 <details>
+    <summary><h3>Pre-provisioning RabbitMQ Resources</h3></summary>
+
+## The Problem
+
+By default, the outbox library automatically creates all required RabbitMQ exchanges, queues, and bindings when the worker starts. While convenient for development, this can cause issues in production environments:
+
+- **Orphaned resources**: When code is removed or refactored, queues and exchanges may remain in RabbitMQ, potentially accumulating messages
+- **Lack of oversight**: No central visibility into what RabbitMQ resources exist across your infrastructure
+- **Configuration drift**: Resources created ad-hoc by applications may have inconsistent settings
+- **Security concerns**: Applications shouldn't have permission to create/delete infrastructure
+
+**Solution**: Pre-provision all RabbitMQ resources using infrastructure-as-code (Terraform, Ansible, etc.) and configure RabbitMQ permissions to prevent applications from creating resources.
+
+## RabbitMQ Resources Created by Outbox
+
+The outbox library creates the following RabbitMQ resources:
+
+### Exchanges
+
+| Name Pattern | Type | Durable | Purpose |
+|--------------|------|---------|---------|
+| `{exchange_name}` | TOPIC | Yes | Main exchange for routing messages from relay to listeners |
+| `{exchange_name}.dlx` | DIRECT | Yes | Dead letter exchange for failed messages |
+| `{exchange_name}.delay_{N}s` | FANOUT | Yes | Delay exchange for retry backoff (one per unique delay value) |
+
+Default value for `exchange_name` is `"outbox"`.
+
+### Queues
+
+| Name Pattern | Durable | Arguments | Purpose |
+|--------------|---------|-----------|---------|
+| `{listener.queue}` | Yes | `x-dead-letter-exchange`: `{exchange_name}.dlx`<br>`x-dead-letter-routing-key`: `{listener.queue}`<br>`x-queue-type`: `quorum` | Listener's main queue |
+| `{listener.queue}.dlq` | Yes | `x-queue-type`: `quorum` | Dead letter queue for messages that exhausted retries |
+| `{exchange_name}.delay_{N}s` | Yes | `x-message-ttl`: `{N * 1000}` ms<br>`x-dead-letter-exchange`: `{exchange_name}`<br>`x-queue-type`: `quorum` | Delay queue for retry backoff (one per unique delay value) |
+
+**Listener queue naming**: If not specified in `@listen(queue=...)`, auto-generated as `{module}.{function_name}`
+
+### Bindings
+
+| Exchange | Binding | Queue | Purpose |
+|----------|---------|-------|---------|
+| `{exchange_name}` | `{listener.binding_key}` | `{listener.queue}` | Routes messages to listener (supports wildcards like `user.*`) |
+| `{exchange_name}.dlx` | `{listener.queue}` | `{listener.queue}.dlq` | Routes failed messages to DLQ |
+| `{exchange_name}.delay_{N}s` | (none - fanout) | `{exchange_name}.delay_{N}s` | Routes messages to delay queue |
+
+**Key insight**: Delay exchanges/queues are **shared** across all listeners. The number created depends on the **unique set** of delay values across global `setup(retry_delays=...)` and all per-listener `@listen(retry_delays=...)` overrides.
+
+<details>
+    <summary><h4>Terraform: Configuration Variables</h4></summary>
+
+```hcl
+terraform {
+  required_providers {
+    rabbitmq = {
+      source  = "cyrilgdn/rabbitmq"
+      version = "~> 1.8"
+    }
+  }
+}
+
+provider "rabbitmq" {
+  endpoint = "http://localhost:15672"
+  username = "admin"
+  password = "admin"
+}
+
+# Variables for configuration
+locals {
+  exchange_name = "outbox"
+  retry_delays  = [1, 10, 60, 300]  # Must match your setup(retry_delays=...)
+
+  listeners = [
+    {
+      queue       = "myapp.user_handler"
+      binding_key = "user.created"
+    }
+  ]
+}
+```
+
+**Important notes:**
+
+1. **Sync retry_delays**: The `local.retry_delays` list in Terraform **must match** your `setup(retry_delays=...)` in Python
+2. **Sync listener queues**: The `local.listeners` list must include all your `@listen()` decorators
+3. **Queue naming**: Use explicit `queue="..."` in `@listen()` to avoid auto-generated names that are hard to predict
+
+</details>
+
+<details>
+    <summary><h4>Terraform: Exchanges, Queues, and Bindings</h4></summary>
+
+```hcl
+# Main topic exchange
+resource "rabbitmq_exchange" "main" {
+  name  = local.exchange_name
+  vhost = "/"
+
+  settings {
+    type    = "topic"
+    durable = true
+  }
+}
+
+# Dead letter exchange
+resource "rabbitmq_exchange" "dlx" {
+  name  = "${local.exchange_name}.dlx"
+  vhost = "/"
+
+  settings {
+    type    = "direct"
+    durable = true
+  }
+}
+
+# Delay exchanges (one per unique delay value)
+resource "rabbitmq_exchange" "delay" {
+  for_each = toset([for d in local.retry_delays : tostring(d)])
+
+  name  = "${local.exchange_name}.delay_${each.key}s"
+  vhost = "/"
+
+  settings {
+    type    = "fanout"
+    durable = true
+  }
+}
+
+# Delay queues (one per unique delay value)
+resource "rabbitmq_queue" "delay" {
+  for_each = toset([for d in local.retry_delays : tostring(d)])
+
+  name  = "${local.exchange_name}.delay_${each.key}s"
+  vhost = "/"
+
+  settings {
+    durable = true
+    arguments = {
+      "x-message-ttl"           = tonumber(each.key) * 1000
+      "x-dead-letter-exchange"  = local.exchange_name
+      "x-queue-type"            = "quorum"
+    }
+  }
+}
+
+# Bind delay queues to their delay exchanges
+resource "rabbitmq_binding" "delay" {
+  for_each = toset([for d in local.retry_delays : tostring(d)])
+
+  source      = "${local.exchange_name}.delay_${each.key}s"
+  vhost       = "/"
+  destination = "${local.exchange_name}.delay_${each.key}s"
+  destination_type = "queue"
+  routing_key = ""  # Fanout exchange ignores routing key
+
+  depends_on = [
+    rabbitmq_exchange.delay,
+    rabbitmq_queue.delay
+  ]
+}
+
+# Listener queues
+resource "rabbitmq_queue" "listener" {
+  for_each = { for idx, l in local.listeners : l.queue => l }
+
+  name  = each.value.queue
+  vhost = "/"
+
+  settings {
+    durable = true
+    arguments = {
+      "x-dead-letter-exchange"    = "${local.exchange_name}.dlx"
+      "x-dead-letter-routing-key" = each.value.queue
+      "x-queue-type"              = "quorum"
+    }
+  }
+}
+
+# Bind listener queues to main exchange
+resource "rabbitmq_binding" "listener" {
+  for_each = { for idx, l in local.listeners : l.queue => l }
+
+  source      = local.exchange_name
+  vhost       = "/"
+  destination = each.value.queue
+  destination_type = "queue"
+  routing_key = each.value.binding_key
+
+  depends_on = [
+    rabbitmq_exchange.main,
+    rabbitmq_queue.listener
+  ]
+}
+
+# Dead letter queues
+resource "rabbitmq_queue" "dlq" {
+  for_each = { for idx, l in local.listeners : l.queue => l }
+
+  name  = "${each.value.queue}.dlq"
+  vhost = "/"
+
+  settings {
+    durable = true
+    arguments = {
+      "x-queue-type" = "quorum"
+    }
+  }
+}
+
+# Bind DLQs to dead letter exchange
+resource "rabbitmq_binding" "dlq" {
+  for_each = { for idx, l in local.listeners : l.queue => l }
+
+  source      = "${local.exchange_name}.dlx"
+  vhost       = "/"
+  destination = "${each.value.queue}.dlq"
+  destination_type = "queue"
+  routing_key = each.value.queue
+
+  depends_on = [
+    rabbitmq_exchange.dlx,
+    rabbitmq_queue.dlq
+  ]
+}
+```
+
+</details>
+
+<details>
+    <summary><h4>Terraform: User and Permissions</h4></summary>
+
+```hcl
+# Create restricted application user
+resource "rabbitmq_user" "app" {
+  name     = "myapp"
+  password = "secure_password_here"
+  tags     = []  # No admin tags
+}
+
+# Grant permissions: no configure, limited write, full read
+resource "rabbitmq_permissions" "app" {
+  user  = rabbitmq_user.app.name
+  vhost = "/"
+
+  permissions {
+    configure = "^$"  # Cannot create/delete any resources
+    write     = "^({exchange_name}|{exchange_name}\\.delay_.*)$"  # Can publish to main exchange and delay exchanges
+    read      = ".*"  # Can consume from any queue
+  }
+}
+```
+
+The permissions configured above:
+
+```hcl
+configure = "^$"  # Regex matches nothing - no resource creation allowed
+write     = "^({exchange_name}|{exchange_name}\\.delay_.*)$"  # Can publish to main and delay exchanges
+read      = ".*"  # Can consume from all queues
+```
+
+**Permission types:**
+
+- **Configure**: Create and delete resources (exchanges, queues, bindings)
+- **Write**: Publish messages to exchanges
+- **Read**: Consume messages from queues
+
+**Why these settings:**
+
+- **`configure = "^$"`**: Prevents application from creating/deleting any RabbitMQ resources
+- **`write = "^({exchange_name}|{exchange_name}\\.delay_.*)$"`**: Allows publishing to main exchange (for message relay) and delay exchanges (for retries)
+- **`read = ".*"`**: Allows consuming from all queues
+
+**Note**: Consumers need write access to delay exchanges because when a message fails and needs to retry, the consumer publishes it to a delay exchange (e.g., `outbox.delay_5s`).
+
+</details>
+
+<details>
+    <summary><h4>What Happens Without Pre-provisioning</h4></summary>
+
+If you configure RabbitMQ permissions to prevent resource creation but don't pre-create resources, you'll see errors **when the worker starts up** (during `_set_up_queues()`), not during task execution:
+
+### Missing Exchange Error
+
+```python
+aio_pika.exceptions.ChannelPreconditionFailed: ACCESS_REFUSED - access to exchange '{exchange_name}.delay_10s'
+in vhost '/' refused for user 'myapp'
+```
+
+**Cause**: Worker tried to create delay exchange at startup but lacks configure permission
+
+**Solution**: Create the exchange in Terraform
+
+### Missing Queue Error
+
+```python
+aio_pika.exceptions.ChannelPreconditionFailed: ACCESS_REFUSED - access to queue 'myapp.user_handler'
+in vhost '/' refused for user 'myapp'
+```
+
+**Cause**: Worker tried to create listener queue at startup but lacks configure permission
+
+**Solution**: Create the queue in Terraform
+
+### Retry Failure (Missing Delay Exchange)
+
+```python
+aio_pika.exceptions.ChannelPreconditionFailed: NOT_FOUND - no exchange '{exchange_name}.delay_5s' in vhost '/'
+```
+
+**Cause**: Added `retry_delays=(5, 15)` to a listener but didn't create corresponding delay exchanges/queues in Terraform
+
+**Solution**: Update `local.retry_delays` in Terraform to include new delay values, run `terraform apply`
+
+### Publishing Failure (Missing Write Permission)
+
+```python
+aio_pika.exceptions.ChannelPreconditionFailed: ACCESS_REFUSED - access to exchange '{exchange_name}.delay_10s'
+in vhost '/' refused for user 'myapp'
+```
+
+**Cause**: Consumer tried to publish to delay exchange during retry but lacks write permission
+
+**Solution**: Update write regex in `rabbitmq_permissions` to include delay exchanges: `"^({exchange_name}|{exchange_name}\\.delay_.*)$"`
+
+**All these errors occur at worker startup**, making it easy to catch configuration issues before processing any messages.
+
+</details>
+
+## Development vs Production
+
+**Recommended approach:**
+
+**Development/Local:**
+
+- Use RabbitMQ with default permissions (guest/guest with full access)
+- Let outbox auto-create resources for fast iteration
+- No Terraform needed
+
+**Production:**
+
+- Pre-create all resources via Terraform
+- Use restricted RabbitMQ user with `configure = "^$"`
+- Enforce infrastructure-as-code discipline
+
+The library's declarative approach (`declare_exchange`/`declare_queue`) means:
+
+- If resources exist with correct config → succeeds silently
+- If resources don't exist and user has permission → creates them
+- If resources don't exist and user lacks permission → fails with error at worker startup
+
+</details>
+
+<details>
     <summary><h3>API</h3></summary>
 
 #### `setup()`
@@ -636,15 +988,14 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ### Medium priority
 
-- [ ] Observability (prometheus)
-- [ ] Better/more error messages
 - [ ] Mypy
-- [ ] Performance tests/benchmarks
-- [ ] Heartbeat to verify connection to RabbitMQ is alive
+- [ ] RabbitMQ prefetch
 - [ ] Fetch multiple messages at once from outbox table
 - [ ] Channel/connection pooling
-- [ ] Option to not create new exchanges/queues/bindings but raise error if they don't exist and configured the same way
-- [ ] RabbitMQ prefetch
+- [ ] Performance tests/benchmarks
+- [ ] Heartbeat to verify connection to RabbitMQ is alive
+- [ ] Better/more error messages
+- [ ] Observability (prometheus)
 
 ### Low priority
 

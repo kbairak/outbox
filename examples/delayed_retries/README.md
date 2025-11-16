@@ -128,19 +128,19 @@ Open http://localhost:15672 in your browser (username: `guest`, password: `guest
 
 **Queues Tab**: You'll see:
 - `demo.order_processor` - Main queue for order processing
-- `outbox_exchange.delay_2s` - Delay queue for 2-second retry
-- `outbox_exchange.delay_5s` - Delay queue for 5-second retry
-- `outbox_exchange.delay_15s` - Delay queue for 15-second retry
+- `outbox.delay_2s` - Delay queue for 2-second retry
+- `outbox.delay_5s` - Delay queue for 5-second retry
+- `outbox.delay_15s` - Delay queue for 15-second retry
 - `demo.order_processor.dlq` - Dead letter queue for failed messages
 - `demo.order_notifier` - Queue for notifications
 - `demo.order_validator.dlq` - DLQ containing the rejected invalid order
 
 **Exchanges Tab**: You'll see:
-- `outbox_exchange` - Main topic exchange
-- `outbox_exchange.dlx` - Dead letter exchange
-- `outbox_exchange.delay_2s` - Delay exchange for 2-second retry (fanout)
-- `outbox_exchange.delay_5s` - Delay exchange for 5-second retry (fanout)
-- `outbox_exchange.delay_15s` - Delay exchange for 15-second retry (fanout)
+- `outbox` - Main topic exchange
+- `outbox.dlx` - Dead letter exchange
+- `outbox.delay_2s` - Delay exchange for 2-second retry (fanout)
+- `outbox.delay_5s` - Delay exchange for 5-second retry (fanout)
+- `outbox.delay_15s` - Delay exchange for 15-second retry (fanout)
 
 ### Database
 
