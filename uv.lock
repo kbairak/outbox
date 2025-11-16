@@ -9,13 +9,32 @@ resolution-markers = [
 
 [[package]]
 name = "aio-pika"
+version = "9.4.3"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version < '3.10'",
+]
+dependencies = [
+    { name = "aiormq", marker = "python_full_version < '3.10'" },
+    { name = "yarl", marker = "python_full_version < '3.10'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c9/69/8649bdb97fa1521af3dafe23dbc5debadd4b01abb2850a4d193dae9b0451/aio_pika-9.4.3.tar.gz", hash = "sha256:fd2b1fce25f6ed5203ef1dd554dc03b90c9a46a64aaf758d032d78dc31e5295d", size = 47693, upload-time = "2024-08-13T06:49:09.619Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/85/66/cad391d83b7266a667c85c826bb6c0d7f68519a0eed7634098c12fb39a4b/aio_pika-9.4.3-py3-none-any.whl", hash = "sha256:f1423d2d5a8b7315d144efe1773763bf687ac17aa1535385982687e9e5ed49bb", size = 53240, upload-time = "2024-08-13T06:49:07.276Z" },
+]
+
+[[package]]
+name = "aio-pika"
 version = "9.5.5"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.11'",
+    "python_full_version == '3.10.*'",
+]
 dependencies = [
-    { name = "aiormq" },
-    { name = "exceptiongroup" },
-    { name = "typing-extensions", marker = "python_full_version < '3.10'" },
-    { name = "yarl" },
+    { name = "aiormq", marker = "python_full_version >= '3.10'" },
+    { name = "exceptiongroup", marker = "python_full_version >= '3.10'" },
+    { name = "yarl", marker = "python_full_version >= '3.10'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/48/00/5391405f15e85bd6cb859186dbe04d99186ca29410a7cdc52848b55a1d72/aio_pika-9.5.5.tar.gz", hash = "sha256:3d2f25838860fa7e209e21fc95555f558401f9b49a832897419489f1c9e1d6a4", size = 48468, upload-time = "2025-02-26T11:15:56.595Z" }
 wheels = [
@@ -782,7 +801,8 @@ name = "outbox"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "aio-pika" },
+    { name = "aio-pika", version = "9.4.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "aio-pika", version = "9.5.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "pydantic" },
     { name = "sqlalchemy", extra = ["asyncio"] },
 ]
@@ -805,9 +825,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aio-pika", specifier = ">=9.5.5" },
-    { name = "pydantic", specifier = ">=2.11.5" },
-    { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.41" },
+    { name = "aio-pika", marker = "python_full_version < '3.10'", specifier = ">=9.4.3,<9.5" },
+    { name = "aio-pika", marker = "python_full_version >= '3.10'", specifier = ">=9.5.0,<10" },
+    { name = "pydantic", specifier = ">=2.0.3,<3" },
+    { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.0,<3" },
 ]
 
 [package.metadata.requires-dev]

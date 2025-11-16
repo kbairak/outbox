@@ -989,7 +989,6 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ### High priority
 
-- [ ] Similarly to how we support python 3.9.2+, make sure we have broad support for aio-pika, pydantic and sqlalchemy
 - [ ] We talk about pre-provisioning for RabbitMQ resources, maybe we should talk the same way about database migrations
 
 ### Medium priority
