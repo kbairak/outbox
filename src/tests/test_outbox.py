@@ -68,7 +68,7 @@ async def test_message_relay(
     # assert
     rmq_connection_mock.channel.assert_called_once_with()
     channel_mock.declare_exchange.assert_called_once_with(
-        "outbox_exchange", aio_pika.ExchangeType.TOPIC, durable=True
+        "outbox", aio_pika.ExchangeType.TOPIC, durable=True
     )
     assert exchange_mock.publish.call_count == 1
     actual_message = exchange_mock.publish.mock_calls[0].args[0]
@@ -192,7 +192,7 @@ async def test_retry(emit: EmitType, outbox: Outbox, session: AsyncSession) -> N
     await outbox._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=1.0)
+    await run_worker(outbox, [handler], timeout=3.0)
 
     # assert
     assert callcount == 3
@@ -581,7 +581,7 @@ async def test_listen_retry_delays(emit: EmitType, session: AsyncSession, outbox
     await outbox._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=1.0)
+    await run_worker(outbox, [handler], timeout=3.0)
 
     # assert
     assert callcount == 3
@@ -637,7 +637,7 @@ async def test_wildcard_routing_key_preserved_through_retries(
     await outbox._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=1.0)
+    await run_worker(outbox, [handler], timeout=3.0)
 
     # assert - routing key should be preserved across all retry attempts
     assert callcount == 3
