@@ -108,6 +108,7 @@ async def main() -> None:
     setup(
         rmq_connection_url=RABBITMQ_URL,
         retry_delays=(2, 5, 15),  # Default: 2s, 5s, 15s delays
+        auto_create_table=True,
     )
 
     print("🎧 Listening for messages...")

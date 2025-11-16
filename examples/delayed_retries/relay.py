@@ -30,6 +30,7 @@ async def main() -> None:
         db_engine_url=DB_URL,
         rmq_connection_url=RABBITMQ_URL,
         poll_interval=1.0,  # Check for new messages every second
+        auto_create_table=True,
     )
 
     print("🔄 Relay started. Polling outbox table every second...\n")

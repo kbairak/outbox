@@ -36,7 +36,12 @@ async def rmq_connection() -> AsyncGenerator[AbstractConnection, None]:
 
 @pytest_asyncio.fixture(loop_scope="session")
 async def outbox(db_engine: AsyncEngine, rmq_connection: AbstractConnection) -> Outbox:
-    outbox = Outbox(db_engine=db_engine, rmq_connection=rmq_connection, clean_up_after="NEVER")
+    outbox = Outbox(
+        db_engine=db_engine,
+        rmq_connection=rmq_connection,
+        clean_up_after="NEVER",
+        auto_create_table=True,
+    )
     return outbox
 
 

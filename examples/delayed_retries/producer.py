@@ -32,6 +32,7 @@ async def main() -> None:
         db_engine=db_engine,
         rmq_connection_url=RABBITMQ_URL,
         retry_delays=(2, 5, 15),  # 3 retry attempts with increasing delays
+        auto_create_table=True,
     )
 
     print("\n" + "=" * 70)

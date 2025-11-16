@@ -203,7 +203,7 @@ async def test_retry(emit: EmitType, outbox: Outbox, session: AsyncSession) -> N
 @pytest.mark.asyncio(loop_scope="session")
 async def test_no_retry_with_setup(emit: EmitType, outbox: Outbox, session: AsyncSession) -> None:
     # arrange
-    outbox.setup(retry_delays=())
+    outbox.setup(retry_delays=(), auto_create_table=True)
     callcount = 0
     retrieved_argument = None
 
@@ -260,7 +260,7 @@ async def test_no_retry_with_empty_delays_setup(
     emit: EmitType, session: AsyncSession, outbox: Outbox
 ) -> None:
     # arrange - empty retry_delays means no retries, go to DLQ
-    outbox.setup(retry_delays=())
+    outbox.setup(retry_delays=(), auto_create_table=True)
     callcount = 0
 
     @listen("routing_key", queue="test_no_retry_with_empty_delays_setup_queue")
@@ -545,7 +545,7 @@ async def test_tracking_ids_with_parameter(
 @pytest.mark.asyncio(loop_scope="session")
 async def test_emit_retry_delays(emit: EmitType, session: AsyncSession, outbox: Outbox) -> None:
     # arrange - test that default retry_delays from Outbox are used
-    outbox.setup(retry_delays=(0.1,) * 2)
+    outbox.setup(retry_delays=(0.1,) * 2, auto_create_table=True)
     await emit(session, "r1", {})
     await session.commit()
 
@@ -596,7 +596,7 @@ async def test_listen_retry_delays(emit: EmitType, session: AsyncSession, outbox
 @pytest.mark.asyncio(loop_scope="session")
 async def test_setup_retry_delays(emit: EmitType, session: AsyncSession, outbox: Outbox) -> None:
     # arrange
-    outbox.setup(retry_delays=(0.1,) * 2)
+    outbox.setup(retry_delays=(0.1,) * 2, auto_create_table=True)
 
     await emit(session, "r1", {})
     await session.commit()

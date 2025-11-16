@@ -33,7 +33,7 @@ from aio_pika.abc import (
 )
 from aio_pika.message import encode_expiration
 from pydantic import BaseModel
-from sqlalchemy import JSON, DateTime, Text, delete, func, select
+from sqlalchemy import JSON, DateTime, Index, Text, delete, func, select, text
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -59,6 +59,22 @@ class OutboxTable(Base):
     expiration: Mapped[Optional[datetime.timedelta]] = mapped_column()
     send_after: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
     sent_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        # Partial index for pending messages
+        Index(
+            "outbox_pending_idx",
+            "send_after",
+            "created_at",
+            postgresql_where=(sent_at.is_(None)),
+        ),
+        # Partial index for cleanup
+        Index(
+            "outbox_cleanup_idx",
+            "sent_at",
+            postgresql_where=(sent_at.is_not(None)),
+        ),
+    )
 
     def __repr__(self) -> str:
         routing_key = self.routing_key
@@ -271,6 +287,7 @@ class Outbox:
     retry_delays: Sequence[int] = (1, 10, 60, 300)
     table_name: str = "outbox_table"
     prefetch_count: int = 10
+    auto_create_table: bool = False
     _table_created: bool = False
     # Instance attribute (not just local var) to allow tests to simulate shutdown signals
     _shutdown_future: Optional[asyncio.Future[None]] = None
@@ -303,7 +320,7 @@ class Outbox:
         self.__post_init__()
 
     async def _ensure_database(self) -> None:
-        if not self._table_created and self.db_engine:
+        if self.auto_create_table and not self._table_created and self.db_engine:
             async with self.db_engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
             self._table_created = True

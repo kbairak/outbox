@@ -43,8 +43,6 @@ async def main():
 asyncio.run(main())
 ```
 
-No need for migrations, `setup` will get-or-create the outbox table automatically.
-
 ### Message relay process
 
 ```python
@@ -504,6 +502,96 @@ For production, `logging.INFO` is recommended so you can track message flow with
 </details>
 
 <details>
+    <summary><h3>Database setup</h3></summary>
+
+If you pass `auto_create_table=True` to `setup`, then the library will automatically get-or-create the outbox table before it's needed (before emitting and during the message relay). This is fine for development environments or if your policies around the database are not particularly strict. If you want better control of your database, you can leave `auto_create_table=False`, which is the default, and do this:
+
+#### Using Alembic
+
+If you manage database migrations using Alembic, before deploying the code that uses this library, you should create a new empty migration:
+
+```sh
+alembic revision -m "Create outbox table"
+```
+
+Then, edit the generated migration file to include the following code:
+
+```python
+from alembic import op
+import sqlalchemy as sa
+
+def upgrade():
+    op.create_table(
+        "outbox_table",
+        sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("routing_key", sa.Text, nullable=False),
+        sa.Column("body", sa.LargeBinary, nullable=False),
+        sa.Column("tracking_ids", sa.JSON, nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("NOW()"),
+            nullable=False,
+        ),
+        sa.Column("retry_limit", sa.Integer),
+        sa.Column("expiration", sa.Interval),
+        sa.Column("send_after", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("sent_at", sa.DateTime(timezone=True)),
+    )
+
+    # Partial index: pending messages
+    op.create_index(
+        "outbox_pending_idx",
+        "outbox_table",
+        ["send_after", "created_at"],
+        postgresql_where=sa.text("sent_at IS NULL"),
+    )
+
+    # Partial index: cleanup
+    op.create_index(
+        "outbox_cleanup_idx",
+        "outbox_table",
+        ["sent_at"],
+        postgresql_where=sa.text("sent_at IS NOT NULL"),
+    )
+
+def downgrade():
+    op.drop_index("outbox_pending_idx", table_name="outbox_table")
+    op.drop_index("outbox_cleanup_idx", table_name="outbox_table")
+    op.drop_table("outbox_table")
+```
+
+#### Using raw SQL
+
+If you manage your database schema with SQL, run the following commands:
+
+```sql
+CREATE TABLE outbox_table (
+    id SERIAL PRIMARY KEY,
+    routing_key TEXT NOT NULL,
+    body BYTEA NOT NULL,
+    tracking_ids JSON NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    retry_limit INTEGER,
+    expiration INTERVAL,
+    send_after TIMESTAMPTZ NOT NULL,
+    sent_at TIMESTAMPTZ
+);
+
+-- Partial index for pending messages
+CREATE INDEX outbox_pending_idx
+ON outbox_table (send_after, created_at)
+WHERE sent_at IS NULL;
+
+-- Partial index for cleanup
+CREATE INDEX outbox_cleanup_idx
+ON outbox_table (sent_at)
+WHERE sent_at IS NOT NULL;
+```
+
+</details>
+
+<details>
     <summary><h3>Pre-provisioning RabbitMQ Resources</h3></summary>
 
 ## The Problem
@@ -871,6 +959,7 @@ The library's declarative approach (`declare_exchange`/`declare_queue`) means:
 - `retry_delays`: Default retry delays (in seconds) for all listeners. A sequence of delay times for exponential backoff. Defaults to `(1, 10, 60, 300)` (1s, 10s, 1m, 5m). Set to `()` for unlimited immediate retries.
 - `table_name`: Name of the outbox table to use. Defaults to `outbox_table`
 - `prefetch_count`: Number of messages to prefetch from RabbitMQ for each listener. Defaults to `10`
+- `auto_create_table`: If `True`, the outbox table will be automatically created if it does not exist. Defaults to `False`
 
 #### `emit()`
 
@@ -986,10 +1075,6 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 </details>
 
 ## TODOs
-
-### High priority
-
-- [ ] We talk about pre-provisioning for RabbitMQ resources, maybe we should talk the same way about database migrations
 
 ### Medium priority
 
