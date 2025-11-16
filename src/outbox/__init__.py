@@ -16,6 +16,8 @@ from typing import (
     Coroutine,
     Generator,
     Literal,
+    Optional,
+    Union,
     cast,
 )
 
@@ -53,10 +55,10 @@ class OutboxTable(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
-    retry_limit: Mapped[int | None] = mapped_column()
-    expiration: Mapped[datetime.timedelta | None] = mapped_column()
+    retry_limit: Mapped[Optional[int]] = mapped_column()
+    expiration: Mapped[Optional[datetime.timedelta]] = mapped_column()
     send_after: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
-    sent_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    sent_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
 
     def __repr__(self) -> str:
         routing_key = self.routing_key
@@ -85,9 +87,9 @@ class Listener:
     binding_key: str
     callback: Callable[..., Coroutine[Any, Any, None]]
     queue: str = ""
-    retry_delays: Sequence[int] | None = None
-    queue_obj: AbstractQueue | None = None
-    consumer_tag: ConsumerTag | None = None
+    retry_delays: Optional[Sequence[int]] = None
+    queue_obj: Optional[AbstractQueue] = None
+    consumer_tag: Optional[ConsumerTag] = None
     _delay_exchanges: dict[int, AbstractExchange] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -120,7 +122,7 @@ class Listener:
         )
         token = _tracking_ids.set(tracking_ids)
 
-        attempt_count_header = cast(str | None, message.headers.get("x-delivery-count"))
+        attempt_count_header = cast(Optional[str], message.headers.get("x-delivery-count"))
         retry_delays = self.retry_delays or ()
 
         if attempt_count_header is not None:
@@ -241,7 +243,7 @@ class Listener:
 def listen(
     binding_key: str,
     queue: str = "",
-    retry_delays: Sequence[int] | None = None,
+    retry_delays: Optional[Sequence[int]] = None,
 ) -> Callable[[Callable[..., Coroutine[Any, Any, None]]], Listener]:
     def decorator(func: Callable[..., Coroutine[Any, Any, None]]) -> Listener:
         return Listener(binding_key, func, queue, retry_delays)
@@ -256,21 +258,21 @@ _tracking_ids: ContextVar[tuple[str, ...]] = ContextVar[tuple[str, ...]](
 
 @dataclass
 class Outbox:
-    db_engine: AsyncEngine | None = None
-    db_engine_url: str | None = None
-    rmq_connection: AbstractConnection | None = None
-    rmq_connection_url: str | None = None
+    db_engine: Optional[AsyncEngine] = None
+    db_engine_url: Optional[str] = None
+    rmq_connection: Optional[AbstractConnection] = None
+    rmq_connection_url: Optional[str] = None
     exchange_name: str = "outbox"
     poll_interval: float = 1.0
-    expiration: DateType | None = None
-    clean_up_after: (
-        Literal["IMMEDIATELY"] | Literal["NEVER"] | datetime.timedelta | int | float | None
-    ) = None
+    expiration: Optional[DateType] = None
+    clean_up_after: Union[
+        Literal["IMMEDIATELY"], Literal["NEVER"], datetime.timedelta, int, float, None
+    ] = None
     retry_delays: Sequence[int] = (1, 10, 60, 300)
     table_name: str = "outbox_table"
     _table_created: bool = False
     # Instance attribute (not just local var) to allow tests to simulate shutdown signals
-    _shutdown_future: asyncio.Future[None] | None = None
+    _shutdown_future: Optional[asyncio.Future[None]] = None
 
     def __post_init__(self) -> None:
         if self.db_engine is not None and self.db_engine_url is not None:
@@ -305,7 +307,7 @@ class Outbox:
                 await conn.run_sync(Base.metadata.create_all)
             self._table_created = True
 
-    async def _get_rmq_connection(self) -> AbstractConnection | None:
+    async def _get_rmq_connection(self) -> Optional[AbstractConnection]:
         if self.rmq_connection is None and self.rmq_connection_url is not None:
             self.rmq_connection = await aio_pika.connect(self.rmq_connection_url)
         return self.rmq_connection
@@ -316,9 +318,9 @@ class Outbox:
         routing_key: str,
         body: Any,
         *,
-        retry_limit: int | None = None,
+        retry_limit: Optional[int] = None,
         expiration: DateType = None,
-        eta: DateType | None = None,
+        eta: Optional[DateType] = None,
     ) -> None:
         await self._ensure_database()
 
@@ -327,7 +329,7 @@ class Outbox:
         elif not isinstance(body, bytes):
             body = json.dumps(body).encode()
 
-        now = datetime.datetime.now(datetime.UTC)
+        now = datetime.datetime.now(datetime.timezone.utc)
         outbox_row = OutboxTable(
             routing_key=routing_key,
             body=body,
@@ -342,9 +344,9 @@ class Outbox:
         if eta is not None:
             milliseconds = encode_expiration(eta)
             assert milliseconds is not None
-            outbox_row.send_after = datetime.datetime.now(datetime.UTC) + datetime.timedelta(
-                milliseconds=int(milliseconds)
-            )
+            outbox_row.send_after = datetime.datetime.now(
+                datetime.timezone.utc
+            ) + datetime.timedelta(milliseconds=int(milliseconds))
         else:
             outbox_row.send_after = outbox_row.created_at
         session.add(outbox_row)
@@ -368,7 +370,7 @@ class Outbox:
             await self._consume_outbox_table(exchange)
             await asyncio.sleep(self.poll_interval)
 
-    async def _consume_outbox_table(self, exchange: AbstractExchange | None = None) -> None:
+    async def _consume_outbox_table(self, exchange: Optional[AbstractExchange] = None) -> None:
         if exchange is None:
             rmq_connection = await self._get_rmq_connection()
             if rmq_connection is None:
@@ -384,7 +386,7 @@ class Outbox:
                     select(OutboxTable)
                     .where(
                         OutboxTable.sent_at.is_(None),
-                        OutboxTable.send_after <= datetime.datetime.now(datetime.UTC),
+                        OutboxTable.send_after <= datetime.datetime.now(datetime.timezone.utc),
                     )
                     .order_by(OutboxTable.created_at)
                     .limit(1)
@@ -414,12 +416,12 @@ class Outbox:
                 if self.clean_up_after == "IMMEDIATELY":
                     await session.delete(outbox_row)
                 else:
-                    outbox_row.sent_at = datetime.datetime.now(datetime.UTC)
+                    outbox_row.sent_at = datetime.datetime.now(datetime.timezone.utc)
                 if isinstance(self.clean_up_after, datetime.timedelta):
                     delete_stmt = delete(OutboxTable).where(
                         OutboxTable.sent_at.is_not(None),
                         OutboxTable.sent_at
-                        < datetime.datetime.now(datetime.UTC) - self.clean_up_after,
+                        < datetime.datetime.now(datetime.timezone.utc) - self.clean_up_after,
                     )
                     await session.execute(delete_stmt)
 

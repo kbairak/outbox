@@ -513,7 +513,7 @@ async def test_tracking_ids_with_parameter(
     counter = itertools.count(0)
     monkeypatch.setattr(uuid, "uuid4", lambda: next(counter))
 
-    logs: list[tuple[str, ...] | Sequence[str]] = []
+    logs: list[Sequence[str]] = []
 
     with outbox.tracking():
         logs.append(outbox.get_tracking_ids())

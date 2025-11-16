@@ -7,7 +7,11 @@ ruff:
 	uv run ruff check --fix .
 
 mypy:
+ifdef MYPY_PYTHON_VERSION
+	uv run mypy --python-version=$(MYPY_PYTHON_VERSION) .
+else
 	uv run mypy .
+endif
 
 ty:
 	uv run ty check .

@@ -1,6 +1,6 @@
 import asyncio
 from collections.abc import Sequence
-from typing import Any, Protocol
+from typing import Any, Optional, Protocol
 
 from aio_pika.abc import DateType
 from pydantic import BaseModel
@@ -20,9 +20,9 @@ class EmitType(Protocol):
         routing_key: str,
         body: Any,
         *,
-        retry_limit: int | None = None,
+        retry_limit: Optional[int] = None,
         expiration: DateType = None,
-        eta: DateType | None = None,
+        eta: Optional[DateType] = None,
     ) -> None: ...
 
 

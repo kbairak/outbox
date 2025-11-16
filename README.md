@@ -990,7 +990,6 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ### Medium priority
 
-- [ ] See what Python versions are supported
 - [ ] RabbitMQ prefetch
 - [ ] Fetch multiple messages at once from outbox table
 - [ ] Channel/connection pooling
