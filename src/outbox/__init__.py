@@ -270,6 +270,7 @@ class Outbox:
     ] = None
     retry_delays: Sequence[int] = (1, 10, 60, 300)
     table_name: str = "outbox_table"
+    prefetch_count: int = 10
     _table_created: bool = False
     # Instance attribute (not just local var) to allow tests to simulate shutdown signals
     _shutdown_future: Optional[asyncio.Future[None]] = None
@@ -470,6 +471,7 @@ class Outbox:
             raise ValueError("RabbitMQ connection is not set up.")
 
         channel = await rmq_connection.channel()
+        await channel.set_qos(prefetch_count=self.prefetch_count)
         exchange = await channel.declare_exchange(
             self.exchange_name, aio_pika.ExchangeType.TOPIC, durable=True
         )

@@ -870,6 +870,7 @@ The library's declarative approach (`declare_exchange`/`declare_queue`) means:
 - `clean_up_after`: How long to keep messages in the outbox table after they are sent. Can be `IMMEDIATELY`, `NEVER`, or a `timedelta`
 - `retry_delays`: Default retry delays (in seconds) for all listeners. A sequence of delay times for exponential backoff. Defaults to `(1, 10, 60, 300)` (1s, 10s, 1m, 5m). Set to `()` for unlimited immediate retries.
 - `table_name`: Name of the outbox table to use. Defaults to `outbox_table`
+- `prefetch_count`: Number of messages to prefetch from RabbitMQ for each listener. Defaults to `10`
 
 #### `emit()`
 
@@ -988,9 +989,13 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ## TODOs
 
+### High priority
+
+- [ ] Similarly to how we support python 3.9.2+, make sure we have broad support for aio-pika, pydantic and sqlalchemy
+- [ ] We talk about pre-provisioning for RabbitMQ resources, maybe we should talk the same way about database migrations
+
 ### Medium priority
 
-- [ ] RabbitMQ prefetch
 - [ ] Fetch multiple messages at once from outbox table
 - [ ] Channel/connection pooling
 - [ ] Performance tests/benchmarks
@@ -1000,7 +1005,7 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ### Low priority
 
-- [ ] Add `queue_prefix` setup arg
+- [ ] Add `queue_prefix` setup arg (or maybe automatic queue name should be prefixed with `exchange_name`)
 - [ ] Use msgpack (optionally) to reduce size
 - [ ] Use pg notify/listen to avoid polling the database
 - [ ] Nested dependencies
