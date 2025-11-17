@@ -172,7 +172,12 @@ class Listener:
         else:
             attempt_count = 1
 
-        routing_key = message.routing_key
+        # Get routing key - use original routing key if preserved in header (for retries)
+        # otherwise use message routing key (for initial delivery)
+        routing_key = (
+            cast(Optional[str], message.headers.get("x-original-routing-key"))
+            or message.routing_key
+        )
         assert routing_key is not None
         body = message.body
         try:
@@ -246,28 +251,44 @@ class Listener:
 
         # Get delay for this attempt
         delay = retry_delays[attempt_count - 1]
+
+        # For instant retries (delay=0), use nack(requeue=True) to avoid unnecessary exchange/queue overhead
+        if delay == 0:
+            await message.nack(requeue=True)
+            logger.info(
+                f"Message requeued for instant retry (attempt {attempt_count}/{len(retry_delays)}) "
+                f"routing_key={message.routing_key}, {tracking_ids=}"
+            )
+            return
+
         delay_exchange = self._delay_exchanges[delay]
 
-        # Prepare new headers with incremented delivery count
+        # Prepare new headers with incremented delivery count and preserve original routing key
         new_headers = dict(message.headers) if message.headers else {}
         new_headers["x-delivery-count"] = str(attempt_count + 1)
 
-        # Publish to delay exchange with original routing key preserved
+        # Preserve original routing key in header (only set on first retry)
         assert message.routing_key is not None
+        if "x-original-routing-key" not in new_headers:
+            new_headers["x-original-routing-key"] = message.routing_key
+
+        # Publish to delay exchange using queue name as routing key
+        # This ensures retry routes back to the SAME queue (via default exchange DLX)
+        # rather than re-routing through topic exchange to multiple queues
         await delay_exchange.publish(
             aio_pika.Message(
                 body=message.body,
                 content_type=message.content_type,
                 headers=new_headers,
             ),
-            routing_key=message.routing_key,
+            routing_key=self.queue,  # Use queue name, not original routing key
         )
 
         # Ack original message
         await message.ack()
         logger.info(
             f"Message sent to delay exchange (attempt {attempt_count}/{len(retry_delays)}, "
-            f"delay {delay}s) routing_key={message.routing_key}, {tracking_ids=}"
+            f"delay {delay}s) routing_key={self.queue}, original_routing_key={message.routing_key}, {tracking_ids=}"
         )
 
 
@@ -521,8 +542,12 @@ class Outbox:
                 all_delays.update(listener.retry_delays)
 
         # Create delay exchanges (fanout type) and their queues
+        # Skip delay=0 since instant retries use nack(requeue=True)
         delay_exchanges = {}
         for delay in all_delays:
+            if delay == 0:
+                continue  # Instant retries handled by nack(requeue=True), no exchange needed
+
             exchange_and_queue_name = f"{self.exchange_name}.delay_{delay}s"
             delay_exchange = await channel.declare_exchange(
                 exchange_and_queue_name, aio_pika.ExchangeType.FANOUT, durable=True
@@ -535,7 +560,7 @@ class Outbox:
                 durable=True,
                 arguments={
                     "x-message-ttl": int(delay * 1000),
-                    "x-dead-letter-exchange": self.exchange_name,  # Dead-letter to main exchange
+                    "x-dead-letter-exchange": "",  # Default exchange (routes by queue name)
                     "x-queue-type": "quorum",
                 },
             )

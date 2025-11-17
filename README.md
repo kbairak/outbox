@@ -52,7 +52,7 @@ from outbox import setup, message_relay
 
 setup(
     db_engine_url="postgresql+asyncpg://user:password@localhost/dbname",
-    rabbitmq_url="amqp://guest:guest@localhost:5672/",
+    rmq_connection_url="amqp://guest:guest@localhost:5672/",
 )
 
 asyncio.run(message_relay())
@@ -69,7 +69,7 @@ import asyncio
 
 from outbox import setup, listen, worker
 
-setup(rabbitmq_url="amqp://guest:guest@localhost:5672/")
+setup(rmq_connection_url="amqp://guest:guest@localhost:5672/")
 
 @listen("user.created")
 async def on_user_created(user):
@@ -86,7 +86,7 @@ import asyncio
 
 from outbox import setup, Listener, worker
 
-setup(rabbitmq_url="amqp://guest:guest@localhost:5672/")
+setup(rmq_connection_url="amqp://guest:guest@localhost:5672/")
 
 async def on_user_created(user):
     print(user)
@@ -667,7 +667,7 @@ Default value for `exchange_name` is `"outbox"`.
 |--------------|---------|-----------|---------|
 | `{listener.queue}` | Yes | `x-dead-letter-exchange`: `{exchange_name}.dlx`<br>`x-dead-letter-routing-key`: `{listener.queue}`<br>`x-queue-type`: `quorum` | Listener's main queue |
 | `{listener.queue}.dlq` | Yes | `x-queue-type`: `quorum` | Dead letter queue for messages that exhausted retries |
-| `{exchange_name}.delay_{N}s` | Yes | `x-message-ttl`: `{N * 1000}` ms<br>`x-dead-letter-exchange`: `{exchange_name}`<br>`x-queue-type`: `quorum` | Delay queue for retry backoff (one per unique delay value) |
+| `{exchange_name}.delay_{N}s` | Yes | `x-message-ttl`: `{N * 1000}` ms<br>`x-dead-letter-exchange`: `""` (default exchange)<br>`x-queue-type`: `quorum` | Delay queue for retry backoff (one per unique delay value). Routes back to specific queue via default exchange. |
 
 **Listener queue naming**: If not specified in `@listen(queue=...)`, auto-generated as `{module}.{function_name}`
 
@@ -772,7 +772,7 @@ resource "rabbitmq_queue" "delay" {
     durable = true
     arguments = {
       "x-message-ttl"           = tonumber(each.key) * 1000
-      "x-dead-letter-exchange"  = local.exchange_name
+      "x-dead-letter-exchange"  = ""  # Default exchange (routes by queue name)
       "x-queue-type"            = "quorum"
     }
   }
@@ -1117,10 +1117,6 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 </details>
 
 ## TODOs
-
-### High priority
-
-- [ ] Support (near) instant retries
 
 ### Medium priority
 

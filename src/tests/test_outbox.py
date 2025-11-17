@@ -201,6 +201,34 @@ async def test_retry(emit: EmitType, outbox: Outbox, session: AsyncSession) -> N
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_instant_retry(emit: EmitType, outbox: Outbox, session: AsyncSession) -> None:
+    """Test that delay=0 uses nack(requeue=True) for instant retries."""
+    # arrange
+    callcount = 0
+    retrieved_argument = None
+
+    @listen("routing_key", queue="test_instant_retry_queue", retry_delays=(0, 0, 1))
+    async def handler(person: object) -> None:
+        nonlocal callcount, retrieved_argument
+        callcount += 1
+        if callcount < 4:
+            raise ValueError("Simulated failure")
+        retrieved_argument = person
+
+    await emit(session, "routing_key", {"name": "InstantRetry"})
+    await session.commit()
+    await outbox._set_up_queues([handler])
+    await outbox._consume_outbox_table()
+
+    # test - first two retries should be instant (delay=0), third has 1s delay
+    await run_worker(outbox, [handler], timeout=2.0)
+
+    # assert - should succeed after 2 instant retries + 1 delayed retry
+    assert callcount == 4
+    assert retrieved_argument == {"name": "InstantRetry"}
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_no_retry_with_setup(emit: EmitType, outbox: Outbox, session: AsyncSession) -> None:
     # arrange
     outbox.setup(retry_delays=(), auto_create_table=True)
@@ -647,6 +675,43 @@ async def test_wildcard_routing_key_preserved_through_retries(
     # assert - routing key should be preserved across all retry attempts
     assert callcount == 3
     assert retrieved_routing_keys == ["order.created", "order.created", "order.created"]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_retry_routes_to_single_queue_only(
+    emit: EmitType, session: AsyncSession, outbox: Outbox
+) -> None:
+    """Test that retries only go to the failing queue, not all queues matching the routing pattern."""
+    # arrange - two queues with overlapping wildcard patterns
+    queue1_callcount = 0
+    queue2_callcount = 0
+
+    @listen("user.*", queue="test_retry_isolation_queue1", retry_delays=(1,))
+    async def handler1(person: object) -> None:
+        nonlocal queue1_callcount
+        queue1_callcount += 1
+        if queue1_callcount == 1:
+            raise ValueError("Simulated failure in queue1")
+
+    @listen("*.created", queue="test_retry_isolation_queue2", retry_delays=(1,))
+    async def handler2(person: object) -> None:
+        nonlocal queue2_callcount
+        queue2_callcount += 1
+        # This handler always succeeds
+
+    await emit(session, "user.created", {"name": "TestUser"})
+    await session.commit()
+    await outbox._set_up_queues([handler1, handler2])
+    await outbox._consume_outbox_table()
+
+    # test
+    await run_worker(outbox, [handler1, handler2], timeout=1.3)
+
+    # assert
+    # Queue1: called twice (initial + 1 retry after failure)
+    assert queue1_callcount == 2
+    # Queue2: called ONCE only (initial message, NO retry from queue1's failure)
+    assert queue2_callcount == 1
 
 
 @pytest.mark.asyncio(loop_scope="session")
