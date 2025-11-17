@@ -411,17 +411,53 @@ The options are:
 </details>
 
 <details>
-    <summary><h3>CPU-bound work</h3></summary>
+    <summary><h3>Blocking I/O and CPU-bound work</h3></summary>
 
-The outbox pattern is designed for I/O-bound operations like sending emails, calling external APIs, or writing to databases. For these tasks, the library's async approach using `asyncio.create_task()` provides excellent concurrency without blocking.
+The outbox pattern is designed for **async I/O-bound operations** like sending emails, calling external APIs, or writing to databases. For these tasks, the library's async approach using `asyncio.create_task()` provides excellent concurrency without blocking.
 
-However, if your listener needs to perform CPU-intensive work (image processing, data transformations, heavy computations), you should offload it to a process pool. **This is intentionally not built into the library** because:
+However, there are two scenarios where you might need different handling:
+
+#### Blocking I/O (Legacy Codebases)
+
+If you're integrating the outbox pattern into an existing codebase with **synchronous/blocking I/O** code, the `@listen` decorator automatically detects and handles this. You can use regular (non-async) functions as callbacks:
+
+```python
+from outbox import listen
+
+# Async callback (preferred for new code)
+@listen("user.created")
+async def async_handler(user):
+    await send_email_async(user)  # Non-blocking async I/O
+
+# Sync callback (for legacy code with blocking I/O)
+@listen("order.created")
+def sync_handler(order):
+    send_email_blocking(order)  # Blocking I/O - automatically runs in thread pool
+    update_crm_blocking(order)   # Blocking I/O - automatically runs in thread pool
+```
+
+**How it works:**
+
+- The library detects if your callback is sync or async using `asyncio.iscoroutinefunction()`
+- Sync callbacks are automatically wrapped with `asyncio.to_thread()` to run in a thread pool
+- This prevents blocking the event loop while maintaining compatibility with legacy code
+- Concurrency is controlled by `prefetch_count` - at most N callbacks (sync or async) run simultaneously
+
+**Performance notes:**
+
+- Thread pool overhead exists but is minimal for I/O-bound work
+- Prefer async callbacks for new code - they're more efficient
+- This feature enables **gradual migration** from sync to async code
+
+#### CPU-Bound Work
+
+If your listener needs to perform **CPU-intensive work** (image processing, data transformations, heavy computations), you should offload it to a **process pool** (not thread pool). This is **not built into the library** because:
 
 1. Most outbox use cases are I/O-bound, not CPU-bound
 2. Users have different needs (process pools, thread pools, custom executors)
-3. Python's standard library already makes this trivial
+3. Python's standard library already makes this straightforward
 
-Here's how to handle CPU-bound work in your listeners:
+Here's how to handle CPU-bound work:
 
 ```python
 import asyncio
@@ -459,6 +495,12 @@ async def process_image(image_data: bytes):
     # Continue with I/O-bound work
     await upload_to_storage(processed_data)
 ```
+
+**Why process pool instead of thread pool for CPU work?**
+
+- Python's GIL (Global Interpreter Lock) prevents true parallelism in threads for CPU-bound tasks
+- Process pools bypass the GIL by using separate processes
+- For blocking I/O, threads are sufficient (and more efficient) because I/O releases the GIL
 
 This pattern gives you complete control over parallelism while keeping the library focused and simple.
 
@@ -1075,6 +1117,10 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 </details>
 
 ## TODOs
+
+### High priority
+
+- [ ] Support (near) instant retries
 
 ### Medium priority
 

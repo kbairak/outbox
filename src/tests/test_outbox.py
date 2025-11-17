@@ -647,3 +647,212 @@ async def test_wildcard_routing_key_preserved_through_retries(
     # assert - routing key should be preserved across all retry attempts
     assert callcount == 3
     assert retrieved_routing_keys == ["order.created", "order.created", "order.created"]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_sync_callback(emit: EmitType, session: AsyncSession, outbox: Outbox) -> None:
+    """Test that sync (non-async) callbacks are supported via auto-wrapping."""
+    # arrange
+    callcount = 0
+    retrieved_data = None
+
+    @listen("sync.test", queue="test_sync_callback")
+    def sync_handler(data: object) -> None:
+        nonlocal callcount, retrieved_data
+        callcount += 1
+        retrieved_data = data
+
+    await emit(session, "sync.test", {"message": "hello"})
+    await session.commit()
+    await outbox._set_up_queues([sync_handler])
+    await outbox._consume_outbox_table()
+
+    # test
+    await run_worker(outbox, [sync_handler], timeout=0.2)
+
+    # assert
+    assert callcount == 1
+    assert retrieved_data == {"message": "hello"}
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_sync_callback_with_pydantic(
+    emit: EmitType, session: AsyncSession, outbox: Outbox
+) -> None:
+    """Test that sync callbacks work with Pydantic models."""
+    # arrange
+    callcount = 0
+    retrieved_person = None
+
+    @listen("person.created", queue="test_sync_pydantic")
+    def sync_handler(person: Person) -> None:
+        nonlocal callcount, retrieved_person
+        callcount += 1
+        retrieved_person = person
+
+    await emit(session, "person.created", Person(name="John"))
+    await session.commit()
+    await outbox._set_up_queues([sync_handler])
+    await outbox._consume_outbox_table()
+
+    # test
+    await run_worker(outbox, [sync_handler], timeout=0.2)
+
+    # assert
+    assert callcount == 1
+    assert retrieved_person == Person(name="John")
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_sync_callback_with_special_params(
+    emit: EmitType, session: AsyncSession, outbox: Outbox
+) -> None:
+    """Test that sync callbacks receive special parameters correctly."""
+    # arrange
+    retrieved_routing_key = None
+    retrieved_tracking_ids = None
+    retrieved_queue_name = None
+
+    @listen("special.test", queue="test_sync_special_params")
+    def sync_handler(
+        data: object,
+        routing_key: str,
+        tracking_ids: Sequence[str],
+        queue_name: str,
+    ) -> None:
+        nonlocal retrieved_routing_key, retrieved_tracking_ids, retrieved_queue_name
+        retrieved_routing_key = routing_key
+        retrieved_tracking_ids = tracking_ids
+        retrieved_queue_name = queue_name
+
+    await emit(session, "special.test", {"value": 42})
+    await session.commit()
+    await outbox._set_up_queues([sync_handler])
+    await outbox._consume_outbox_table()
+
+    # test
+    await run_worker(outbox, [sync_handler], timeout=0.2)
+
+    # assert
+    assert retrieved_routing_key == "special.test"
+    assert retrieved_tracking_ids is not None
+    assert len(retrieved_tracking_ids) == 1
+    assert retrieved_queue_name == "test_sync_special_params"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_sync_callback_exception_retry(
+    emit: EmitType, session: AsyncSession, outbox: Outbox
+) -> None:
+    """Test that sync callbacks are retried on exception."""
+    # arrange
+    callcount = 0
+
+    @listen("retry.test", queue="test_sync_retry", retry_delays=(1,))
+    def sync_handler(data: object) -> None:
+        nonlocal callcount
+        callcount += 1
+        if callcount < 2:
+            raise Exception("Temporary error")
+
+    await emit(session, "retry.test", {})
+    await session.commit()
+    await outbox._set_up_queues([sync_handler])
+    await outbox._consume_outbox_table()
+
+    # test
+    await run_worker(outbox, [sync_handler], timeout=2.0)
+
+    # assert - should be called twice (initial + 1 retry)
+    assert callcount == 2
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_sync_callback_reject(emit: EmitType, session: AsyncSession, outbox: Outbox) -> None:
+    """Test that sync callbacks can raise Reject exception."""
+    # arrange
+    callcount = 0
+
+    @listen("reject.test", queue="test_sync_reject")
+    def sync_handler(data: object) -> None:
+        nonlocal callcount
+        callcount += 1
+        raise Reject()
+
+    await emit(session, "reject.test", {})
+    await session.commit()
+    await outbox._set_up_queues([sync_handler])
+    await outbox._consume_outbox_table()
+
+    # test
+    await run_worker(outbox, [sync_handler], timeout=0.2)
+
+    # assert - should be called once and sent to DLQ
+    assert callcount == 1
+    assert await get_dlq_message_count(outbox, "test_sync_reject") == 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_mixed_sync_async_listeners(
+    emit: EmitType, session: AsyncSession, outbox: Outbox
+) -> None:
+    """Test that sync and async listeners can coexist in the same worker."""
+    # arrange
+    sync_callcount = 0
+    async_callcount = 0
+
+    @listen("mixed.sync", queue="test_mixed_sync")
+    def sync_handler(data: object) -> None:
+        nonlocal sync_callcount
+        sync_callcount += 1
+
+    @listen("mixed.async", queue="test_mixed_async")
+    async def async_handler(data: object) -> None:
+        nonlocal async_callcount
+        async_callcount += 1
+
+    await emit(session, "mixed.sync", {})
+    await emit(session, "mixed.async", {})
+    await session.commit()
+    await outbox._set_up_queues([sync_handler, async_handler])
+    await outbox._consume_outbox_table()
+
+    # test
+    await run_worker(outbox, [sync_handler, async_handler], timeout=0.2)
+
+    # assert - both should be called
+    assert sync_callcount == 1
+    assert async_callcount == 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_listener_direct_instantiation_with_sync(outbox: Outbox) -> None:
+    """Test that Listener class works with sync callbacks when instantiated directly."""
+    # arrange
+    from outbox import Listener
+
+    callcount = 0
+
+    def sync_func(data: object) -> None:
+        nonlocal callcount
+        callcount += 1
+
+    listener = Listener("test.key", sync_func, queue="test_direct_sync")
+
+    # assert - callback should be wrapped to async
+    assert asyncio.iscoroutinefunction(listener.callback)
+    assert listener.queue == "test_direct_sync"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_sync_callback_queue_name_generation(outbox: Outbox) -> None:
+    """Test that queue names are auto-generated correctly for sync callbacks."""
+
+    # arrange
+    @listen("queue.test")
+    def my_sync_handler(data: object) -> None:
+        pass
+
+    # assert - queue name should be generated from function module and name
+    assert "my_sync_handler" in my_sync_handler.queue
+    assert "test_outbox" in my_sync_handler.queue

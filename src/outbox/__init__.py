@@ -101,7 +101,7 @@ class Reject(Exception):
 @dataclass
 class Listener:
     binding_key: str
-    callback: Callable[..., Coroutine[Any, Any, None]]
+    callback: Union[Callable[..., Any], Callable[..., Coroutine[Any, Any, None]]]
     queue: str = ""
     retry_delays: Optional[Sequence[int]] = None
     _queue_obj: Optional[AbstractQueue] = None
@@ -115,6 +115,20 @@ class Listener:
             self.queue = f"{callback_func.__module__}.{callback_func.__qualname__}".replace(
                 "<", ""
             ).replace(">", "")
+
+        # Auto-wrap sync callbacks to async using asyncio.to_thread
+        if not asyncio.iscoroutinefunction(self.callback):
+            sync_callback = self.callback
+
+            async def async_wrapper(
+                *args: Any, _sync_callback: Callable[..., Any] = sync_callback, **kwargs: Any
+            ) -> None:
+                return await asyncio.to_thread(_sync_callback, *args, **kwargs)
+
+            # Preserve function signature for introspection
+            async_wrapper.__signature__ = inspect.signature(sync_callback)  # type: ignore[attr-defined]
+
+            self.callback = async_wrapper
 
     def __call__(self, *args: Any, **kwargs: Any) -> Coroutine[Any, Any, None]:
         return self.callback(*args, **kwargs)
@@ -177,16 +191,17 @@ class Listener:
         else:
             logger.info(f"Processing message {routing_key=}, {tracking_ids=}, {body=}")
 
-        kwargs = {body_param_key: body}
-        for attr in (
-            "routing_key",
-            "message",
-            "tracking_ids",
-            "queue_name",
-            "attempt_count",
-        ):
-            if attr in parameters:
-                kwargs[attr] = locals()[attr]  # TODO: This is ugly, do it more explicitly
+        kwargs: dict[str, Any] = {body_param_key: body}
+        if "routing_key" in parameters:
+            kwargs["routing_key"] = routing_key
+        if "message" in parameters:
+            kwargs["message"] = message
+        if "tracking_ids" in parameters:
+            kwargs["tracking_ids"] = tracking_ids
+        if "queue_name" in parameters:
+            kwargs["queue_name"] = self.queue
+        if "attempt_count" in parameters:
+            kwargs["attempt_count"] = attempt_count
 
         try:
             await self.callback(**kwargs)
@@ -260,8 +275,10 @@ def listen(
     binding_key: str,
     queue: str = "",
     retry_delays: Optional[Sequence[int]] = None,
-) -> Callable[[Callable[..., Coroutine[Any, Any, None]]], Listener]:
-    def decorator(func: Callable[..., Coroutine[Any, Any, None]]) -> Listener:
+) -> Callable[[Union[Callable[..., Any], Callable[..., Coroutine[Any, Any, None]]]], Listener]:
+    def decorator(
+        func: Union[Callable[..., Any], Callable[..., Coroutine[Any, Any, None]]],
+    ) -> Listener:
         return Listener(binding_key, func, queue, retry_delays)
 
     return decorator
