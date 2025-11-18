@@ -634,6 +634,67 @@ WHERE sent_at IS NOT NULL;
 </details>
 
 <details>
+    <summary><h3>Observability</h3></summary>
+
+Outbox provides optional Prometheus metrics for monitoring message flow and performance. Metrics automatically register to prometheus_client's global registry, so they work seamlessly with your existing Prometheus instrumentation:
+
+```python
+from prometheus_client import start_http_server, Counter
+from outbox import Outbox
+
+# Your application metrics
+my_counter = Counter('my_app_requests_total', 'Total requests')
+
+# Start Prometheus HTTP server once
+start_http_server(9090)
+
+# Outbox metrics are automatically included
+outbox = Outbox(
+    enable_metrics=True,  # Default is True
+    exchange_name="orders",
+)
+
+# Both your metrics and outbox metrics are served at :9090/metrics
+```
+
+#### Available Metrics
+
+**Implemented:**
+
+##### `outbox_messages_published_total`
+
+Counter of messages successfully published from outbox table to RabbitMQ.
+
+**Labels**: `exchange_name`
+
+**Example**:
+
+```
+outbox_messages_published_total{exchange_name="orders"} 1542
+```
+
+**Pending Implementation:**
+
+- `outbox_publish_failures_total` - Counter of failed publishes to RabbitMQ (labels: `exchange_name`, `error_type`)
+- `outbox_message_age_seconds` - Histogram of time message spent in outbox table before publishing (labels: `exchange_name`)
+- `outbox_poll_duration_seconds` - Histogram of time to poll DB and publish one message (labels: `exchange_name`)
+- `outbox_table_backlog` - Gauge of current unsent messages in outbox table (labels: `exchange_name`)
+- `outbox_messages_received_total` - Counter of messages received from RabbitMQ queue (labels: `queue`, `exchange_name`)
+- `outbox_messages_processed_total` - Counter of messages processed with outcome (labels: `queue`, `exchange_name`, `status`)
+- `outbox_retry_attempts_total` - Counter of retry attempts by delay tier (labels: `queue`, `delay_seconds`)
+- `outbox_message_processing_duration_seconds` - Histogram of handler execution time (labels: `queue`, `exchange_name`)
+- `outbox_dlq_messages` - Gauge of current messages in dead letter queue (labels: `queue`)
+- `outbox_active_consumers` - Gauge of active consumer connections (labels: `queue`, `exchange_name`)
+
+#### Disabling Metrics
+
+```python
+outbox = Outbox(enable_metrics=False)
+```
+
+</details>
+
+<details>
     <summary><h3>Pre-provisioning RabbitMQ Resources</h3></summary>
 
 ## The Problem
@@ -1120,12 +1181,13 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ### Medium priority
 
+- [ ] Observability (prometheus)
+  - [ ] Grafana dashboard
 - [ ] Fetch multiple messages at once from outbox table
 - [ ] Channel/connection pooling
 - [ ] Performance tests/benchmarks
 - [ ] Heartbeat to verify connection to RabbitMQ is alive
 - [ ] Better/more error messages
-- [ ] Observability (prometheus)
 
 ### Low priority
 
@@ -1136,3 +1198,4 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 - [ ] No 'application/json' content type if body is bytes
 - [ ] Delay exchange/queue names to include minutes and/or hours (`XmYYs` instead of `XXXXs`)
 - [ ] Maybe not everything quorum-able should be quorum. Perhaps configuration
+- [ ] Make tests faster

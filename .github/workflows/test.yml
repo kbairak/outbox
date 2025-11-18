@@ -30,7 +30,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: uv sync
-        run: uv sync
+        run: uv sync --all-groups
 
       - name: Run linters
         run: make lint

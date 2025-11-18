@@ -23,10 +23,13 @@ Use-cases:
 import asyncio
 from typing import Awaitable, Callable
 
+from prometheus_client import start_http_server
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from outbox import Listener, emit, message_relay, setup, worker
+
+start_http_server(8000)
 
 db_engine = create_async_engine("postgresql+asyncpg://postgres:postgres@localhost/postgres")
 

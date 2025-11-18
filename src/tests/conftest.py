@@ -41,6 +41,7 @@ async def outbox(db_engine: AsyncEngine, rmq_connection: AbstractConnection) -> 
         rmq_connection=rmq_connection,
         clean_up_after="NEVER",
         auto_create_table=True,
+        enable_metrics=False,
     )
     return outbox
 

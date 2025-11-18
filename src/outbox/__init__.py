@@ -38,6 +38,8 @@ from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from .metrics import metrics
+
 logger = logging.getLogger("outbox")
 
 
@@ -326,11 +328,13 @@ class Outbox:
     table_name: str = "outbox_table"
     prefetch_count: int = 10
     auto_create_table: bool = False
+    enable_metrics: bool = True
     _table_created: bool = False
     # Instance attribute (not just local var) to allow tests to simulate shutdown signals
     _shutdown_future: Optional[asyncio.Future[None]] = None
 
     def __post_init__(self) -> None:
+        metrics.enable_metrics(self.enable_metrics)
         if self.db_engine is not None and self.db_engine_url is not None:
             raise ValueError("You cannot set both db_engine and db_engine_url")
         if self.rmq_connection is not None and self.rmq_connection_url is not None:
@@ -468,6 +472,7 @@ class Outbox:
                     ),
                     outbox_row.routing_key,
                 )
+                metrics.messages_published.labels(exchange_name=self.exchange_name).inc()
                 logger.debug(f"Sent message: {outbox_row} to RabbitMQ")
                 if self.clean_up_after == "IMMEDIATELY":
                     await session.delete(outbox_row)
