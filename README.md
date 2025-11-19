@@ -659,32 +659,19 @@ outbox = Outbox(
 
 #### Available Metrics
 
-**Implemented:**
-
-##### `outbox_messages_published_total`
-
-Counter of messages successfully published from outbox table to RabbitMQ.
-
-**Labels**: `exchange_name`
-
-**Example**:
-
-```
-outbox_messages_published_total{exchange_name="orders"} 1542
-```
-
-**Pending Implementation:**
-
-- `outbox_publish_failures_total` - Counter of failed publishes to RabbitMQ (labels: `exchange_name`, `error_type`)
-- `outbox_message_age_seconds` - Histogram of time message spent in outbox table before publishing (labels: `exchange_name`)
-- `outbox_poll_duration_seconds` - Histogram of time to poll DB and publish one message (labels: `exchange_name`)
-- `outbox_table_backlog` - Gauge of current unsent messages in outbox table (labels: `exchange_name`)
-- `outbox_messages_received_total` - Counter of messages received from RabbitMQ queue (labels: `queue`, `exchange_name`)
-- `outbox_messages_processed_total` - Counter of messages processed with outcome (labels: `queue`, `exchange_name`, `status`)
-- `outbox_retry_attempts_total` - Counter of retry attempts by delay tier (labels: `queue`, `delay_seconds`)
-- `outbox_message_processing_duration_seconds` - Histogram of handler execution time (labels: `queue`, `exchange_name`)
-- `outbox_dlq_messages` - Gauge of current messages in dead letter queue (labels: `queue`)
-- `outbox_active_consumers` - Gauge of active consumer connections (labels: `queue`, `exchange_name`)
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `outbox_messages_published_total` | Counter | `exchange_name` | Messages successfully published from outbox table |
+| `outbox_publish_failures_total` | Counter | `exchange_name`, `failure_type`, `error_type` | Failed publish attempts to RabbitMQ |
+| `outbox_message_age_seconds` | Histogram | `exchange_name` | Time message spent in outbox table before publishing |
+| `outbox_poll_duration_seconds` | Histogram | `exchange_name` | Time to poll DB and publish one message |
+| `outbox_table_backlog` | Gauge | `exchange_name` | Current unsent messages in outbox table |
+| `outbox_messages_received_total` | Counter | `queue`, `exchange_name` | Messages received from RabbitMQ queue |
+| `outbox_messages_processed_total` | Counter | `queue`, `exchange_name`, `status` | Messages processed with outcome (success/failed/rejected) |
+| `outbox_retry_attempts_total` | Counter | `queue`, `delay_seconds` | Retry attempts by delay tier |
+| `outbox_message_processing_duration_seconds` | Histogram | `queue`, `exchange_name` | Handler execution time |
+| `outbox_dlq_messages` | Gauge | `queue` | Current messages in dead letter queue (updated every 30s) |
+| `outbox_active_consumers` | Gauge | `queue`, `exchange_name` | Active consumer connections |
 
 #### Disabling Metrics
 
@@ -1178,6 +1165,10 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 </details>
 
 ## TODOs
+
+### High priority
+
+- [ ] connections/channels become unresponsive handling, robust connections/channels
 
 ### Medium priority
 

@@ -5,6 +5,7 @@ import json
 import logging
 import reprlib
 import signal
+import time
 import uuid
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -109,6 +110,7 @@ class Listener:
     _queue_obj: Optional[AbstractQueue] = None
     _consumer_tag: Optional[ConsumerTag] = None
     _delay_exchanges: dict[int, AbstractExchange] = field(default_factory=dict)
+    _exchange_name: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.queue:
@@ -136,6 +138,9 @@ class Listener:
         return self.callback(*args, **kwargs)
 
     async def _handle(self, message: AbstractIncomingMessage) -> None:
+        assert self._exchange_name is not None
+        metrics.messages_received.labels(queue=self.queue, exchange_name=self._exchange_name).inc()
+
         parameters = inspect.signature(self.callback).parameters
         parameter_keys = set(parameters.keys()) - {
             "routing_key",
@@ -210,6 +215,8 @@ class Listener:
         if "attempt_count" in parameters:
             kwargs["attempt_count"] = attempt_count
 
+        processing_start_time = time.perf_counter()
+
         try:
             await self.callback(**kwargs)
         except Reject:
@@ -218,6 +225,9 @@ class Listener:
                 f"{body=}"
             )
             await message.nack(requeue=False)
+            metrics.messages_processed.labels(
+                queue=self.queue, exchange_name=self._exchange_name, status="rejected"
+            ).inc()
         except Exception:
             if retry_delays:
                 logger.warning(f"Retrying {routing_key=}, {tracking_ids=}, {body=}")
@@ -229,10 +239,21 @@ class Listener:
                     f"{body=}"
                 )
                 await message.nack(requeue=False)
+            metrics.messages_processed.labels(
+                queue=self.queue, exchange_name=self._exchange_name, status="failed"
+            ).inc()
         else:
             logger.info(f"Success {routing_key=}, {tracking_ids=}, {body=}")
             await message.ack()
+            metrics.messages_processed.labels(
+                queue=self.queue, exchange_name=self._exchange_name, status="success"
+            ).inc()
         finally:
+            processing_duration_seconds = time.perf_counter() - processing_start_time
+            metrics.message_processing_duration.labels(
+                queue=self.queue, exchange_name=self._exchange_name
+            ).observe(processing_duration_seconds)
+
             _tracking_ids.reset(token)
 
     async def _delayed_retry(
@@ -257,6 +278,7 @@ class Listener:
         # For instant retries (delay=0), use nack(requeue=True) to avoid unnecessary exchange/queue overhead
         if delay == 0:
             await message.nack(requeue=True)
+            metrics.retry_attempts.labels(queue=self.queue, delay_seconds=str(delay)).inc()
             logger.info(
                 f"Message requeued for instant retry (attempt {attempt_count}/{len(retry_delays)}) "
                 f"routing_key={message.routing_key}, {tracking_ids=}"
@@ -277,17 +299,33 @@ class Listener:
         # Publish to delay exchange using queue name as routing key
         # This ensures retry routes back to the SAME queue (via default exchange DLX)
         # rather than re-routing through topic exchange to multiple queues
-        await delay_exchange.publish(
-            aio_pika.Message(
-                body=message.body,
-                content_type=message.content_type,
-                headers=new_headers,
-            ),
-            routing_key=self.queue,  # Use queue name, not original routing key
-        )
+        try:
+            await delay_exchange.publish(
+                aio_pika.Message(
+                    body=message.body,
+                    content_type=message.content_type,
+                    headers=new_headers,
+                ),
+                routing_key=self.queue,  # Use queue name, not original routing key
+            )
+        except Exception as exc:
+            metrics.publish_failures.labels(
+                exchange_name=delay_exchange.name,
+                failure_type="retry",
+                error_type=type(exc).__name__,
+            ).inc()
+            logger.error(
+                f"Failed to publish message to delay exchange: routing_key={self.queue}, "
+                f"original_routing_key={message.routing_key}, {tracking_ids=}, "
+                f"delay_exchange={delay_exchange.name}, error={type(exc).__name__}, {exc=}"
+            )
+            raise
 
         # Ack original message
         await message.ack()
+
+        metrics.retry_attempts.labels(queue=self.queue, delay_seconds=str(delay)).inc()
+
         logger.info(
             f"Message sent to delay exchange (attempt {attempt_count}/{len(retry_delays)}, "
             f"delay {delay}s) routing_key={self.queue}, original_routing_key={message.routing_key}, {tracking_ids=}"
@@ -427,6 +465,21 @@ class Outbox:
             self.exchange_name, aio_pika.ExchangeType.TOPIC, durable=True
         )
         while True:
+            # Update table backlog gauge
+            async with AsyncSession(self.db_engine) as session:
+                count_stmt = (
+                    select(func.count())
+                    .select_from(OutboxTable)
+                    .where(
+                        OutboxTable.sent_at.is_(None),
+                        OutboxTable.send_after <= datetime.datetime.now(datetime.timezone.utc),
+                    )
+                )
+                backlog_count = (await session.execute(count_stmt)).scalar()
+                metrics.table_backlog.labels(exchange_name=self.exchange_name).set(
+                    backlog_count or 0
+                )
+
             await self._consume_outbox_table(exchange)
             await asyncio.sleep(self.poll_interval)
 
@@ -440,6 +493,7 @@ class Outbox:
                 self.exchange_name, aio_pika.ExchangeType.TOPIC, durable=True
             )
         while True:
+            poll_start_time = time.perf_counter()
             async with AsyncSession(self.db_engine) as session, session.begin():
                 logger.debug("Checking for unsent messages...")
                 select_stmt = (
@@ -463,16 +517,46 @@ class Outbox:
                 headers = cast(
                     HeadersType, {"x-outbox-tracking-ids": json.dumps(outbox_row.tracking_ids)}
                 )
-                await exchange.publish(
-                    aio_pika.Message(
-                        outbox_row.body,
-                        content_type="application/json",
-                        expiration=expiration,
-                        headers=headers,
-                    ),
-                    outbox_row.routing_key,
-                )
+                try:
+                    await exchange.publish(
+                        aio_pika.Message(
+                            outbox_row.body,
+                            content_type="application/json",
+                            expiration=expiration,
+                            headers=headers,
+                        ),
+                        outbox_row.routing_key,
+                    )
+                except Exception as exc:
+                    error_type = type(exc).__name__
+                    metrics.publish_failures.labels(
+                        exchange_name=self.exchange_name,
+                        failure_type="main",
+                        error_type=error_type,
+                    ).inc()
+                    logger.error(
+                        f"Failed to publish message to RabbitMQ: {outbox_row}, "
+                        f"exchange={self.exchange_name}, error={error_type}, {exc=}"
+                    )
+                    raise
                 metrics.messages_published.labels(exchange_name=self.exchange_name).inc()
+
+                # Record message age (time from creation to publish)
+                # Handle both timezone-aware and naive datetimes (for SQLite compatibility)
+                now = datetime.datetime.now(datetime.timezone.utc)
+                created_at = outbox_row.created_at
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=datetime.timezone.utc)
+                message_age_seconds = (now - created_at).total_seconds()
+                metrics.message_age.labels(exchange_name=self.exchange_name).observe(
+                    message_age_seconds
+                )
+
+                poll_duration_seconds = time.perf_counter() - poll_start_time
+                metrics.poll_duration.labels(exchange_name=self.exchange_name).observe(
+                    poll_duration_seconds
+                )
+
                 logger.debug(f"Sent message: {outbox_row} to RabbitMQ")
                 if self.clean_up_after == "IMMEDIATELY":
                     await session.delete(outbox_row)
@@ -486,6 +570,34 @@ class Outbox:
                     )
                     await session.execute(delete_stmt)
 
+    async def _update_dlq_metrics(self, listeners: Sequence[Listener]) -> None:
+        """Background task to periodically update DLQ message count metrics."""
+        rmq_connection = await self._get_rmq_connection()
+        if rmq_connection is None:
+            logger.warning("Cannot update DLQ metrics: RabbitMQ connection not available")
+            return
+
+        while True:
+            if self._shutdown_future is not None and self._shutdown_future.done():
+                break
+
+            try:
+                channel = await rmq_connection.channel()
+                for listener in listeners:
+                    dlq_name = f"{listener.queue}.dlq"
+                    try:
+                        dlq = await channel.get_queue(dlq_name, ensure=False)
+                        metrics.dlq_messages.labels(queue=listener.queue).set(
+                            float(dlq.declaration_result.message_count or 0)
+                        )
+                    except Exception as exc:
+                        logger.debug(f"Failed to get DLQ message count for {dlq_name}: {exc}")
+            except Exception as exc:
+                logger.warning(f"Error updating DLQ metrics: {exc}")
+
+            # Update every 30 seconds
+            await asyncio.sleep(30)
+
     async def worker(self, listeners: Sequence[Listener]) -> None:
         await self._set_up_queues(listeners)
 
@@ -495,6 +607,12 @@ class Outbox:
         loop.add_signal_handler(signal.SIGTERM, self._shutdown_future.set_result, None)
 
         tasks = set()
+
+        dlq_metrics_task = (
+            asyncio.create_task(self._update_dlq_metrics(listeners))
+            if self.enable_metrics
+            else None
+        )
 
         logger.info(f"Starting worker on exchange: {self.exchange_name} ...")
         for listener in listeners:
@@ -511,6 +629,9 @@ class Outbox:
                 task.add_done_callback(tasks.discard)
 
             listener._consumer_tag = await listener._queue_obj.consume(_task)
+            metrics.active_consumers.labels(
+                queue=listener.queue, exchange_name=self.exchange_name
+            ).inc()
 
         await self._shutdown_future
 
@@ -521,9 +642,15 @@ class Outbox:
                 continue
             assert listener._queue_obj is not None
             await listener._queue_obj.cancel(listener._consumer_tag)
+            metrics.active_consumers.labels(
+                queue=listener.queue, exchange_name=self.exchange_name
+            ).dec()
 
         if tasks:
             await asyncio.wait(tasks)
+
+        if dlq_metrics_task is not None:
+            dlq_metrics_task.cancel()
 
     async def _set_up_queues(self, listeners: Sequence[Listener]) -> None:
         rmq_connection = await self._get_rmq_connection()
@@ -574,10 +701,11 @@ class Outbox:
 
         # Set up listener queues and inject configuration
         for listener in listeners:
-            # Inject default retry_delays and delay exchanges
+            # Inject default retry_delays, delay exchanges, and exchange_name
             if listener.retry_delays is None:
                 listener.retry_delays = self.retry_delays
             listener._delay_exchanges = delay_exchanges
+            listener._exchange_name = self.exchange_name
 
             dead_letter_queue_obj = await channel.declare_queue(
                 f"{listener.queue}.dlq", durable=True, arguments={"x-queue-type": "quorum"}
