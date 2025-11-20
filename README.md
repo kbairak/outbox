@@ -1095,6 +1095,7 @@ The library's declarative approach (`declare_exchange`/`declare_queue`) means:
 - `retry_delays`: Default retry delays (in seconds) for all listeners. A sequence of delay times for exponential backoff. Defaults to `(1, 10, 60, 300)` (1s, 10s, 1m, 5m). Set to `()` for unlimited immediate retries.
 - `table_name`: Name of the outbox table to use. Defaults to `outbox_table`
 - `prefetch_count`: Number of messages to prefetch from RabbitMQ for each listener. Defaults to `10`
+- `batch_size`: Number of messages to fetch and publish concurrently in each batch from the outbox table. Defaults to `50`. Higher values improve throughput but increase transaction duration and memory usage. Set to `1` for sequential processing.
 - `auto_create_table`: If `True`, the outbox table will be automatically created if it does not exist. Defaults to `False`
 
 #### `emit()`
@@ -1214,7 +1215,6 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ### Medium priority
 
-- [ ] Fetch multiple messages at once from outbox table
 - [ ] Performance tests/benchmarks
 - [ ] Better/more error messages
 

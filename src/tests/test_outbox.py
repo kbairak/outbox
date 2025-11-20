@@ -82,6 +82,53 @@ async def test_message_relay(
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_message_relay_batch(
+    emit: EmitType,
+    outbox: Outbox,
+    monkeypatch: pytest.MonkeyPatch,
+    session: AsyncSession,
+) -> None:
+    # arrange
+    outbox.setup(batch_size=2)
+
+    rmq_connection_mock = AsyncMock(name="rmq_connection")
+
+    async def _get_rmq_connection() -> AsyncMock:
+        return rmq_connection_mock
+
+    monkeypatch.setattr(outbox, "_get_rmq_connection", _get_rmq_connection)
+    rmq_connection_mock.channel.return_value = (channel_mock := AsyncMock(name="channel"))
+    channel_mock.declare_exchange.return_value = (exchange_mock := AsyncMock(name="exchange"))
+
+    await emit(session, "test_routing_key_1", "test_body_1")
+    await emit(session, "test_routing_key_2", "test_body_2")
+    await emit(session, "test_routing_key_3", "test_body_3")
+    await session.commit()
+
+    # act - process one batch
+    count = await outbox._consume_outbox_batch(exchange_mock, session)
+
+    # assert - batch_size=2 means exactly 2 messages processed
+    assert count == 2
+    assert len(exchange_mock.publish.mock_calls) == 2
+    assert exchange_mock.publish.mock_calls[0].args[0].body == b'"test_body_1"'
+    assert exchange_mock.publish.mock_calls[0].args[1] == "test_routing_key_1"
+    assert exchange_mock.publish.mock_calls[1].args[0].body == b'"test_body_2"'
+    assert exchange_mock.publish.mock_calls[1].args[1] == "test_routing_key_2"
+
+    await session.commit()
+
+    # assert - 2 messages marked as sent, 1 still pending
+    messages = (
+        (await session.execute(select(OutboxTable).order_by(OutboxTable.id))).scalars().all()
+    )
+    assert len(messages) == 3
+    assert messages[0].sent_at is not None  # First message sent
+    assert messages[1].sent_at is not None  # Second message sent
+    assert messages[2].sent_at is None  # Third message still pending
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_register_listener() -> None:
     # test
     @listen("test_register_listener_binding_key", queue="test_register_listener_queue")

@@ -34,7 +34,7 @@ from aio_pika.abc import (
 )
 from aio_pika.message import encode_expiration
 from pydantic import BaseModel
-from sqlalchemy import JSON, DateTime, Index, Text, delete, func, select, text
+from sqlalchemy import JSON, DateTime, Index, Text, delete, func, select, text, update
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -365,6 +365,7 @@ class Outbox:
     retry_delays: Sequence[int] = (1, 10, 60, 300)
     table_name: str = "outbox_table"
     prefetch_count: int = 10
+    batch_size: int = 50
     auto_create_table: bool = False
     enable_metrics: bool = True
     _table_created: bool = False
@@ -484,6 +485,8 @@ class Outbox:
             await asyncio.sleep(self.poll_interval)
 
     async def _consume_outbox_table(self, exchange: Optional[AbstractExchange] = None) -> None:
+        "Consume outbox table until it's empty (of pending messages)"
+
         if exchange is None:
             rmq_connection = await self._get_rmq_connection()
             if rmq_connection is None:
@@ -493,58 +496,79 @@ class Outbox:
                 self.exchange_name, aio_pika.ExchangeType.TOPIC, durable=True
             )
         while True:
-            poll_start_time = time.perf_counter()
             async with AsyncSession(self.db_engine) as session, session.begin():
-                logger.debug("Checking for unsent messages...")
-                select_stmt = (
-                    select(OutboxTable)
-                    .where(
-                        OutboxTable.sent_at.is_(None),
-                        OutboxTable.send_after <= datetime.datetime.now(datetime.timezone.utc),
-                    )
-                    .order_by(OutboxTable.created_at)
-                    .limit(1)
-                    .with_for_update(skip_locked=True)
-                )
-                try:
-                    outbox_row = (await session.execute(select_stmt)).scalars().one()
-                except NoResultFound:
-                    logger.debug("No unsent messages found, waiting...")
+                count = await self._consume_outbox_batch(exchange, session)
+                if count == 0:
                     break
 
-                logger.debug(f"Processing message: {outbox_row}")
-                expiration = outbox_row.expiration or self.expiration
-                headers = cast(
-                    HeadersType, {"x-outbox-tracking-ids": json.dumps(outbox_row.tracking_ids)}
-                )
-                try:
-                    await exchange.publish(
-                        aio_pika.Message(
-                            outbox_row.body,
-                            content_type="application/json",
-                            expiration=expiration,
-                            headers=headers,
+    async def _consume_outbox_batch(
+        self, exchange: AbstractExchange, session: AsyncSession
+    ) -> int:
+        """Consume a single batch of messages from the outbox table.
+
+        Returns the number of messages processed.
+        """
+        poll_start_time = time.perf_counter()
+        logger.debug("Checking for unsent messages...")
+        select_stmt = (
+            select(OutboxTable)
+            .where(
+                OutboxTable.sent_at.is_(None),
+                OutboxTable.send_after <= datetime.datetime.now(datetime.timezone.utc),
+            )
+            .order_by(OutboxTable.created_at)
+            .limit(self.batch_size)
+            .with_for_update(skip_locked=True)
+        )
+        outbox_rows = (await session.execute(select_stmt)).scalars().all()
+
+        if not outbox_rows:
+            logger.debug("No unsent messages found")
+            return 0
+
+        logger.debug(f"Processing {len(outbox_rows)} messages...")
+
+        results = await asyncio.gather(
+            *[
+                exchange.publish(
+                    aio_pika.Message(
+                        row.body,
+                        content_type="application/json",
+                        expiration=row.expiration or self.expiration,
+                        headers=cast(
+                            HeadersType, {"x-outbox-tracking-ids": json.dumps(row.tracking_ids)}
                         ),
-                        outbox_row.routing_key,
-                    )
-                except Exception as exc:
-                    error_type = type(exc).__name__
-                    metrics.publish_failures.labels(
-                        exchange_name=self.exchange_name,
-                        failure_type="main",
-                        error_type=error_type,
-                    ).inc()
-                    logger.error(
-                        f"Failed to publish message to RabbitMQ: {outbox_row}, "
-                        f"exchange={self.exchange_name}, error={error_type}, {exc=}"
-                    )
-                    raise
+                    ),
+                    row.routing_key,
+                )
+                for row in outbox_rows
+            ],
+            return_exceptions=True,
+        )
+
+        # Separate successful vs failed publishes
+        successful_ids = []
+        now = datetime.datetime.now(datetime.timezone.utc)
+        for i, result in enumerate(results):
+            row = outbox_rows[i]
+            if isinstance(result, Exception):
+                error_type = type(result).__name__
+                metrics.publish_failures.labels(
+                    exchange_name=self.exchange_name,
+                    failure_type="main",
+                    error_type=error_type,
+                ).inc()
+                logger.error(
+                    f"Failed to publish message to RabbitMQ: {row}, "
+                    f"exchange={self.exchange_name}, error={error_type}, {result!r}"
+                )
+            else:
+                successful_ids.append(row.id)
                 metrics.messages_published.labels(exchange_name=self.exchange_name).inc()
 
                 # Record message age (time from creation to publish)
                 # Handle both timezone-aware and naive datetimes (for SQLite compatibility)
-                now = datetime.datetime.now(datetime.timezone.utc)
-                created_at = outbox_row.created_at
+                created_at = row.created_at
                 if created_at.tzinfo is None:
                     created_at = created_at.replace(tzinfo=datetime.timezone.utc)
                 message_age_seconds = (now - created_at).total_seconds()
@@ -552,23 +576,34 @@ class Outbox:
                     message_age_seconds
                 )
 
-                poll_duration_seconds = time.perf_counter() - poll_start_time
-                metrics.poll_duration.labels(exchange_name=self.exchange_name).observe(
-                    poll_duration_seconds
+        poll_duration_seconds = time.perf_counter() - poll_start_time
+        metrics.poll_duration.labels(exchange_name=self.exchange_name).observe(
+            poll_duration_seconds
+        )
+
+        # Batch UPDATE/DELETE: Mark only successful messages as sent
+        if successful_ids:
+            logger.debug(f"Sent {len(successful_ids)} messages to RabbitMQ")
+            if self.clean_up_after == "IMMEDIATELY":
+                await session.execute(
+                    delete(OutboxTable).where(OutboxTable.id.in_(successful_ids))
+                )
+            else:
+                await session.execute(
+                    update(OutboxTable)
+                    .where(OutboxTable.id.in_(successful_ids))
+                    .values(sent_at=now)
                 )
 
-                logger.debug(f"Sent message: {outbox_row} to RabbitMQ")
-                if self.clean_up_after == "IMMEDIATELY":
-                    await session.delete(outbox_row)
-                else:
-                    outbox_row.sent_at = datetime.datetime.now(datetime.timezone.utc)
-                if isinstance(self.clean_up_after, datetime.timedelta):
-                    delete_stmt = delete(OutboxTable).where(
-                        OutboxTable.sent_at.is_not(None),
-                        OutboxTable.sent_at
-                        < datetime.datetime.now(datetime.timezone.utc) - self.clean_up_after,
-                    )
-                    await session.execute(delete_stmt)
+        # Time-based cleanup
+        if isinstance(self.clean_up_after, datetime.timedelta):
+            delete_stmt = delete(OutboxTable).where(
+                OutboxTable.sent_at.is_not(None),
+                OutboxTable.sent_at < now - self.clean_up_after,
+            )
+            await session.execute(delete_stmt)
+
+        return len(outbox_rows)
 
     async def _update_dlq_metrics(self, listeners: Sequence[Listener]) -> None:
         """Background task to periodically update DLQ message count metrics."""
