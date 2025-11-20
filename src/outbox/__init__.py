@@ -407,7 +407,7 @@ class Outbox:
 
     async def _get_rmq_connection(self) -> Optional[AbstractConnection]:
         if self.rmq_connection is None and self.rmq_connection_url is not None:
-            self.rmq_connection = await aio_pika.connect(self.rmq_connection_url)
+            self.rmq_connection = await aio_pika.connect_robust(self.rmq_connection_url)
         return self.rmq_connection
 
     async def emit(

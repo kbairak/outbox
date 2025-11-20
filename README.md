@@ -634,6 +634,52 @@ WHERE sent_at IS NOT NULL;
 </details>
 
 <details>
+    <summary><h3>Connection resilience</h3></summary>
+
+The library uses `aio_pika.connect_robust()` for RabbitMQ connections, which provides automatic reconnection with full state recovery (queues, exchanges, bindings, and consumers). If RabbitMQ restarts or network issues occur, connections automatically recover without manual intervention.
+
+For additional control over connection resilience, you can pass connection objects directly to `setup()`:
+
+**PostgreSQL - Configure connection pooling:**
+
+```python
+from sqlalchemy.ext.asyncio import create_async_engine
+
+db_engine = create_async_engine(
+    "postgresql+asyncpg://user:password@localhost/dbname",
+    pool_pre_ping=True,        # Test connections before use (recommended)
+    pool_recycle=3600,         # Recycle connections after 1 hour
+    pool_size=5,               # Connection pool size
+    max_overflow=10,           # Max connections beyond pool_size
+)
+
+setup(db_engine=db_engine)
+```
+
+**Key parameters:**
+
+- `pool_pre_ping=True` - Most important! Tests if a connection is alive before use, prevents "connection closed" errors
+- `pool_recycle=3600` - Closes and recreates connections after specified seconds to prevent stale connections
+- `pool_size` and `max_overflow` - Control connection pool sizing for your workload
+
+**RabbitMQ - Configure heartbeat and other connection parameters:**
+
+```python
+import aio_pika
+
+rmq_connection = await aio_pika.connect_robust(
+    "amqp://guest:guest@localhost:5672/",
+    heartbeat=30,              # Send heartbeats every 30 seconds (default: 60)
+)
+
+setup(rmq_connection=rmq_connection)
+```
+
+Heartbeats detect dead connections and trigger automatic reconnection. The default timeout (60s) works for most cases, but you can adjust it based on your network reliability
+
+</details>
+
+<details>
     <summary><h3>Observability</h3></summary>
 
 Outbox provides optional Prometheus metrics for monitoring message flow and performance. Metrics automatically register to prometheus_client's global registry, so they work seamlessly with your existing Prometheus instrumentation:
@@ -1166,18 +1212,10 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ## TODOs
 
-### High priority
-
-- [ ] connections/channels become unresponsive handling, robust connections/channels
-
 ### Medium priority
 
-- [ ] Observability (prometheus)
-  - [ ] Grafana dashboard
 - [ ] Fetch multiple messages at once from outbox table
-- [ ] Channel/connection pooling
 - [ ] Performance tests/benchmarks
-- [ ] Heartbeat to verify connection to RabbitMQ is alive
 - [ ] Better/more error messages
 
 ### Low priority
