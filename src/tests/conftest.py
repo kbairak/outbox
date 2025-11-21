@@ -4,7 +4,9 @@ import aio_pika
 import pytest
 import pytest_asyncio
 from aio_pika.abc import AbstractConnection
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
+from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from testcontainers.rabbitmq import RabbitMqContainer  # type: ignore[import-untyped]
 
 from outbox import Outbox
@@ -12,9 +14,13 @@ from outbox import Outbox
 from .utils import EmitType
 
 
-@pytest.fixture
-def db_engine() -> AsyncEngine:
-    return create_async_engine("sqlite+aiosqlite:///:memory:")
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def db_engine() -> AsyncGenerator[AsyncEngine, None]:
+    with PostgresContainer("postgres:17.5-alpine") as postgres:
+        connection_url = postgres.get_connection_url().replace("psycopg2", "asyncpg")
+        engine = create_async_engine(connection_url)
+        yield engine
+        await engine.dispose()
 
 
 @pytest_asyncio.fixture(loop_scope="session")
@@ -49,3 +55,12 @@ async def outbox(db_engine: AsyncEngine, rmq_connection: AbstractConnection) -> 
 @pytest.fixture
 def emit(outbox: Outbox) -> EmitType:
     return outbox.emit
+
+
+@pytest_asyncio.fixture(autouse=True, loop_scope="session")
+async def cleanup_database(db_engine: AsyncEngine) -> AsyncGenerator[None, None]:
+    """Clean up the outbox table after each test to ensure test isolation"""
+    yield
+    async with AsyncSession(db_engine) as session:
+        await session.execute(text("TRUNCATE TABLE outbox_table"))
+        await session.commit()

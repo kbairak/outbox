@@ -1,6 +1,6 @@
 # Outbox pattern for Python, SQLAlchemy, RabbitMQ and Pydantic
 
-Implementation of the [outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html) for async Python applications with SQLAlchemy and RabbitMQ.
+Implementation of the [outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html) for async Python applications with PostgreSQL (SQLAlchemy) and RabbitMQ.
 
 ```mermaid
 flowchart LR
@@ -1084,7 +1084,7 @@ The library's declarative approach (`declare_exchange`/`declare_queue`) means:
 
 #### `setup()`
 
-- `db_engine_url`: A string that indicates database dialect and connection arguments. Will be passed to SQLAlchemy. Follows the pattern `<database_type>+<dbapi>://<username>:<password>@<host>:<port>/<db_name>`. Make sure you use a DBAPI that supports async operations, like `asyncpg` for PostgreSQL or `aiosqlite` for SQLite. Examples: `postgresql+asyncpg://postgres:postgres@localhost:5432/postgres` or `sqlite+aiosqlite:///:memory:`
+- `db_engine_url`: A string that indicates database dialect and connection arguments. Will be passed to SQLAlchemy. Follows the pattern `postgresql+asyncpg://<username>:<password>@<host>:<port>/<db_name>`. Must use `asyncpg` for async PostgreSQL operations. Example: `postgresql+asyncpg://postgres:postgres@localhost:5432/postgres`
 - `db_engine`: If you already have a SQLAlchemy engine, you can pass it here instead of `db_engine_url` (you must pass either one or the other)
 - `rmq_connection_url`: A string that indicates RabbitMQ connection parameters. Follows the pattern `amqp[s]://<username>:<password>@<host>:(<port>)/(virtualhost)`. Example: `amqp://guest:guest@localhost:5672/`
 - `rmq_connection`: If you already have a aio-pika connection, you can pass it here instead of `rmq_connection_url` (you must pass either one or the other)

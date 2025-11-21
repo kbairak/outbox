@@ -567,11 +567,7 @@ class Outbox:
                 metrics.messages_published.labels(exchange_name=self.exchange_name).inc()
 
                 # Record message age (time from creation to publish)
-                # Handle both timezone-aware and naive datetimes (for SQLite compatibility)
-                created_at = row.created_at
-                if created_at.tzinfo is None:
-                    created_at = created_at.replace(tzinfo=datetime.timezone.utc)
-                message_age_seconds = (now - created_at).total_seconds()
+                message_age_seconds = (now - row.created_at).total_seconds()
                 metrics.message_age.labels(exchange_name=self.exchange_name).observe(
                     message_age_seconds
                 )
