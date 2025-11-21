@@ -20,6 +20,7 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "asyncpg>=0.30.0",
+    "asyncpg-stubs>=0.30.0",
     "mypy>=1.18.2",
     "ptipython>=1.0.1",
     "pudb>=2025.1",

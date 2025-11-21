@@ -142,6 +142,19 @@ wheels = [
 ]
 
 [[package]]
+name = "asyncpg-stubs"
+version = "0.30.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "asyncpg" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a3/e5/1a06ecec2a77a75974ba6b22d3bed697193177c0ed7595cce4dd2362735d/asyncpg_stubs-0.30.2.tar.gz", hash = "sha256:b8a1b7cb790a7b8a0e4e64e438a97c3fac77ea02441b563b1975748f18af33ab", size = 20250, upload-time = "2025-06-27T20:03:15.712Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a4/22/77a4a08cc9ef4f8bbb5e7ffbf4be008e596b535a3533a28c3465e9400d75/asyncpg_stubs-0.30.2-py3-none-any.whl", hash = "sha256:e57818bbaf10945a60ff3219da3c5ce97e1b424503b6a6f0a18db99797397cbb", size = 26929, upload-time = "2025-06-27T20:03:14.847Z" },
+]
+
+[[package]]
 name = "certifi"
 version = "2025.4.26"
 source = { registry = "https://pypi.org/simple" }
@@ -799,6 +812,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "asyncpg" },
+    { name = "asyncpg-stubs" },
     { name = "mypy" },
     { name = "ptipython" },
     { name = "pudb" },
@@ -823,6 +837,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "asyncpg", specifier = ">=0.30.0" },
+    { name = "asyncpg-stubs", specifier = ">=0.30.0" },
     { name = "mypy", specifier = ">=1.18.2" },
     { name = "ptipython", specifier = ">=1.0.1" },
     { name = "pudb", specifier = ">=2025.1" },

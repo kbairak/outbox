@@ -1089,7 +1089,7 @@ The library's declarative approach (`declare_exchange`/`declare_queue`) means:
 - `rmq_connection_url`: A string that indicates RabbitMQ connection parameters. Follows the pattern `amqp[s]://<username>:<password>@<host>:(<port>)/(virtualhost)`. Example: `amqp://guest:guest@localhost:5672/`
 - `rmq_connection`: If you already have a aio-pika connection, you can pass it here instead of `rmq_connection_url` (you must pass either one or the other)
 - `exchange_name`: Name of the RabbitMQ exchange to use. Defaults to `outbox`
-- `poll_interval`: How often to poll the outbox table for unsent messages. Defaults to `1` second
+- `notification_timeout`: Maximum time (in seconds) to wait for a PostgreSQL NOTIFY before checking for scheduled messages. Acts as a safety timeout. Defaults to `60` seconds
 - `expiration`: Expiration time in seconds for messages in RabbitMQ. Defaults to `None` (no expiration)
 - `clean_up_after`: How long to keep messages in the outbox table after they are sent. Can be `IMMEDIATELY`, `NEVER`, or a `timedelta`
 - `retry_delays`: Default retry delays (in seconds) for all listeners. A sequence of delay times for exponential backoff. Defaults to `(1, 10, 60, 300)` (1s, 10s, 1m, 5m). Set to `()` for unlimited immediate retries.
@@ -1217,14 +1217,13 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 - [ ] Performance tests/benchmarks
 - [ ] Better/more error messages
+- [ ] Make tests faster
 
 ### Low priority
 
-- [ ] Add `queue_prefix` setup arg (or maybe automatic queue name should be prefixed with `exchange_name`)
-- [ ] Use msgpack (optionally) to reduce size
-- [ ] Use pg notify/listen to avoid polling the database
-- [ ] Nested dependencies
 - [ ] No 'application/json' content type if body is bytes
 - [ ] Delay exchange/queue names to include minutes and/or hours (`XmYYs` instead of `XXXXs`)
+- [ ] Add `queue_prefix` setup arg (or maybe automatic queue name should be prefixed with `exchange_name`)
+- [ ] Use msgpack (optionally) to reduce size
+- [ ] Nested dependencies
 - [ ] Maybe not everything quorum-able should be quorum. Perhaps configuration
-- [ ] Make tests faster

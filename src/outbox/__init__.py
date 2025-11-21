@@ -3,13 +3,13 @@ import datetime
 import inspect
 import json
 import logging
-import reprlib
 import signal
 import time
 import uuid
 from collections.abc import Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+from copy import copy
 from dataclasses import dataclass, field, fields
 from typing import (
     Any,
@@ -23,6 +23,7 @@ from typing import (
 )
 
 import aio_pika
+import asyncpg
 from aio_pika.abc import (
     AbstractConnection,
     AbstractExchange,
@@ -34,67 +35,13 @@ from aio_pika.abc import (
 )
 from aio_pika.message import encode_expiration
 from pydantic import BaseModel
-from sqlalchemy import JSON, DateTime, Index, Text, delete, func, select, text, update
-from sqlalchemy.exc import NoResultFound
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from .database import Base, OutboxTable
 from .metrics import metrics
 
 logger = logging.getLogger("outbox")
-
-
-class Base(DeclarativeBase):
-    pass
-
-
-class OutboxTable(Base):
-    __tablename__ = "outbox_table"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    routing_key: Mapped[str] = mapped_column(Text)
-    body: Mapped[bytes] = mapped_column()
-    tracking_ids: Mapped[list[str]] = mapped_column(JSON)
-    created_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-    retry_limit: Mapped[Optional[int]] = mapped_column()
-    expiration: Mapped[Optional[datetime.timedelta]] = mapped_column()
-    send_after: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
-    sent_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
-
-    __table_args__ = (
-        # Partial index for pending messages
-        Index(
-            "outbox_pending_idx",
-            "send_after",
-            "created_at",
-            postgresql_where=(sent_at.is_(None)),
-        ),
-        # Partial index for cleanup
-        Index(
-            "outbox_cleanup_idx",
-            "sent_at",
-            postgresql_where=(sent_at.is_not(None)),
-        ),
-    )
-
-    def __repr__(self) -> str:
-        routing_key = self.routing_key
-        body = reprlib.repr(self.body)
-        tracking_ids = self.tracking_ids
-        created_at = self.created_at
-        args = [f"{routing_key=}", f"{body=}", f"{tracking_ids=}", f"{created_at=}"]
-        if self.send_after != self.created_at:
-            send_after = self.send_after
-            args.append(f"{send_after=}")
-        if self.retry_limit is not None:
-            retry_limit = self.retry_limit
-            args.append(f"{retry_limit=}")
-        if self.expiration:
-            expiration = self.expiration.total_seconds
-            args.append(f"{expiration=}")
-        return f"OutboxTable({', '.join(args)})"
 
 
 class Reject(Exception):
@@ -357,7 +304,7 @@ class Outbox:
     rmq_connection: Optional[AbstractConnection] = None
     rmq_connection_url: Optional[str] = None
     exchange_name: str = "outbox"
-    poll_interval: float = 1.0
+    notification_timeout: float = 60.0
     expiration: Optional[DateType] = None
     clean_up_after: Union[
         Literal["IMMEDIATELY"], Literal["NEVER"], datetime.timedelta, int, float, None
@@ -401,10 +348,40 @@ class Outbox:
         self.__post_init__()
 
     async def _ensure_database(self) -> None:
-        if self.auto_create_table and not self._table_created and self.db_engine:
-            async with self.db_engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
-            self._table_created = True
+        if not self.auto_create_table or self._table_created or not self.db_engine:
+            return
+
+        async with self.db_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        # Create NOTIFY trigger for instant message delivery
+        async with AsyncSession(self.db_engine) as session:
+            await session.execute(
+                text("""
+                    CREATE OR REPLACE FUNCTION notify_outbox_insert() RETURNS TRIGGER AS $$
+                    BEGIN
+                        IF NEW.send_after <= NOW() THEN
+                            PERFORM pg_notify('outbox_channel', '');
+                        END IF;
+                        RETURN NEW;
+                    END;
+                    $$ LANGUAGE plpgsql
+                """)
+            )
+            await session.execute(
+                text("DROP TRIGGER IF EXISTS outbox_notify_trigger ON outbox_table")
+            )
+            await session.execute(
+                text("""
+                    CREATE TRIGGER outbox_notify_trigger
+                        AFTER INSERT ON outbox_table
+                        FOR EACH ROW
+                        EXECUTE FUNCTION notify_outbox_insert()
+                """)
+            )
+            await session.commit()
+
+        self._table_created = True
 
     async def _get_rmq_connection(self) -> Optional[AbstractConnection]:
         if self.rmq_connection is None and self.rmq_connection_url is not None:
@@ -465,24 +442,67 @@ class Outbox:
         exchange = await channel.declare_exchange(
             self.exchange_name, aio_pika.ExchangeType.TOPIC, durable=True
         )
-        while True:
-            # Update table backlog gauge
-            async with AsyncSession(self.db_engine) as session:
-                count_stmt = (
-                    select(func.count())
-                    .select_from(OutboxTable)
-                    .where(
-                        OutboxTable.sent_at.is_(None),
-                        OutboxTable.send_after <= datetime.datetime.now(datetime.timezone.utc),
-                    )
-                )
-                backlog_count = (await session.execute(count_stmt)).scalar()
-                metrics.table_backlog.labels(exchange_name=self.exchange_name).set(
-                    backlog_count or 0
-                )
 
-            await self._consume_outbox_table(exchange)
-            await asyncio.sleep(self.poll_interval)
+        # Create dedicated asyncpg connection for LISTEN
+        listen_conn = await asyncpg.connect(
+            copy(self.db_engine.url)
+            .set(drivername="postgresql")
+            .render_as_string(hide_password=False)
+        )
+        notification_event = asyncio.Event()
+        await listen_conn.add_listener("outbox_channel", lambda *_: notification_event.set())
+
+        try:
+            while True:
+                # Update table backlog gauge
+                async with AsyncSession(self.db_engine) as session:
+                    count_stmt = (
+                        select(func.count())
+                        .select_from(OutboxTable)
+                        .where(
+                            OutboxTable.sent_at.is_(None),
+                            OutboxTable.send_after <= datetime.datetime.now(datetime.timezone.utc),
+                        )
+                    )
+                    backlog_count = (await session.execute(count_stmt)).scalar()
+                    metrics.table_backlog.labels(exchange_name=self.exchange_name).set(
+                        backlog_count or 0
+                    )
+
+                # Process all ready messages
+                await self._consume_outbox_table(exchange)
+
+                # Query for next scheduled message time
+                async with AsyncSession(self.db_engine) as session:
+                    result = await session.execute(
+                        select(func.min(OutboxTable.send_after)).where(
+                            OutboxTable.sent_at.is_(None),
+                            OutboxTable.send_after > datetime.datetime.now(datetime.timezone.utc),
+                        )
+                    )
+                    next_send_time = result.scalar()
+
+                # Calculate wait time
+                if next_send_time:
+                    timeout = min(
+                        (
+                            next_send_time - datetime.datetime.now(datetime.timezone.utc)
+                        ).total_seconds(),
+                        self.notification_timeout,
+                    )
+                else:
+                    timeout = self.notification_timeout
+
+                # Wait for notification or timeout
+                try:
+                    await asyncio.wait_for(notification_event.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    pass
+                finally:
+                    notification_event.clear()
+        finally:
+            if listen_conn:
+                await listen_conn.close()
 
     async def _consume_outbox_table(self, exchange: Optional[AbstractExchange] = None) -> None:
         "Consume outbox table until it's empty (of pending messages)"
@@ -777,3 +797,16 @@ message_relay = outbox.message_relay
 worker = outbox.worker
 tracking = outbox.tracking
 get_tracking_ids = outbox.get_tracking_ids
+
+__all__ = [
+    "Outbox",
+    "OutboxTable",
+    "Reject",
+    "listen",
+    "setup",
+    "emit",
+    "message_relay",
+    "worker",
+    "tracking",
+    "get_tracking_ids",
+]
