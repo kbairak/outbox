@@ -1171,6 +1171,14 @@ Starts the worker that consumes messages from RabbitMQ and dispatches them to th
 </details>
 
 <details>
+  <summary><h3>Benchmarks</h3></summary>
+
+The outbox pattern scales according to your needs - from ~3,500 msgs/sec with a single worker/relay to higher throughput with additional workers and relays. Performance is comparable to pure Celery, with the relay introducing minimal overhead despite providing transactional guarantees.
+
+See [detailed benchmark results](src/benchmarks/README.md) for throughput scaling, parameter tuning recommendations, and Celery comparison.
+</details>
+
+<details>
     <summary><h3>Singleton vs multiple instances</h3></summary>
 
 > You likely will not have to be aware of this feature, but it was useful for developing unit-tests for this library.
@@ -1234,11 +1242,14 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ## TODOs
 
+### High priority
+
+- [ ] 'retry_limit' is no longer used, clean it up
+- [ ] Add notify to database migration readme
+- [ ] Ability to emit non-async
+
 ### Medium priority
 
-- [ ] Performance tests/benchmarks
-  - [ ] Compare with multiprocess
-  - [ ] Compare with celery
 - [ ] Better/more error messages
 - [ ] Make tests faster
 - [ ] Split readme into features/best practices
