@@ -35,7 +35,7 @@ from aio_pika.abc import (
 )
 from aio_pika.message import encode_expiration
 from pydantic import BaseModel
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import delete, func, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
 from .database import Base, OutboxTable
@@ -298,6 +298,15 @@ _tracking_ids: ContextVar[tuple[str, ...]] = ContextVar[tuple[str, ...]](
 
 
 @dataclass
+class OutboxMessage:
+    routing_key: str
+    body: Any
+    retry_limit: Optional[int] = None
+    expiration: DateType = None
+    eta: Optional[DateType] = None
+
+
+@dataclass
 class Outbox:
     db_engine: Optional[AsyncEngine] = None
     db_engine_url: Optional[str] = None
@@ -388,6 +397,43 @@ class Outbox:
             self.rmq_connection = await aio_pika.connect_robust(self.rmq_connection_url)
         return self.rmq_connection
 
+    async def bulk_emit(self, session: AsyncSession, messages: Sequence[OutboxMessage]) -> None:
+        await self._ensure_database()
+        rows = []
+        now = datetime.datetime.now(datetime.timezone.utc)
+        for message in messages:
+            if isinstance(message.body, BaseModel):
+                body = message.body.model_dump_json().encode()
+            elif not isinstance(message.body, bytes):
+                body = json.dumps(message.body).encode()
+            else:
+                body = message.body
+            if message.expiration is not None:
+                milliseconds = encode_expiration(message.expiration)
+                assert milliseconds is not None
+                expiration = datetime.timedelta(milliseconds=int(milliseconds))
+            else:
+                expiration = None
+            if message.eta is not None:
+                milliseconds = encode_expiration(message.eta)
+                assert milliseconds is not None
+                send_after = now + datetime.timedelta(milliseconds=int(milliseconds))
+            else:
+                send_after = now
+            rows.append(
+                {
+                    "routing_key": message.routing_key,
+                    "body": body,
+                    "tracking_ids": list(self.get_tracking_ids() + (str(uuid.uuid4()),)),
+                    "retry_limit": message.retry_limit,
+                    "created_at": now,
+                    "expiration": expiration,
+                    "send_after": send_after,
+                }
+            )
+        await session.execute(insert(OutboxTable).values(rows))
+        logger.info(f"Emitted {len(rows)} messages to outbox")
+
     async def emit(
         self,
         session: AsyncSession,
@@ -398,36 +444,9 @@ class Outbox:
         expiration: DateType = None,
         eta: Optional[DateType] = None,
     ) -> None:
-        await self._ensure_database()
-
-        if isinstance(body, BaseModel):
-            body = body.model_dump_json().encode()
-        elif not isinstance(body, bytes):
-            body = json.dumps(body).encode()
-
-        now = datetime.datetime.now(datetime.timezone.utc)
-        outbox_row = OutboxTable(
-            routing_key=routing_key,
-            body=body,
-            tracking_ids=list(self.get_tracking_ids() + (str(uuid.uuid4()),)),
-            retry_limit=retry_limit,
-            created_at=now,
+        await self.bulk_emit(
+            session, [OutboxMessage(routing_key, body, retry_limit, expiration, eta)]
         )
-        if expiration is not None:
-            milliseconds = encode_expiration(expiration)
-            assert milliseconds is not None
-            outbox_row.expiration = datetime.timedelta(milliseconds=int(milliseconds))
-        if eta is not None:
-            milliseconds = encode_expiration(eta)
-            assert milliseconds is not None
-            outbox_row.send_after = datetime.datetime.now(
-                datetime.timezone.utc
-            ) + datetime.timedelta(milliseconds=int(milliseconds))
-        else:
-            outbox_row.send_after = outbox_row.created_at
-        session.add(outbox_row)
-
-        logger.info(f"Emitted message to outbox: {outbox_row}")
 
     async def message_relay(self) -> None:
         if self.db_engine is None:
@@ -793,6 +812,7 @@ class Outbox:
 outbox = Outbox()
 setup = outbox.setup
 emit = outbox.emit
+bulk_emit = outbox.bulk_emit
 message_relay = outbox.message_relay
 worker = outbox.worker
 tracking = outbox.tracking

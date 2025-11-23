@@ -10,7 +10,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from outbox import Outbox, OutboxTable, Reject, listen
+from outbox import Outbox, OutboxMessage, OutboxTable, Reject, listen
 
 from .utils import EmitType, Person, get_dlq_message_count, run_worker
 
@@ -27,6 +27,29 @@ async def test_emit(emit: EmitType, session: AsyncSession) -> None:
     assert messages[0].body == b'"test_body"'
     assert messages[0].created_at is not None
     assert messages[0].sent_at is None
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_bulk_emit(outbox: Outbox, session: AsyncSession) -> None:
+    # test
+    messages = [
+        OutboxMessage(routing_key="test_key_1", body="test_body_1"),
+        OutboxMessage(routing_key="test_key_2", body="test_body_2"),
+    ]
+    await outbox.bulk_emit(session, messages)
+    await session.commit()
+
+    # assert
+    rows = (await session.execute(select(OutboxTable))).scalars().all()
+    assert len(rows) == 2
+    assert rows[0].routing_key == "test_key_1"
+    assert rows[0].body == b'"test_body_1"'
+    assert rows[0].created_at is not None
+    assert rows[0].sent_at is None
+    assert rows[1].routing_key == "test_key_2"
+    assert rows[1].body == b'"test_body_2"'
+    assert rows[1].created_at is not None
+    assert rows[1].sent_at is None
 
 
 @pytest.mark.asyncio(loop_scope="session")

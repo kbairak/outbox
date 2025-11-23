@@ -112,6 +112,27 @@ listen("binding_key", ...)(callback)
 ## Features
 
 <details>
+    <summary><h3>Bulk emit for high throughput</h3></summary>
+
+For performance-critical scenarios where you need to emit many messages at once, use `bulk_emit()` to insert multiple messages in a single database operation:
+
+```python
+from outbox import OutboxMessage, bulk_emit
+
+async with AsyncSession(db_engine) as session, session.begin():
+    messages = [
+        OutboxMessage(routing_key="user.created", body={"id": 1, "username": "alice"}),
+        OutboxMessage(routing_key="user.created", body={"id": 2, "username": "bob"}),
+        OutboxMessage(routing_key="order.placed", body={"order_id": 456}),
+    ]
+    await bulk_emit(session, messages)
+```
+
+This is significantly faster than calling `emit()` individually when dealing with large batches of messages.
+
+</details>
+
+<details>
     <summary><h3>Emit inside database transaction</h3></summary>
 
 You can (and should) call `emit` inside a database transaction. This way, data creation and triggering of side-effects will either succeed together or fail together. This is the main goal of the outbox pattern.
@@ -1216,8 +1237,11 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 ### Medium priority
 
 - [ ] Performance tests/benchmarks
+  - [ ] Compare with multiprocess
+  - [ ] Compare with celery
 - [ ] Better/more error messages
 - [ ] Make tests faster
+- [ ] Split readme into features/best practices
 
 ### Low priority
 
