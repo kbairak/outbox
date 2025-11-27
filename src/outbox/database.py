@@ -20,7 +20,6 @@ class OutboxTable(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
-    retry_limit: Mapped[Optional[int]] = mapped_column()
     expiration: Mapped[Optional[datetime.timedelta]] = mapped_column()
     send_after: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
     sent_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
@@ -50,9 +49,6 @@ class OutboxTable(Base):
         if self.send_after != self.created_at:
             send_after = self.send_after
             args.append(f"{send_after=}")
-        if self.retry_limit is not None:
-            retry_limit = self.retry_limit
-            args.append(f"{retry_limit=}")
         if self.expiration:
             expiration = self.expiration.total_seconds
             args.append(f"{expiration=}")

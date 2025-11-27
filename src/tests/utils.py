@@ -20,7 +20,6 @@ class EmitType(Protocol):
         routing_key: str,
         body: Any,
         *,
-        retry_limit: Optional[int] = None,
         expiration: DateType = None,
         eta: Optional[DateType] = None,
     ) -> None: ...

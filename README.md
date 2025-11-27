@@ -596,7 +596,6 @@ def upgrade():
             server_default=sa.text("NOW()"),
             nullable=False,
         ),
-        sa.Column("retry_limit", sa.Integer),
         sa.Column("expiration", sa.Interval),
         sa.Column("send_after", sa.DateTime(timezone=True), nullable=False),
         sa.Column("sent_at", sa.DateTime(timezone=True)),
@@ -618,7 +617,28 @@ def upgrade():
         postgresql_where=sa.text("sent_at IS NOT NULL"),
     )
 
+    # Create NOTIFY trigger for instant message delivery
+    op.execute("""
+        CREATE OR REPLACE FUNCTION notify_outbox_insert() RETURNS TRIGGER AS $$
+        BEGIN
+            IF NEW.send_after <= NOW() THEN
+                PERFORM pg_notify('outbox_channel', '');
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+    """)
+
+    op.execute("""
+        CREATE TRIGGER outbox_notify_trigger
+            AFTER INSERT ON outbox_table
+            FOR EACH ROW
+            EXECUTE FUNCTION notify_outbox_insert()
+    """)
+
 def downgrade():
+    op.execute("DROP TRIGGER IF EXISTS outbox_notify_trigger ON outbox_table")
+    op.execute("DROP FUNCTION IF EXISTS notify_outbox_insert()")
     op.drop_index("outbox_pending_idx", table_name="outbox_table")
     op.drop_index("outbox_cleanup_idx", table_name="outbox_table")
     op.drop_table("outbox_table")
@@ -635,7 +655,6 @@ CREATE TABLE outbox_table (
     body BYTEA NOT NULL,
     tracking_ids JSON NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    retry_limit INTEGER,
     expiration INTERVAL,
     send_after TIMESTAMPTZ NOT NULL,
     sent_at TIMESTAMPTZ
@@ -650,6 +669,21 @@ WHERE sent_at IS NULL;
 CREATE INDEX outbox_cleanup_idx
 ON outbox_table (sent_at)
 WHERE sent_at IS NOT NULL;
+
+-- Create NOTIFY trigger for instant message delivery
+CREATE OR REPLACE FUNCTION notify_outbox_insert() RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.send_after <= NOW() THEN
+        PERFORM pg_notify('outbox_channel', '');
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER outbox_notify_trigger
+    AFTER INSERT ON outbox_table
+    FOR EACH ROW
+    EXECUTE FUNCTION notify_outbox_insert();
 ```
 
 </details>
@@ -1244,8 +1278,6 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 
 ### High priority
 
-- [ ] 'retry_limit' is no longer used, clean it up
-- [ ] Add notify to database migration readme
 - [ ] Ability to emit non-async
 
 ### Medium priority

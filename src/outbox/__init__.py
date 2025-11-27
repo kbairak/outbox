@@ -301,7 +301,6 @@ _tracking_ids: ContextVar[tuple[str, ...]] = ContextVar[tuple[str, ...]](
 class OutboxMessage:
     routing_key: str
     body: Any
-    retry_limit: Optional[int] = None
     expiration: DateType = None
     eta: Optional[DateType] = None
 
@@ -425,7 +424,6 @@ class Outbox:
                     "routing_key": message.routing_key,
                     "body": body,
                     "tracking_ids": list(self.get_tracking_ids() + (str(uuid.uuid4()),)),
-                    "retry_limit": message.retry_limit,
                     "created_at": now,
                     "expiration": expiration,
                     "send_after": send_after,
@@ -440,13 +438,10 @@ class Outbox:
         routing_key: str,
         body: Any,
         *,
-        retry_limit: Optional[int] = None,
         expiration: DateType = None,
         eta: Optional[DateType] = None,
     ) -> None:
-        await self.bulk_emit(
-            session, [OutboxMessage(routing_key, body, retry_limit, expiration, eta)]
-        )
+        await self.bulk_emit(session, [OutboxMessage(routing_key, body, expiration, eta)])
 
     async def message_relay(self) -> None:
         if self.db_engine is None:
