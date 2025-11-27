@@ -1,10 +1,11 @@
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Generator
+from typing import Awaitable, Generator, Optional, Union, overload
 
-from sqlalchemy import text
+from sqlalchemy import Engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.orm import Session
 
 from outbox.database import Base
 
@@ -13,13 +14,47 @@ class Reject(Exception):
     pass
 
 
-_table_created = False
+_table_created: set[str] = set()
 
 
-async def ensure_database(db_engine: AsyncEngine) -> None:
-    global _table_created
+notify_statements = [
+    text("""
+        CREATE OR REPLACE FUNCTION notify_outbox_insert() RETURNS TRIGGER AS $$
+        BEGIN
+            IF NEW.send_after <= NOW() THEN
+                PERFORM pg_notify('outbox_channel', '');
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+    """),
+    text("DROP TRIGGER IF EXISTS outbox_notify_trigger ON outbox_table"),
+    text("""
+        CREATE TRIGGER outbox_notify_trigger
+            AFTER INSERT ON outbox_table
+            FOR EACH ROW
+            EXECUTE FUNCTION notify_outbox_insert()
+    """),
+]
 
-    if _table_created:
+
+def ensure_database_sync(db_engine: Engine) -> None:
+    if str(db_engine.url) in _table_created:
+        return
+
+    Base.metadata.create_all(db_engine)
+
+    # Create NOTIFY trigger for instant message delivery
+    with Session(db_engine) as session:
+        for notify_statement in notify_statements:
+            session.execute(notify_statement)
+        session.commit()
+
+    _table_created.add(str(db_engine.url))
+
+
+async def ensure_database_async(db_engine: AsyncEngine) -> None:
+    if str(db_engine.url) in _table_created:
         return
 
     async with db_engine.begin() as conn:
@@ -27,30 +62,11 @@ async def ensure_database(db_engine: AsyncEngine) -> None:
 
     # Create NOTIFY trigger for instant message delivery
     async with AsyncSession(db_engine) as session:
-        await session.execute(
-            text("""
-                CREATE OR REPLACE FUNCTION notify_outbox_insert() RETURNS TRIGGER AS $$
-                BEGIN
-                    IF NEW.send_after <= NOW() THEN
-                        PERFORM pg_notify('outbox_channel', '');
-                    END IF;
-                    RETURN NEW;
-                END;
-                $$ LANGUAGE plpgsql
-            """)
-        )
-        await session.execute(text("DROP TRIGGER IF EXISTS outbox_notify_trigger ON outbox_table"))
-        await session.execute(
-            text("""
-                CREATE TRIGGER outbox_notify_trigger
-                    AFTER INSERT ON outbox_table
-                    FOR EACH ROW
-                    EXECUTE FUNCTION notify_outbox_insert()
-            """)
-        )
+        for notify_statement in notify_statements:
+            await session.execute(notify_statement)
         await session.commit()
 
-    _table_created = True
+    _table_created.add(str(db_engine.url))
 
 
 tracking_ids_contextvar: ContextVar[tuple[str, ...]] = ContextVar[tuple[str, ...]](

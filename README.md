@@ -139,6 +139,37 @@ This is significantly faster than calling `emitter.emit()` individually when dea
 </details>
 
 <details>
+    <summary><h3>Sync and async emit support</h3></summary>
+
+The `Emitter` supports both synchronous and asynchronous operations, allowing integration with legacy codebases that use blocking I/O:
+
+```python
+from outbox import Emitter
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+
+# Sync setup (for legacy codebases)
+db_engine = create_engine("postgresql+psycopg2://user:password@localhost/dbname")
+emitter = Emitter(db_engine=db_engine)
+
+with Session(db_engine) as session, session.begin():
+    session.add(User(id=123, username="johndoe"))
+    emitter.emit(session, "user.created", {"id": 123, "username": "johndoe"})
+```
+
+The `emit()` and `bulk_emit()` methods automatically detect whether you're using a sync `Session` or async `AsyncSession`. You can also use the explicit `emit_sync()`/`emit_async()` and `bulk_emit_sync()`/`bulk_emit_async()` methods.
+
+**Installation:** To use sync emits, install the `noasync` dependency group to add psycopg2:
+
+```bash
+uv pip install --group noasync
+```
+
+Note: `MessageRelay` and `Worker` remain async-only, as they are standalone processes designed for asynchronous operation.
+
+</details>
+
+<details>
     <summary><h3>Emit inside database transaction</h3></summary>
 
 You can (and should) call `emitter.emit` inside a database transaction. This way, data creation and triggering of side-effects will either succeed together or fail together. This is the main goal of the outbox pattern.
@@ -1162,24 +1193,30 @@ Class for emitting messages to the outbox table.
 
 **Constructor parameters:**
 
-- `db_engine_url`: A string that indicates database dialect and connection arguments. Will be passed to SQLAlchemy. Follows the pattern `postgresql+asyncpg://<username>:<password>@<host>:<port>/<db_name>`. Must use `asyncpg` for async PostgreSQL operations. Example: `postgresql+asyncpg://postgres:postgres@localhost:5432/postgres`
-- `db_engine`: If you already have a SQLAlchemy engine, you can pass it here instead of `db_engine_url` (you must pass either one or the other)
+- `db_engine_url`: A string that indicates database dialect and connection arguments. Will be passed to SQLAlchemy. For async: `postgresql+asyncpg://<username>:<password>@<host>:<port>/<db_name>`. For sync: `postgresql+psycopg2://<username>:<password>@<host>:<port>/<db_name>`. Example: `postgresql+asyncpg://postgres:postgres@localhost:5432/postgres`
+- `db_engine`: If you already have a SQLAlchemy engine, you can pass it here instead of `db_engine_url` (you must pass either one or the other). Accepts both `AsyncEngine` (async) and `Engine` (sync)
 - `expiration`: Default expiration time for messages in RabbitMQ. Defaults to `None` (no expiration)
 - `table_name`: Name of the outbox table to use. Defaults to `outbox_table`
 - `auto_create_table`: If `True`, the outbox table will be automatically created if it does not exist. Defaults to `False`
 
 **Methods:**
 
-- `emit(session, routing_key, body, *, expiration=None, eta=None)`: Emit a single message to the outbox table
-  - `session`: An async SQLAlchemy session
+- `emit(session, routing_key, body, *, expiration=None, eta=None)`: Emit a single message to the outbox table. Automatically detects sync vs async based on session type
+  - `session`: A SQLAlchemy session (`Session` for sync, `AsyncSession` for async)
   - `routing_key`: The routing key to use for the message
   - `body`: The body of the message. If it is an instance of a Pydantic model, it will be serialized by Pydantic, if it is bytes, it will be used as is, otherwise outbox will attempt to serialize it with `json.dumps`
   - `expiration`: The expiration time in seconds for the message. Overrides the default set in the constructor
   - `eta`: The time at which the message should be sent. Can be a `datetime`, a `timedelta` or an interval in milliseconds
 
-- `bulk_emit(session, messages)`: Emit multiple messages in a single database operation
-  - `session`: An async SQLAlchemy session
+- `emit_async(session, routing_key, body, *, expiration=None, eta=None)`: Async version of `emit()` (explicit)
+- `emit_sync(session, routing_key, body, *, expiration=None, eta=None)`: Sync version of `emit()` (explicit)
+
+- `bulk_emit(session, messages)`: Emit multiple messages in a single database operation. Automatically detects sync vs async based on session type
+  - `session`: A SQLAlchemy session (`Session` for sync, `AsyncSession` for async)
   - `messages`: A sequence of `OutboxMessage` instances
+
+- `bulk_emit_async(session, messages)`: Async version of `bulk_emit()` (explicit)
+- `bulk_emit_sync(session, messages)`: Sync version of `bulk_emit()` (explicit)
 
 #### `MessageRelay`
 
@@ -1261,10 +1298,6 @@ See [detailed benchmark results](src/benchmarks/README.md) for throughput scalin
 </details>
 
 ## TODOs
-
-### High priority
-
-- [ ] Ability to emit non-async
 
 ### Medium priority
 

@@ -1,11 +1,12 @@
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Generator
 
 import aio_pika
 import pytest
 import pytest_asyncio
 from aio_pika.abc import AbstractConnection
-from sqlalchemy import text
+from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
+from sqlalchemy.orm import Session
 from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from testcontainers.rabbitmq import RabbitMqContainer  # type: ignore[import-untyped]
 
@@ -23,9 +24,24 @@ async def db_engine() -> AsyncGenerator[AsyncEngine, None]:
         await engine.dispose()
 
 
+@pytest.fixture(scope="session")
+def db_engine_sync() -> Generator[Engine, None]:
+    with PostgresContainer("postgres:17.5-alpine") as postgres:
+        connection_url = postgres.get_connection_url()
+        engine = create_engine(connection_url)
+        yield engine
+        engine.dispose()
+
+
 @pytest_asyncio.fixture(loop_scope="session")
 async def session(db_engine: AsyncEngine) -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSession(db_engine) as session:
+        yield session
+
+
+@pytest.fixture(scope="session")
+def session_sync(db_engine_sync: Engine) -> Generator[Session]:
+    with Session(db_engine_sync) as session:
         yield session
 
 
@@ -47,7 +63,7 @@ def emitter(db_engine: AsyncEngine) -> Emitter:
 
 @pytest.fixture
 def emit(emitter: Emitter) -> EmitType:
-    return emitter.emit
+    return emitter.emit_async
 
 
 @pytest.fixture

@@ -1,8 +1,9 @@
 import json
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import Engine, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from outbox import Emitter, OutboxMessage
 from outbox.database import OutboxTable
@@ -17,6 +18,22 @@ async def test_emit(emit: EmitType, session: AsyncSession) -> None:
 
     # assert
     messages = (await session.execute(select(OutboxTable))).scalars().all()
+    assert len(messages) == 1
+    assert messages[0].routing_key == "test_routing_key"
+    assert messages[0].body == b'"test_body"'
+    assert messages[0].created_at is not None
+    assert messages[0].sent_at is None
+
+
+def test_emit_sync(db_engine_sync: Engine, session_sync: Session) -> None:
+    # setup
+    emitter = Emitter(db_engine=db_engine_sync, auto_create_table=True)
+
+    # act
+    emitter.emit_sync(session_sync, "test_routing_key", "test_body")
+
+    # assert
+    messages = (session_sync.execute(select(OutboxTable))).scalars().all()
     assert len(messages) == 1
     assert messages[0].routing_key == "test_routing_key"
     assert messages[0].body == b'"test_body"'

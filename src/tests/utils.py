@@ -1,6 +1,6 @@
 import asyncio
 from collections.abc import Sequence
-from typing import Any, Optional, Protocol
+from typing import Any, Awaitable, Optional, Protocol
 
 from aio_pika.abc import AbstractConnection, DateType
 from pydantic import BaseModel
@@ -14,15 +14,15 @@ class Person(BaseModel):
 
 
 class EmitType(Protocol):
-    async def __call__(
+    def __call__(
         self,
         session: AsyncSession,
         routing_key: str,
         body: Any,
         *,
-        expiration: DateType = None,
+        expiration: Optional[DateType] = None,
         eta: Optional[DateType] = None,
-    ) -> None: ...
+    ) -> Awaitable[None]: ...
 
 
 async def run_worker(worker: Worker, listeners: Sequence[Listener], timeout: float) -> None:

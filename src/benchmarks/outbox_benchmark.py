@@ -7,12 +7,12 @@ import time
 from typing import Generator, Optional, Union, cast
 
 import aio_pika
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from testcontainers.rabbitmq import RabbitMqContainer  # type: ignore[import-untyped]
 
 from outbox import Emitter, Listener, MessageRelay, OutboxMessage, Worker
-from outbox.utils import ensure_database
+from outbox.utils import ensure_database_async
 
 
 def _generate_batch_sizes(
@@ -95,7 +95,8 @@ async def benchmark(
         # Setup in main process (creates table)
         emitter = Emitter(db_engine_url=postgres_url, auto_create_table=True)
         assert emitter.db_engine is not None
-        await ensure_database(emitter.db_engine)
+        assert isinstance(emitter.db_engine, AsyncEngine)
+        await ensure_database_async(emitter.db_engine)
 
         # Start message relay processes
         print(f"Starting {relay_count} message relay process(es)...")

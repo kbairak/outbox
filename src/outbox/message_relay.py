@@ -14,7 +14,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
 from outbox.database import OutboxTable
-from outbox.utils import ensure_database
+from outbox.utils import ensure_database_async
 
 from .log import logger
 from .metrics import metrics
@@ -60,7 +60,7 @@ class MessageRelay:
         if self.db_engine is None:
             raise ValueError("Database engine is not set up.")
         if self.auto_create_table:
-            await ensure_database(self.db_engine)
+            await ensure_database_async(self.db_engine)
         if self.rmq_connection is None:
             if self.rmq_connection_url is not None:
                 self.rmq_connection = await aio_pika.connect_robust(self.rmq_connection_url)
