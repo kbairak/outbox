@@ -29,16 +29,16 @@ flowchart LR
 ```python
 import asyncio
 
-from outbox import setup, emit
-from sqlalchemy.ext.asyncio import create_async_engine
+from outbox import Emitter
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 
 db_engine = create_async_engine("postgresql+asyncpg://user:password@localhost/dbname")
-setup(db_engine=db_engine)
+emitter = Emitter(db_engine=db_engine)
 
 async def main():
     async with AsyncSession(db_engine) as session, session.begin():
         session.add(User(id=123, username="johndoe"))
-        await emit(session, "user.created", {"id": 123, "username": "johndoe"})
+        await emitter.emit(session, "user.created", {"id": 123, "username": "johndoe"})
 
 asyncio.run(main())
 ```
@@ -48,14 +48,14 @@ asyncio.run(main())
 ```python
 import asyncio
 
-from outbox import setup, message_relay
+from outbox import MessageRelay
 
-setup(
+message_relay = MessageRelay(
     db_engine_url="postgresql+asyncpg://user:password@localhost/dbname",
     rmq_connection_url="amqp://guest:guest@localhost:5672/",
 )
 
-asyncio.run(message_relay())
+asyncio.run(message_relay.run())
 ```
 
 ### Worker process
@@ -67,16 +67,19 @@ You can define handlers using either decorators or by creating `Listener` instan
 ```python
 import asyncio
 
-from outbox import setup, listen, worker
-
-setup(rmq_connection_url="amqp://guest:guest@localhost:5672/")
+from outbox import Worker, listen
 
 @listen("user.created")
 async def on_user_created(user):
     print(user)
     # <<< {"id": 123, "username": "johndoe"}
 
-asyncio.run(worker([on_user_created]))
+worker = Worker(
+    rmq_connection_url="amqp://guest:guest@localhost:5672/",
+    listeners=[on_user_created],
+)
+
+asyncio.run(worker.run())
 ```
 
 **Option 2: Using `Listener` directly:**
@@ -84,22 +87,23 @@ asyncio.run(worker([on_user_created]))
 ```python
 import asyncio
 
-from outbox import setup, Listener, worker
-
-setup(rmq_connection_url="amqp://guest:guest@localhost:5672/")
+from outbox import Worker, Listener
 
 async def on_user_created(user):
     print(user)
 
-handlers = [
-    Listener(
-        binding_key="user.created",
-        callback=on_user_created,
-        queue="analytics_service.on_user_created",  # optional, auto-generated if not provided
-    )
-]
+worker = Worker(
+    rmq_connection_url="amqp://guest:guest@localhost:5672/",
+    listeners=[
+        Listener(
+            binding_key="user.created",
+            callback=on_user_created,
+            queue="analytics_service.on_user_created",  # optional, auto-generated if not provided
+        )
+    ]
+)
 
-asyncio.run(worker(handlers))
+asyncio.run(worker.run())
 ```
 
 Both approaches are equivalent. The decorator is more concise, while the explicit `Listener` instantiation gives you more control and makes it clear which handlers are registered. Essentially, these are identical:
@@ -114,10 +118,12 @@ listen("binding_key", ...)(callback)
 <details>
     <summary><h3>Bulk emit for high throughput</h3></summary>
 
-For performance-critical scenarios where you need to emit many messages at once, use `bulk_emit()` to insert multiple messages in a single database operation:
+For performance-critical scenarios where you need to emit many messages at once, use `emitter.bulk_emit()` to insert multiple messages in a single database operation:
 
 ```python
-from outbox import OutboxMessage, bulk_emit
+from outbox import Emitter, OutboxMessage
+
+emitter = Emitter(db_engine=db_engine)
 
 async with AsyncSession(db_engine) as session, session.begin():
     messages = [
@@ -125,22 +131,22 @@ async with AsyncSession(db_engine) as session, session.begin():
         OutboxMessage(routing_key="user.created", body={"id": 2, "username": "bob"}),
         OutboxMessage(routing_key="order.placed", body={"order_id": 456}),
     ]
-    await bulk_emit(session, messages)
+    await emitter.bulk_emit(session, messages)
 ```
 
-This is significantly faster than calling `emit()` individually when dealing with large batches of messages.
+This is significantly faster than calling `emitter.emit()` individually when dealing with large batches of messages.
 
 </details>
 
 <details>
     <summary><h3>Emit inside database transaction</h3></summary>
 
-You can (and should) call `emit` inside a database transaction. This way, data creation and triggering of side-effects will either succeed together or fail together. This is the main goal of the outbox pattern.
+You can (and should) call `emitter.emit` inside a database transaction. This way, data creation and triggering of side-effects will either succeed together or fail together. This is the main goal of the outbox pattern.
 
 ```python
 async with AsyncSession(db_engine) as session, session.begin():
     session.add(User(id=123, username="johndoe"))
-    await emit(session, "user.created", {"id": 123, "username": "johndoe"})
+    await emitter.emit(session, "user.created", {"id": 123, "username": "johndoe"})
     # commit not needed because of `session.begin()`
 ```
 
@@ -164,10 +170,7 @@ You can control retry behavior by configuring `retry_delays` - a sequence of del
 Configure retry delays at two levels, with per-listener overriding global:
 
 ```python
-from outbox import setup, emit, listen, Reject
-
-# Global default for all listeners
-setup(..., retry_delays=(1, 10, 60, 300))
+from outbox import Worker, listen, Reject
 
 # Per-listener override
 @listen("user.created", retry_delays=(5, 30))  # Only 2 retries with these delays
@@ -181,13 +184,16 @@ async def on_user_created(user):
 @listen("user.deleted", retry_delays=())  # No retries - straight to DLQ on failure
 async def on_user_deleted(user):
     pass  # Failures go directly to DLQ
+
+# Global default for all listeners
+worker = Worker(retry_delays=(1, 10, 60, 300), ...)
 ```
 
 **Special cases:**
 
 - **Empty retry_delays (`()`)**: No retries - failures send message directly to dead-letter queue. Useful when you want failures to be handled manually.
 - **`Reject` exception**: Sends message directly to dead-letter queue, bypassing all retries. Same effect as raising any exception with `retry_delays=()`.
-- **Message expiration**: You can still set `expiration` during `emit()` to limit total processing time regardless of retries.
+- **Message expiration**: You can still set `expiration` during `emitter.emit()` to limit total processing time regardless of retries.
 
 **Dead-letter queues:**
 
@@ -228,15 +234,15 @@ from collections.abc import Sequence
 
 async def entrypoint():
     async with AsyncSession(db_engine) as session:
-        await emit(session, "user.created", {"id": 123, "username": "johndoe"})
+        await emitter.emit(session, "user.created", {"id": 123, "username": "johndoe"})
         await session.commit()
 
 @listen("user.created")
 async def on_user_created(user, tracking_ids: Sequence[str]):
     logger.info(f"User created {user.id}, tracking IDs: {tracking_ids}")
     async with AsyncSession(db_engine) as session:
-        await emit(session, "user.welcome_email", {"id": user.id})
-        await emit(session, "user.created_notification", {"id": user.id})
+        await emitter.emit(session, "user.welcome_email", {"id": user.id})
+        await emitter.emit(session, "user.created_notification", {"id": user.id})
         await session.commit()
 
 @listen("user.welcome_email")
@@ -256,13 +262,15 @@ Welcome email sent for user 123, tracking IDs: ['uuid1', 'uuid2']
 Notification created for user 123, tracking IDs: ['uuid1', 'uuid3']
 ```
 
-If you want to include a UUID for the entrypoint as well, you have to wrap your initial emits (or the entire entrypoint) with `with outbox.tracking():`
+If you want to include a UUID for the entrypoint as well, you have to wrap your initial emits (or the entire entrypoint) with `tracking()`:
 
 ```python
+from outbox import tracking
+
 async def entrypoint():
-    with outbox.tracking():
+    with tracking():
         async with AsyncSession(db_engine) as session:
-            await emit(session, "user.created", {"id": 123, "username": "johndoe"})
+            await emitter.emit(session, "user.created", {"id": 123, "username": "johndoe"})
             await session.commit()
 ```
 
@@ -377,11 +385,11 @@ You must have exactly **one** argument that doesn't meet the above criteria, whi
 <details>
     <summary><h3>Delayed execution</h3></summary>
 
-You can cause an event to be sent some time in the future by setting the `eta` argument during `emit`:
+You can cause an event to be sent some time in the future by setting the `eta` argument during `emitter.emit()`:
 
 ```python
 async with AsyncSession(db_engine) as session:
-    await emit(
+    await emitter.emit(
         session,
         "user.created",
         {"id": 123, "username": "johndoe"},
@@ -402,7 +410,7 @@ class User(BaseModel):
 
 # Main application
 async with AsyncSession(db_engine) as session:
-    await emit(session, "user.created", User(id=123, username="johndoe"))
+    await emitter.emit(session, "user.created", User(id=123, username="johndoe"))
     await session.commit()
 
 # Worker process
@@ -417,10 +425,14 @@ async def on_user_created(user: User):  # inspects type annotation
 <details>
     <summary><h3>Outbox table cleanup</h3></summary>
 
-You can choose a strategy for when already sent messages from the outbox table should be cleaned up by passing the `clean_up_after` argument during setup:
+You can choose a strategy for when already sent messages from the outbox table should be cleaned up by passing the `clean_up_after` argument to the MessageRelay constructor:
 
 ```python
-setup(..., clean_up_after=datetime.timedelta(days=7))
+message_relay = MessageRelay(
+    db_engine_url="...",
+    rmq_connection_url="...",
+    clean_up_after=datetime.timedelta(days=7)
+)
 ```
 
 The options are:
@@ -567,7 +579,7 @@ For production, `logging.INFO` is recommended so you can track message flow with
 <details>
     <summary><h3>Database setup</h3></summary>
 
-If you pass `auto_create_table=True` to `setup`, then the library will automatically get-or-create the outbox table before it's needed (before emitting and during the message relay). This is fine for development environments or if your policies around the database are not particularly strict. If you want better control of your database, you can leave `auto_create_table=False`, which is the default, and do this:
+If you pass `auto_create_table=True` to the `Emitter` or `MessageRelay` constructors, then the library will automatically get-or-create the outbox table before it's needed (before emitting and during the message relay). This is fine for development environments or if your policies around the database are not particularly strict. If you want better control of your database, you can leave `auto_create_table=False`, which is the default, and do this:
 
 #### Using Alembic
 
@@ -693,7 +705,7 @@ CREATE TRIGGER outbox_notify_trigger
 
 The library uses `aio_pika.connect_robust()` for RabbitMQ connections, which provides automatic reconnection with full state recovery (queues, exchanges, bindings, and consumers). If RabbitMQ restarts or network issues occur, connections automatically recover without manual intervention.
 
-For additional control over connection resilience, you can pass connection objects directly to `setup()`:
+For additional control over connection resilience, you can pass connection objects directly to the class constructors:
 
 **PostgreSQL - Configure connection pooling:**
 
@@ -708,7 +720,8 @@ db_engine = create_async_engine(
     max_overflow=10,           # Max connections beyond pool_size
 )
 
-setup(db_engine=db_engine)
+emitter = Emitter(db_engine=db_engine)
+message_relay = MessageRelay(db_engine=db_engine, rmq_connection_url="...")
 ```
 
 **Key parameters:**
@@ -727,7 +740,8 @@ rmq_connection = await aio_pika.connect_robust(
     heartbeat=30,              # Send heartbeats every 30 seconds (default: 60)
 )
 
-setup(rmq_connection=rmq_connection)
+message_relay = MessageRelay(db_engine=db_engine, rmq_connection=rmq_connection)
+worker = Worker(rmq_connection=rmq_connection, ...)
 ```
 
 Heartbeats detect dead connections and trigger automatic reconnection. The default timeout (60s) works for most cases, but you can adjust it based on your network reliability
@@ -741,7 +755,7 @@ Outbox provides optional Prometheus metrics for monitoring message flow and perf
 
 ```python
 from prometheus_client import start_http_server, Counter
-from outbox import Outbox
+from outbox import MessageRelay, Worker
 
 # Your application metrics
 my_counter = Counter('my_app_requests_total', 'Total requests')
@@ -750,10 +764,14 @@ my_counter = Counter('my_app_requests_total', 'Total requests')
 start_http_server(9090)
 
 # Outbox metrics are automatically included
-outbox = Outbox(
+message_relay = MessageRelay(
+    db_engine_url="...",
+    rmq_connection_url="...",
     enable_metrics=True,  # Default is True
     exchange_name="orders",
 )
+
+worker = Worker(enable_metrics=True, ...)  # Default is True
 
 # Both your metrics and outbox metrics are served at :9090/metrics
 ```
@@ -777,7 +795,8 @@ outbox = Outbox(
 #### Disabling Metrics
 
 ```python
-outbox = Outbox(enable_metrics=False)
+message_relay = MessageRelay(enable_metrics=False, ...)
+worker = Worker(enable_metrics=False, ...)
 ```
 
 </details>
@@ -852,7 +871,7 @@ provider "rabbitmq" {
 # Variables for configuration
 locals {
   exchange_name = "outbox"
-  retry_delays  = [1, 10, 60, 300]  # Must match your setup(retry_delays=...)
+  retry_delays  = [1, 10, 60, 300]  # Must match your Worker(retry_delays=...)
 
   listeners = [
     {
@@ -865,7 +884,7 @@ locals {
 
 **Important notes:**
 
-1. **Sync retry_delays**: The `local.retry_delays` list in Terraform **must match** your `setup(retry_delays=...)` in Python
+1. **Sync retry_delays**: The `local.retry_delays` list in Terraform **must match** your `Worker(retry_delays=...)` in Python
 2. **Sync listener queues**: The `local.listeners` list must include all your `@listen()` decorators
 3. **Queue naming**: Use explicit `queue="..."` in `@listen()` to avoid auto-generated names that are hard to predict
 
@@ -1137,47 +1156,84 @@ The library's declarative approach (`declare_exchange`/`declare_queue`) means:
 <details>
     <summary><h3>API</h3></summary>
 
-#### `setup()`
+#### `Emitter`
+
+Class for emitting messages to the outbox table.
+
+**Constructor parameters:**
 
 - `db_engine_url`: A string that indicates database dialect and connection arguments. Will be passed to SQLAlchemy. Follows the pattern `postgresql+asyncpg://<username>:<password>@<host>:<port>/<db_name>`. Must use `asyncpg` for async PostgreSQL operations. Example: `postgresql+asyncpg://postgres:postgres@localhost:5432/postgres`
 - `db_engine`: If you already have a SQLAlchemy engine, you can pass it here instead of `db_engine_url` (you must pass either one or the other)
+- `expiration`: Default expiration time for messages in RabbitMQ. Defaults to `None` (no expiration)
+- `table_name`: Name of the outbox table to use. Defaults to `outbox_table`
+- `auto_create_table`: If `True`, the outbox table will be automatically created if it does not exist. Defaults to `False`
+
+**Methods:**
+
+- `emit(session, routing_key, body, *, expiration=None, eta=None)`: Emit a single message to the outbox table
+  - `session`: An async SQLAlchemy session
+  - `routing_key`: The routing key to use for the message
+  - `body`: The body of the message. If it is an instance of a Pydantic model, it will be serialized by Pydantic, if it is bytes, it will be used as is, otherwise outbox will attempt to serialize it with `json.dumps`
+  - `expiration`: The expiration time in seconds for the message. Overrides the default set in the constructor
+  - `eta`: The time at which the message should be sent. Can be a `datetime`, a `timedelta` or an interval in milliseconds
+
+- `bulk_emit(session, messages)`: Emit multiple messages in a single database operation
+  - `session`: An async SQLAlchemy session
+  - `messages`: A sequence of `OutboxMessage` instances
+
+#### `MessageRelay`
+
+Class for relaying messages from the outbox table to RabbitMQ.
+
+**Constructor parameters:**
+
+- `db_engine_url`: Database connection string (same as Emitter)
+- `db_engine`: SQLAlchemy engine (same as Emitter)
 - `rmq_connection_url`: A string that indicates RabbitMQ connection parameters. Follows the pattern `amqp[s]://<username>:<password>@<host>:(<port>)/(virtualhost)`. Example: `amqp://guest:guest@localhost:5672/`
 - `rmq_connection`: If you already have a aio-pika connection, you can pass it here instead of `rmq_connection_url` (you must pass either one or the other)
 - `exchange_name`: Name of the RabbitMQ exchange to use. Defaults to `outbox`
 - `notification_timeout`: Maximum time (in seconds) to wait for a PostgreSQL NOTIFY before checking for scheduled messages. Acts as a safety timeout. Defaults to `60` seconds
-- `expiration`: Expiration time in seconds for messages in RabbitMQ. Defaults to `None` (no expiration)
-- `clean_up_after`: How long to keep messages in the outbox table after they are sent. Can be `IMMEDIATELY`, `NEVER`, or a `timedelta`
-- `retry_delays`: Default retry delays (in seconds) for all listeners. A sequence of delay times for exponential backoff. Defaults to `(1, 10, 60, 300)` (1s, 10s, 1m, 5m). Set to `()` for unlimited immediate retries.
-- `table_name`: Name of the outbox table to use. Defaults to `outbox_table`
-- `prefetch_count`: Number of messages to prefetch from RabbitMQ for each listener. Defaults to `10`
+- `expiration`: Default expiration time for messages (same as Emitter)
+- `clean_up_after`: How long to keep messages in the outbox table after they are sent. Can be `IMMEDIATELY`, `NEVER`, or a `timedelta`. Defaults to `IMMEDIATELY`
+- `table_name`: Name of the outbox table (same as Emitter)
 - `batch_size`: Number of messages to fetch and publish concurrently in each batch from the outbox table. Defaults to `50`. Higher values improve throughput but increase transaction duration and memory usage. Set to `1` for sequential processing.
-- `auto_create_table`: If `True`, the outbox table will be automatically created if it does not exist. Defaults to `False`
+- `auto_create_table`: Auto-create table if missing (same as Emitter)
+- `enable_metrics`: Enable Prometheus metrics. Defaults to `True`
 
-#### `emit()`
+**Methods:**
 
-Positional arguments:
+- `run()`: Start the message relay loop. Blocks until interrupted.
 
-- `session`: An async SQLAlchemy session that is used to emit the message
-- `routing_key`: The routing key to use for the message
-- `body`: The body of the message. If it is an instance of a Pydantic model, it will be serialized by Pydantic, if it is bytes, it will be used as is, otherwise outbox will attempt to serialize it with `json.dumps`
+#### `Worker`
 
-Keyword-only arguments:
+Class for consuming messages from RabbitMQ and dispatching them to listeners.
 
-- `expiration`: The expiration time in seconds for the message. Overrides the default set during `setup`
-- `eta`: The time at which the message should be sent. Can be a `datetime`, a `timedelta` or an interval in milliseconds
+**Constructor parameters:**
+
+- `rmq_connection_url`: RabbitMQ connection string (same as MessageRelay)
+- `rmq_connection`: aio-pika connection object (same as MessageRelay)
+- `exchange_name`: Name of the RabbitMQ exchange (same as MessageRelay)
+- `retry_delays`: Default retry delays (in seconds) for all listeners. A sequence of delay times for exponential backoff. Defaults to `(1, 10, 60, 300)` (1s, 10s, 1m, 5m). Set to `()` for no retries.
+- `prefetch_count`: Number of messages to prefetch from RabbitMQ for each listener. Defaults to `10`
+- `enable_metrics`: Enable Prometheus metrics. Defaults to `True`
+- `listeners`: A sequence of `Listener` instances to consume messages for. Defaults to `()`
+
+**Methods:**
+
+- `run()`: Start the worker consuming messages. Blocks until SIGINT/SIGTERM is received.
 
 #### `listen()`
 
 A decorator that creates a `Listener` instance from a function.
 
-Positional arguments:
+**Positional arguments:**
 
 - `binding_key`: The binding key to use for the listener. Supports wildcards, e.g. `user.*` will match `user.created`, `user.updated`, etc, according to RabbitMQ's topic exchange rules
 
-Keyword-only arguments:
+**Keyword-only arguments:**
 
 - `queue`: The name of the queue to use for the listener. If not provided (empty string), a name based on the callback's module and qualname will be auto-generated
-- `retry_delays`: Retry delays (in seconds) for this listener. Overrides the default set during `setup`. Set to `()` for unlimited immediate retries.
+- `retry_delays`: Retry delays (in seconds) for this listener. Overrides the Worker's default retry_delays. Set to `()` for no retries.
 
 Returns a `Listener` instance that is also callable (delegates to the original function).
 
@@ -1185,22 +1241,14 @@ Returns a `Listener` instance that is also callable (delegates to the original f
 
 A dataclass representing a message handler.
 
-Fields:
+**Fields:**
 
 - `binding_key`: The binding key pattern to match messages against
 - `callback`: The async function to call when a message is received
 - `queue`: The queue name (auto-generated from callback if empty string)
-- `retry_delays`: Retry delays in seconds for this listener (None means use global default)
+- `retry_delays`: Retry delays in seconds for this listener (None means use Worker's default)
 
 The `Listener` instance is callable and will delegate to the `callback` function, making it transparent for testing.
-
-#### `worker()`
-
-Positional arguments:
-
-- `listeners`: A sequence of `Listener` instances to consume messages for
-
-Starts the worker that consumes messages from RabbitMQ and dispatches them to the appropriate listeners. Blocks until SIGINT/SIGTERM is received.
 
 </details>
 
@@ -1212,68 +1260,6 @@ The outbox pattern scales according to your needs - from ~3,500 msgs/sec with a 
 See [detailed benchmark results](src/benchmarks/README.md) for throughput scaling, parameter tuning recommendations, and Celery comparison.
 </details>
 
-<details>
-    <summary><h3>Singleton vs multiple instances</h3></summary>
-
-> You likely will not have to be aware of this feature, but it was useful for developing unit-tests for this library.
-
-This library has been implemented in such a way that you can run single or multiple outbox setups. Most use-cases will use the singleton approach:
-
-```python
-from outbox import setup, emit
-
-db_engine = create_async_engine("postgresql+asyncpg://user:password@localhost/dbname")
-setup(db_engine=db_engine)
-
-async def main():
-    async with AsyncSession(db_engine) as session:
-        await emit(session, "user.created", {"id": 123, "username": "johndoe"})
-        await session.commit()
-
-asyncio.run(main())
-```
-
-or
-
-```python
-from outbox import outbox
-
-db_engine = create_async_engine("postgresql+asyncpg://user:password@localhost/dbname")
-outbox.setup(db_engine=db_engine)
-
-async def main():
-    async with AsyncSession(db_engine) as session:
-        await outbox.emit(session, "user.created", {"id": 123, "username": "johndoe"})
-        await session.commit()
-
-asyncio.run(main())
-```
-
-You can, however, setup multiple instances:
-
-```python
-from outbox import Outbox
-
-db_engine1 = create_async_engine("postgresql+asyncpg://user:password@localhost/dbname1")
-db_engine2 = create_async_engine("postgresql+asyncpg://user:password@localhost/dbname2")
-
-outbox1 = Outbox(db_engine=db_engine1)
-outbox2 = Outbox(db_engine=db_engine2)
-
-async def main():
-    async with AsyncSession(db_engine1) as session:
-        await outbox1.emit(session, "user.created", {"id": 123, "username": "johndoe"})
-        await session.commit()
-    async with AsyncSession(db_engine2) as session:
-        await outbox2.emit(session, "user.created", {"id": 456, "username": "maryjane"})
-        await session.commit()
-
-asyncio.run(main())
-```
-
-The whole approach is explained [in this blog post](https://www.kbairak.net/programming/python/2020/09/16/global-singleton-vs-instance-for-libraries.html).
-</details>
-
 ## TODOs
 
 ### High priority
@@ -1283,7 +1269,7 @@ The whole approach is explained [in this blog post](https://www.kbairak.net/prog
 ### Medium priority
 
 - [ ] Better/more error messages
-- [ ] Make tests faster
+- [ ] Make tests faster (support ms delays?)
 - [ ] Split readme into features/best practices
 
 ### Low priority

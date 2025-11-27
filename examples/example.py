@@ -6,7 +6,7 @@ from prometheus_client import start_http_server
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
-from outbox import emit, listen, message_relay, setup, worker
+from outbox import Emitter, MessageRelay, Worker, listen
 
 logging.getLogger("outbox").setLevel(logging.DEBUG)
 
@@ -14,11 +14,12 @@ start_http_server(8000)
 
 db_engine = create_async_engine("postgresql+asyncpg://postgres:postgres@localhost/postgres")
 
-setup(
+emitter = Emitter(db_engine=db_engine, auto_create_table=True)
+
+message_relay = MessageRelay(
     db_engine=db_engine,
     rmq_connection_url="amqp://guest:guest@localhost:5672/",
     auto_create_table=True,
-    retry_delays=(1, 2, 3),
 )
 
 
@@ -57,10 +58,13 @@ async def on_user_deleted(user: User, routing_key: str) -> None:
 
 
 async def main() -> None:
-    message_relay_task = asyncio.create_task(message_relay())
-    worker_task = asyncio.create_task(
-        worker((on_user_event, on_user_created, on_user_updated, on_user_deleted))
+    message_relay_task = asyncio.create_task(message_relay.run())
+    worker = Worker(
+        rmq_connection_url="amqp://guest:guest@localhost:5672/",
+        listeners=(on_user_event, on_user_created, on_user_updated, on_user_deleted),
+        retry_delays=(1, 2, 3),
     )
+    worker_task = asyncio.create_task(worker.run())
 
     user = User(username="johndoe", first_name="John", last_name="Doe")
     try:
@@ -78,7 +82,7 @@ async def main() -> None:
                 continue
 
             async with AsyncSession(db_engine) as session, session.begin():
-                await emit(session, routing_key, user)
+                await emitter.emit(session, routing_key, user)
     except EOFError:
         pass
     finally:

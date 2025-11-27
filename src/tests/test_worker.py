@@ -1,154 +1,15 @@
 import asyncio
 import itertools
-import json
 import uuid
 from collections.abc import Sequence
-from unittest.mock import AsyncMock
 
-import aio_pika
 import pytest
-from sqlalchemy import select
+from aio_pika.abc import AbstractConnection
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from outbox import Outbox, OutboxMessage, OutboxTable, Reject, listen
+from outbox import Listener, MessageRelay, Reject, Worker, get_tracking_ids, listen, tracking
 
 from .utils import EmitType, Person, get_dlq_message_count, run_worker
-
-
-@pytest.mark.asyncio(loop_scope="session")
-async def test_emit(emit: EmitType, session: AsyncSession) -> None:
-    # test
-    await emit(session, "test_routing_key", "test_body")
-
-    # assert
-    messages = (await session.execute(select(OutboxTable))).scalars().all()
-    assert len(messages) == 1
-    assert messages[0].routing_key == "test_routing_key"
-    assert messages[0].body == b'"test_body"'
-    assert messages[0].created_at is not None
-    assert messages[0].sent_at is None
-
-
-@pytest.mark.asyncio(loop_scope="session")
-async def test_bulk_emit(outbox: Outbox, session: AsyncSession) -> None:
-    # test
-    messages = [
-        OutboxMessage(routing_key="test_key_1", body="test_body_1"),
-        OutboxMessage(routing_key="test_key_2", body="test_body_2"),
-    ]
-    await outbox.bulk_emit(session, messages)
-    await session.commit()
-
-    # assert
-    rows = (await session.execute(select(OutboxTable))).scalars().all()
-    assert len(rows) == 2
-    assert rows[0].routing_key == "test_key_1"
-    assert rows[0].body == b'"test_body_1"'
-    assert rows[0].created_at is not None
-    assert rows[0].sent_at is None
-    assert rows[1].routing_key == "test_key_2"
-    assert rows[1].body == b'"test_body_2"'
-    assert rows[1].created_at is not None
-    assert rows[1].sent_at is None
-
-
-@pytest.mark.asyncio(loop_scope="session")
-async def test_emit_with_pydantic(emit: EmitType, session: AsyncSession) -> None:
-    # test
-    await emit(session, "my_routing_key", Person(name="MyName"))
-
-    # assert
-    messages = (await session.execute(select(OutboxTable))).scalars().all()
-    assert len(messages) == 1
-    assert messages[0].routing_key == "my_routing_key"
-    assert json.loads(messages[0].body) == {"name": "MyName"}
-    assert messages[0].created_at is not None
-    assert messages[0].sent_at is None
-
-
-@pytest.mark.asyncio(loop_scope="session")
-async def test_message_relay(
-    emit: EmitType,
-    outbox: Outbox,
-    monkeypatch: pytest.MonkeyPatch,
-    session: AsyncSession,
-) -> None:
-    # arrange
-    rmq_connection_mock = AsyncMock(name="rmq_connection")
-
-    async def _get_rmq_connection() -> AsyncMock:
-        return rmq_connection_mock
-
-    monkeypatch.setattr(outbox, "_get_rmq_connection", _get_rmq_connection)
-    rmq_connection_mock.channel.return_value = (channel_mock := AsyncMock(name="channel"))
-    channel_mock.declare_exchange.return_value = (exchange_mock := AsyncMock(name="exchange"))
-
-    await emit(session, "test_routing_key", "test_body")
-    await session.commit()
-
-    # test
-    await outbox._consume_outbox_table()
-
-    # assert
-    rmq_connection_mock.channel.assert_called_once_with()
-    channel_mock.declare_exchange.assert_called_once_with(
-        "outbox", aio_pika.ExchangeType.TOPIC, durable=True
-    )
-    assert exchange_mock.publish.call_count == 1
-    actual_message = exchange_mock.publish.mock_calls[0].args[0]
-    assert actual_message.body == b'"test_body"'
-    assert actual_message.body_size == 11
-    assert actual_message.content_type == "application/json"
-
-    message = (await session.execute(select(OutboxTable))).scalars().one()
-    assert message.sent_at is not None
-
-
-@pytest.mark.asyncio(loop_scope="session")
-async def test_message_relay_batch(
-    emit: EmitType,
-    outbox: Outbox,
-    monkeypatch: pytest.MonkeyPatch,
-    session: AsyncSession,
-) -> None:
-    # arrange
-    outbox.setup(batch_size=2)
-
-    rmq_connection_mock = AsyncMock(name="rmq_connection")
-
-    async def _get_rmq_connection() -> AsyncMock:
-        return rmq_connection_mock
-
-    monkeypatch.setattr(outbox, "_get_rmq_connection", _get_rmq_connection)
-    rmq_connection_mock.channel.return_value = (channel_mock := AsyncMock(name="channel"))
-    channel_mock.declare_exchange.return_value = (exchange_mock := AsyncMock(name="exchange"))
-
-    await emit(session, "test_routing_key_1", "test_body_1")
-    await emit(session, "test_routing_key_2", "test_body_2")
-    await emit(session, "test_routing_key_3", "test_body_3")
-    await session.commit()
-
-    # act - process one batch
-    count = await outbox._consume_outbox_batch(exchange_mock, session)
-
-    # assert - batch_size=2 means exactly 2 messages processed
-    assert count == 2
-    assert len(exchange_mock.publish.mock_calls) == 2
-    assert exchange_mock.publish.mock_calls[0].args[0].body == b'"test_body_1"'
-    assert exchange_mock.publish.mock_calls[0].args[1] == "test_routing_key_1"
-    assert exchange_mock.publish.mock_calls[1].args[0].body == b'"test_body_2"'
-    assert exchange_mock.publish.mock_calls[1].args[1] == "test_routing_key_2"
-
-    await session.commit()
-
-    # assert - 2 messages marked as sent, 1 still pending
-    messages = (
-        (await session.execute(select(OutboxTable).order_by(OutboxTable.id))).scalars().all()
-    )
-    assert len(messages) == 3
-    assert messages[0].sent_at is not None  # First message sent
-    assert messages[1].sent_at is not None  # Second message sent
-    assert messages[2].sent_at is None  # Third message still pending
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -166,7 +27,9 @@ async def test_register_listener() -> None:
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_worker(emit: EmitType, session: AsyncSession, outbox: Outbox) -> None:
+async def test_worker(
+    emit: EmitType, session: AsyncSession, message_relay: MessageRelay, worker: Worker
+) -> None:
     # arrange
     callcount = 0
     retrieved_argument = None
@@ -179,19 +42,26 @@ async def test_worker(emit: EmitType, session: AsyncSession, outbox: Outbox) -> 
 
     await emit(session, "routing_key", {"name": "MyName"})
     await session.commit()
-    await outbox._set_up_queues([handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=0.2)
+    await run_worker(worker, [handler], timeout=0.2)
 
     # assert
     assert callcount == 1
     assert retrieved_argument == {"name": "MyName"}
 
+    # reset
+    worker.listeners = prev_listeners
+
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_worker_with_pydantic(emit: EmitType, session: AsyncSession, outbox: Outbox) -> None:
+async def test_worker_with_pydantic(
+    emit: EmitType, session: AsyncSession, worker: Worker, message_relay: MessageRelay
+) -> None:
     # arrange
     callcount = 0
     retrieved_argument = None
@@ -204,19 +74,26 @@ async def test_worker_with_pydantic(emit: EmitType, session: AsyncSession, outbo
 
     await emit(session, "routing_key", Person(name="MyName"))
     await session.commit()
-    await outbox._set_up_queues([handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=0.2)
+    await run_worker(worker, [handler], timeout=0.2)
 
     # assert
     assert callcount == 1
     assert retrieved_argument == Person(name="MyName")
 
+    # reset
+    worker.listeners = prev_listeners
+
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_worker_with_wildcard(emit: EmitType, outbox: Outbox, session: AsyncSession) -> None:
+async def test_worker_with_wildcard(
+    emit: EmitType, worker: Worker, message_relay: MessageRelay, session: AsyncSession
+) -> None:
     # arrange
     callcount = 0
     retrieved_routing_key = None
@@ -231,20 +108,27 @@ async def test_worker_with_wildcard(emit: EmitType, outbox: Outbox, session: Asy
 
     await emit(session, "routing_key.foo", {"name": "MyName"})
     await session.commit()
-    await outbox._set_up_queues([handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=0.2)
+    await run_worker(worker, [handler], timeout=0.2)
 
     # assert
     assert callcount == 1
     assert retrieved_routing_key == "routing_key.foo"
     assert retrieved_argument == {"name": "MyName"}
 
+    # reset
+    worker.listeners = prev_listeners
+
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_retry(emit: EmitType, outbox: Outbox, session: AsyncSession) -> None:
+async def test_retry(
+    emit: EmitType, worker: Worker, message_relay: MessageRelay, session: AsyncSession
+) -> None:
     # arrange
     callcount = 0
     retrieved_argument = None
@@ -259,19 +143,26 @@ async def test_retry(emit: EmitType, outbox: Outbox, session: AsyncSession) -> N
 
     await emit(session, "routing_key", {"name": "MyName"})
     await session.commit()
-    await outbox._set_up_queues([handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=3.0)
+    await run_worker(worker, [handler], timeout=3.0)
 
     # assert
     assert callcount == 3
     assert retrieved_argument == {"name": "MyName"}
 
+    # reset
+    worker.listeners = prev_listeners
+
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_instant_retry(emit: EmitType, outbox: Outbox, session: AsyncSession) -> None:
+async def test_instant_retry(
+    emit: EmitType, worker: Worker, message_relay: MessageRelay, session: AsyncSession
+) -> None:
     """Test that delay=0 uses nack(requeue=True) for instant retries."""
     # arrange
     callcount = 0
@@ -287,21 +178,29 @@ async def test_instant_retry(emit: EmitType, outbox: Outbox, session: AsyncSessi
 
     await emit(session, "routing_key", {"name": "InstantRetry"})
     await session.commit()
-    await outbox._set_up_queues([handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test - first two retries should be instant (delay=0), third has 1s delay
-    await run_worker(outbox, [handler], timeout=2.0)
+    await run_worker(worker, [handler], timeout=2.0)
 
     # assert - should succeed after 2 instant retries + 1 delayed retry
     assert callcount == 4
     assert retrieved_argument == {"name": "InstantRetry"}
 
+    # reset
+    worker.listeners = prev_listeners
+
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_no_retry_with_setup(emit: EmitType, outbox: Outbox, session: AsyncSession) -> None:
+async def test_no_retry_with_setup(
+    emit: EmitType, worker: Worker, message_relay: MessageRelay, session: AsyncSession
+) -> None:
     # arrange
-    outbox.setup(retry_delays=(), auto_create_table=True, enable_metrics=False)
+    prev_retry_delays = worker.retry_delays
+    worker.retry_delays = ()
     callcount = 0
     retrieved_argument = None
 
@@ -315,19 +214,27 @@ async def test_no_retry_with_setup(emit: EmitType, outbox: Outbox, session: Asyn
 
     await emit(session, "routing_key", {"name": "MyName"})
     await session.commit()
-    await outbox._set_up_queues([handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=0.2)
+    await run_worker(worker, [handler], timeout=0.2)
 
     # assert
     assert callcount == 1
     assert retrieved_argument is None
 
+    # reset
+    worker.listeners = prev_listeners
+    worker.retry_delays = prev_retry_delays
+
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_no_retry_with_listen(emit: EmitType, outbox: Outbox, session: AsyncSession) -> None:
+async def test_no_retry_with_listen(
+    emit: EmitType, worker: Worker, message_relay: MessageRelay, session: AsyncSession
+) -> None:
     # arrange
     callcount = 0
     retrieved_argument = None
@@ -342,77 +249,102 @@ async def test_no_retry_with_listen(emit: EmitType, outbox: Outbox, session: Asy
 
     await emit(session, "routing_key", {"name": "MyName"})
     await session.commit()
-    await outbox._set_up_queues([handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=0.2)
+    await run_worker(worker, [handler], timeout=0.2)
 
     # assert
     assert callcount == 1
+
+    # reset
+    worker.listeners = prev_listeners
     assert retrieved_argument is None
 
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_no_retry_with_empty_delays_setup(
-    emit: EmitType, session: AsyncSession, outbox: Outbox
+    emit: EmitType,
+    session: AsyncSession,
+    worker: Worker,
+    message_relay: MessageRelay,
+    rmq_connection: AbstractConnection,
 ) -> None:
     # arrange - empty retry_delays means no retries, go to DLQ
-    outbox.setup(retry_delays=(), auto_create_table=True, enable_metrics=False)
+    prev_retry_delays = worker.retry_delays
+    worker.retry_delays = ()
     callcount = 0
 
     @listen("routing_key", queue="test_no_retry_with_empty_delays_setup_queue")
-    async def handler(person: object) -> None:
+    async def handler(_: object) -> None:
         nonlocal callcount
         callcount += 1
         raise Exception("Simulated failure")
 
     await emit(session, "routing_key", {"name": "MyName"})
     await session.commit()
-    await outbox._set_up_queues([handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=0.2)
+    await run_worker(worker, [handler], timeout=0.2)
 
     # assert - only 1 attempt, then goes to DLQ
     assert callcount == 1
     assert (
-        await get_dlq_message_count(outbox, "test_no_retry_with_empty_delays_setup_queue")
+        await get_dlq_message_count(rmq_connection, "test_no_retry_with_empty_delays_setup_queue")
     ) == 1
+
+    # reset
+    worker.listeners = prev_listeners
+    worker.retry_delays = prev_retry_delays
 
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_no_retry_with_empty_delays_listen(
-    emit: EmitType, outbox: Outbox, session: AsyncSession
+    emit: EmitType,
+    worker: Worker,
+    message_relay: MessageRelay,
+    session: AsyncSession,
+    rmq_connection: AbstractConnection,
 ) -> None:
     # arrange - empty retry_delays on listener means no retries, go to DLQ
     callcount = 0
 
     @listen("routing_key", retry_delays=(), queue="test_no_retry_with_empty_delays_listen_queue")
-    async def handler(person: object) -> None:
+    async def handler(_: object) -> None:
         nonlocal callcount
         callcount += 1
         raise Exception("Simulated failure")
 
     await emit(session, "routing_key", {"name": "MyName"})
     await session.commit()
-    await outbox._set_up_queues([handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=0.2)
+    await run_worker(worker, [handler], timeout=0.2)
 
-    # assert - only 1 attempt, then goes to DLQ
+    # assert
     assert callcount == 1
     assert (
-        await get_dlq_message_count(outbox, "test_no_retry_with_empty_delays_listen_queue")
+        await get_dlq_message_count(rmq_connection, "test_no_retry_with_empty_delays_listen_queue")
     ) == 1
+
+    # reset
+    worker.listeners = prev_listeners
 
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_emit_and_consume_binary(
-    emit: EmitType, outbox: Outbox, session: AsyncSession
+    emit: EmitType, worker: Worker, message_relay: MessageRelay, session: AsyncSession
 ) -> None:
     # arrange
     callcount = 0
@@ -426,40 +358,60 @@ async def test_emit_and_consume_binary(
 
     await emit(session, "routing_key", "hεllo".encode())
     await session.commit()
-    await outbox._set_up_queues([handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=0.2)
+    await run_worker(worker, [handler], timeout=0.2)
 
     # assert
     assert callcount == 1
     assert retrieved_argument == "hεllo".encode()
     assert retrieved_argument is not None and len(retrieved_argument) == 6
 
+    # reset
+    worker.listeners = prev_listeners
+
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_dead_letter(emit: EmitType, session: AsyncSession, outbox: Outbox) -> None:
+async def test_dead_letter(
+    emit: EmitType,
+    session: AsyncSession,
+    worker: Worker,
+    message_relay: MessageRelay,
+    rmq_connection: AbstractConnection,
+) -> None:
     # arrange
     @listen("routing_key", queue="test_dead_letter_queue_name")
-    async def handler(person: object) -> None:
+    async def handler(_: object) -> None:
         raise Reject("test")
 
     await emit(session, "routing_key", {})
     await session.commit()
-    await outbox._set_up_queues([handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=0.2)
+    await run_worker(worker, [handler], timeout=0.2)
 
     # assert
-    assert (await get_dlq_message_count(outbox, "test_dead_letter_queue_name")) == 1
+    assert (await get_dlq_message_count(rmq_connection, "test_dead_letter_queue_name")) == 1
+
+    # reset
+    worker.listeners = prev_listeners
 
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_dead_letter_with_expiration(
-    emit: EmitType, session: AsyncSession, outbox: Outbox
+    emit: EmitType,
+    session: AsyncSession,
+    worker: Worker,
+    message_relay: MessageRelay,
+    rmq_connection: AbstractConnection,
 ) -> None:
     # arrange
     @listen("routing_key", queue="test_dead_letter_with_expiration_queue_name2")
@@ -468,20 +420,27 @@ async def test_dead_letter_with_expiration(
 
     await emit(session, "routing_key", {}, expiration=0.02)
     await session.commit()
-    await outbox._set_up_queues([handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=0.2)
+    await run_worker(worker, [handler], timeout=0.2)
 
     # assert
     assert (
-        await get_dlq_message_count(outbox, "test_dead_letter_with_expiration_queue_name2")
+        await get_dlq_message_count(rmq_connection, "test_dead_letter_with_expiration_queue_name2")
     ) == 1
+
+    # reset
+    worker.listeners = prev_listeners
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_graceful_shutdown(emit: EmitType, session: AsyncSession, outbox: Outbox) -> None:
+async def test_graceful_shutdown(
+    emit: EmitType, session: AsyncSession, worker: Worker, message_relay: MessageRelay
+) -> None:
     # arrange
     before, after = 0, 0
 
@@ -494,26 +453,31 @@ async def test_graceful_shutdown(emit: EmitType, session: AsyncSession, outbox: 
 
     await emit(session, "routing_key", {})
     await session.commit()
-    await outbox._set_up_queues([handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
-    worker_task = asyncio.create_task(outbox.worker([handler]))
+    worker_task = asyncio.create_task(worker.run())
 
     await asyncio.sleep(0.2)  # Give some time for the task to reach `sleep`
     assert (before, after) == (1, 0)
 
     # test
-    assert outbox._shutdown_future is not None
-    outbox._shutdown_future.set_result(None)  # Simulate SIGINT/TERM
+    assert worker._shutdown_future is not None
+    worker._shutdown_future.set_result(None)  # Simulate SIGINT/TERM
     await asyncio.wait((worker_task,))
 
     # assert
     assert (before, after) == (1, 1)
 
+    # reset
+    worker.listeners = prev_listeners
+
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_messages_not_lost_during_graceful_shutdown(
-    emit: EmitType, session: AsyncSession, outbox: Outbox
+    emit: EmitType, session: AsyncSession, worker: Worker, message_relay: MessageRelay
 ) -> None:
     # arrange
     before, after = 0, 0
@@ -527,45 +491,51 @@ async def test_messages_not_lost_during_graceful_shutdown(
 
     await emit(session, "routing_key", {})
     await session.commit()
-    await outbox._set_up_queues([handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
-    worker_task = asyncio.create_task(outbox.worker([handler]))
+    worker_task = asyncio.create_task(worker.run())
 
     await asyncio.sleep(0.2)  # Give some time for the task to reach `sleep`
     assert (before, after) == (1, 0)
 
-    assert outbox._shutdown_future is not None
-    outbox._shutdown_future.set_result(None)  # Simulate SIGINT/TERM
+    assert worker._shutdown_future is not None
+    worker._shutdown_future.set_result(None)  # Simulate SIGINT/TERM
 
     # Send another message while the worker is in shutdown mode
     await asyncio.sleep(0.2)
     await emit(session, "routing_key", {})
     await session.commit()
-    await outbox._consume_outbox_table()
+    await message_relay._consume_outbox_table()
 
     await asyncio.wait((worker_task,))
     assert (before, after) == (1, 1)
 
     # test
     # Start the worker again
-    worker_task = asyncio.create_task(outbox.worker([handler]))
+    worker_task = asyncio.create_task(worker.run())
     await asyncio.sleep(0.4)  # Give some time for the task to reach `sleep`
     assert (before, after) == (2, 1)
 
     # assert
-    assert outbox._shutdown_future is not None
-    outbox._shutdown_future.set_result(None)  # Simulate SIGINT/TERM
+    assert worker._shutdown_future is not None
+    worker._shutdown_future.set_result(None)  # Simulate SIGINT/TERM
     await asyncio.wait((worker_task,))
     assert (before, after) == (2, 2)
+
+    # reset
+    worker.listeners = prev_listeners
 
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_tracking_ids(
     monkeypatch: pytest.MonkeyPatch,
-    outbox: Outbox,
     emit: EmitType,
     session: AsyncSession,
+    message_relay: MessageRelay,
+    worker: Worker,
 ) -> None:
     # arrange
     counter = itertools.count(0)
@@ -573,39 +543,45 @@ async def test_tracking_ids(
 
     logs: list[tuple[str, ...]] = []
 
-    with outbox.tracking():
-        logs.append(outbox.get_tracking_ids())
+    with tracking():
+        logs.append(get_tracking_ids())
         await emit(session, "r1", {})
         await session.commit()
 
     @listen("r1", queue="test_tracking_ids_queue_1")
     async def handler1(_: object) -> None:
-        logs.append(outbox.get_tracking_ids())
+        logs.append(get_tracking_ids())
         await emit(session, "r2", {})
         await emit(session, "r2", {})
         await session.commit()
-        await outbox._consume_outbox_table()
+        await message_relay._consume_outbox_table()
 
     @listen("r2", queue="test_tracking_ids_queue_2")
     async def handler2(_: object) -> None:
-        logs.append(outbox.get_tracking_ids())
+        logs.append(get_tracking_ids())
 
-    await outbox._set_up_queues([handler1, handler2])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler1, handler2]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler1, handler2], timeout=0.6)
+    await run_worker(worker, [handler1, handler2], timeout=0.6)
 
     # assert
     assert logs == [("0",), ("0", "1"), ("0", "1", "2"), ("0", "1", "3")]
+
+    # reset
+    worker.listeners = prev_listeners
 
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_tracking_ids_with_parameter(
     monkeypatch: pytest.MonkeyPatch,
-    outbox: Outbox,
     emit: EmitType,
     session: AsyncSession,
+    message_relay: MessageRelay,
+    worker: Worker,
 ) -> None:
     # arrange
     counter = itertools.count(0)
@@ -613,8 +589,8 @@ async def test_tracking_ids_with_parameter(
 
     logs: list[Sequence[str]] = []
 
-    with outbox.tracking():
-        logs.append(outbox.get_tracking_ids())
+    with tracking():
+        logs.append(get_tracking_ids())
         await emit(session, "r1", {})
         await session.commit()
 
@@ -624,26 +600,38 @@ async def test_tracking_ids_with_parameter(
         await emit(session, "r2", {})
         await emit(session, "r2", {})
         await session.commit()
-        await outbox._consume_outbox_table()
+        await message_relay._consume_outbox_table()
 
     @listen("r2", queue="test_tracking_ids_with_parameter_queue2")
     async def handler2(_: object, tracking_ids: Sequence[str]) -> None:
         logs.append(tracking_ids)
 
-    await outbox._set_up_queues([handler1, handler2])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler1, handler2]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler1, handler2], timeout=0.6)
+    await run_worker(worker, [handler1, handler2], timeout=0.6)
 
     # assert
     assert logs == [("0",), ("0", "1"), ("0", "1", "2"), ("0", "1", "3")]
 
+    # reset
+    worker.listeners = prev_listeners
+
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_emit_retry_delays(emit: EmitType, session: AsyncSession, outbox: Outbox) -> None:
+async def test_emit_retry_delays(
+    emit: EmitType,
+    session: AsyncSession,
+    worker: Worker,
+    message_relay: MessageRelay,
+    rmq_connection: AbstractConnection,
+) -> None:
     # arrange - test that default retry_delays from Outbox are used
-    outbox.setup(retry_delays=(0.1,) * 2, auto_create_table=True, enable_metrics=False)
+    prev_retry_delays = worker.retry_delays
+    worker.retry_delays = (1, 1)
     await emit(session, "r1", {})
     await session.commit()
 
@@ -655,19 +643,31 @@ async def test_emit_retry_delays(emit: EmitType, session: AsyncSession, outbox: 
         callcount += 1
         _ = 3 / 0
 
-    await outbox._set_up_queues([handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=1.0)
+    await run_worker(worker, [handler], timeout=3.0)
 
     # assert
     assert callcount == 3
-    assert (await get_dlq_message_count(outbox, "test_emit_retry_delays_queue")) == 1
+    assert (await get_dlq_message_count(rmq_connection, "test_emit_retry_delays_queue")) == 1
+
+    # reset
+    worker.listeners = prev_listeners
+    worker.retry_delays = prev_retry_delays
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_listen_retry_delays(emit: EmitType, session: AsyncSession, outbox: Outbox) -> None:
+async def test_listen_retry_delays(
+    emit: EmitType,
+    session: AsyncSession,
+    worker: Worker,
+    message_relay: MessageRelay,
+    rmq_connection: AbstractConnection,
+) -> None:
     # arrange
     await emit(session, "r1", {})
     await session.commit()
@@ -680,21 +680,34 @@ async def test_listen_retry_delays(emit: EmitType, session: AsyncSession, outbox
         callcount += 1
         _ = 3 / 0
 
-    await outbox._set_up_queues([handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler]
+
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=3.0)
+    await run_worker(worker, [handler], timeout=3.0)
 
     # assert
     assert callcount == 3
-    assert (await get_dlq_message_count(outbox, "test_listen_retry_delays_queue")) == 1
+    assert (await get_dlq_message_count(rmq_connection, "test_listen_retry_delays_queue")) == 1
+
+    # reset
+    worker.listeners = prev_listeners
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_setup_retry_delays(emit: EmitType, session: AsyncSession, outbox: Outbox) -> None:
+async def test_setup_retry_delays(
+    emit: EmitType,
+    session: AsyncSession,
+    worker: Worker,
+    message_relay: MessageRelay,
+    rmq_connection: AbstractConnection,
+) -> None:
     # arrange
-    outbox.setup(retry_delays=(0.1,) * 2, auto_create_table=True, enable_metrics=False)
+    prev_retry_delays = worker.retry_delays
+    worker.retry_delays = (1, 1)
 
     await emit(session, "r1", {})
     await session.commit()
@@ -707,27 +720,33 @@ async def test_setup_retry_delays(emit: EmitType, session: AsyncSession, outbox:
         callcount += 1
         _ = 3 / 0
 
-    await outbox._set_up_queues([handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=1.0)
+    await run_worker(worker, [handler], timeout=3.0)
 
     # assert
     assert callcount == 3
-    assert (await get_dlq_message_count(outbox, "test_setup_retry_delays_queue")) == 1
+    assert (await get_dlq_message_count(rmq_connection, "test_setup_retry_delays_queue")) == 1
+
+    # reset
+    worker.listeners = prev_listeners
+    worker.retry_delays = prev_retry_delays
 
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_wildcard_routing_key_preserved_through_retries(
-    emit: EmitType, session: AsyncSession, outbox: Outbox
+    emit: EmitType, session: AsyncSession, worker: Worker, message_relay: MessageRelay
 ) -> None:
     # arrange - test that wildcard routing keys are preserved through delay exchange retries
     callcount = 0
     retrieved_routing_keys = []
 
     @listen("order.*", queue="test_wildcard_retry_queue", retry_delays=(1, 1))
-    async def handler(routing_key: str, person: object) -> None:
+    async def handler(routing_key: str, _: object) -> None:
         nonlocal callcount
         callcount += 1
         retrieved_routing_keys.append(routing_key)
@@ -736,46 +755,53 @@ async def test_wildcard_routing_key_preserved_through_retries(
 
     await emit(session, "order.created", {"name": "MyName"})
     await session.commit()
-    await outbox._set_up_queues([handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler], timeout=3.0)
+    await run_worker(worker, [handler], timeout=3.0)
 
     # assert - routing key should be preserved across all retry attempts
     assert callcount == 3
     assert retrieved_routing_keys == ["order.created", "order.created", "order.created"]
 
+    # reset
+    worker.listeners = prev_listeners
+
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_retry_routes_to_single_queue_only(
-    emit: EmitType, session: AsyncSession, outbox: Outbox
+    emit: EmitType, session: AsyncSession, worker: Worker, message_relay: MessageRelay
 ) -> None:
-    """Test that retries only go to the failing queue, not all queues matching the routing pattern."""
+    "Test that retries only go to the failing queue, not all queues matching the routing pattern."
     # arrange - two queues with overlapping wildcard patterns
     queue1_callcount = 0
     queue2_callcount = 0
 
     @listen("user.*", queue="test_retry_isolation_queue1", retry_delays=(1,))
-    async def handler1(person: object) -> None:
+    async def handler1(_: object) -> None:
         nonlocal queue1_callcount
         queue1_callcount += 1
         if queue1_callcount == 1:
             raise ValueError("Simulated failure in queue1")
 
     @listen("*.created", queue="test_retry_isolation_queue2", retry_delays=(1,))
-    async def handler2(person: object) -> None:
+    async def handler2(_: object) -> None:
         nonlocal queue2_callcount
         queue2_callcount += 1
         # This handler always succeeds
 
     await emit(session, "user.created", {"name": "TestUser"})
     await session.commit()
-    await outbox._set_up_queues([handler1, handler2])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [handler1, handler2]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [handler1, handler2], timeout=1.3)
+    await run_worker(worker, [handler1, handler2], timeout=1.3)
 
     # assert
     # Queue1: called twice (initial + 1 retry after failure)
@@ -783,9 +809,14 @@ async def test_retry_routes_to_single_queue_only(
     # Queue2: called ONCE only (initial message, NO retry from queue1's failure)
     assert queue2_callcount == 1
 
+    # reset
+    worker.listeners = prev_listeners
+
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_sync_callback(emit: EmitType, session: AsyncSession, outbox: Outbox) -> None:
+async def test_sync_callback(
+    emit: EmitType, session: AsyncSession, worker: Worker, message_relay: MessageRelay
+) -> None:
     """Test that sync (non-async) callbacks are supported via auto-wrapping."""
     # arrange
     callcount = 0
@@ -799,20 +830,25 @@ async def test_sync_callback(emit: EmitType, session: AsyncSession, outbox: Outb
 
     await emit(session, "sync.test", {"message": "hello"})
     await session.commit()
-    await outbox._set_up_queues([sync_handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [sync_handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [sync_handler], timeout=0.2)
+    await run_worker(worker, [sync_handler], timeout=0.2)
 
     # assert
     assert callcount == 1
     assert retrieved_data == {"message": "hello"}
 
+    # reset
+    worker.listeners = prev_listeners
+
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_sync_callback_with_pydantic(
-    emit: EmitType, session: AsyncSession, outbox: Outbox
+    emit: EmitType, session: AsyncSession, worker: Worker, message_relay: MessageRelay
 ) -> None:
     """Test that sync callbacks work with Pydantic models."""
     # arrange
@@ -827,20 +863,25 @@ async def test_sync_callback_with_pydantic(
 
     await emit(session, "person.created", Person(name="John"))
     await session.commit()
-    await outbox._set_up_queues([sync_handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [sync_handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [sync_handler], timeout=0.2)
+    await run_worker(worker, [sync_handler], timeout=0.2)
 
     # assert
     assert callcount == 1
     assert retrieved_person == Person(name="John")
 
+    # reset
+    worker.listeners = prev_listeners
+
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_sync_callback_with_special_params(
-    emit: EmitType, session: AsyncSession, outbox: Outbox
+    emit: EmitType, session: AsyncSession, worker: Worker, message_relay: MessageRelay
 ) -> None:
     """Test that sync callbacks receive special parameters correctly."""
     # arrange
@@ -850,7 +891,7 @@ async def test_sync_callback_with_special_params(
 
     @listen("special.test", queue="test_sync_special_params")
     def sync_handler(
-        data: object,
+        _: object,
         routing_key: str,
         tracking_ids: Sequence[str],
         queue_name: str,
@@ -862,11 +903,13 @@ async def test_sync_callback_with_special_params(
 
     await emit(session, "special.test", {"value": 42})
     await session.commit()
-    await outbox._set_up_queues([sync_handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [sync_handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [sync_handler], timeout=0.2)
+    await run_worker(worker, [sync_handler], timeout=0.2)
 
     # assert
     assert retrieved_routing_key == "special.test"
@@ -874,17 +917,23 @@ async def test_sync_callback_with_special_params(
     assert len(retrieved_tracking_ids) == 1
     assert retrieved_queue_name == "test_sync_special_params"
 
+    # reset
+    worker.listeners = prev_listeners
+
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_sync_callback_exception_retry(
-    emit: EmitType, session: AsyncSession, outbox: Outbox
+    emit: EmitType,
+    session: AsyncSession,
+    worker: Worker,
+    message_relay: MessageRelay,
 ) -> None:
     """Test that sync callbacks are retried on exception."""
     # arrange
     callcount = 0
 
     @listen("retry.test", queue="test_sync_retry", retry_delays=(1,))
-    def sync_handler(data: object) -> None:
+    def sync_handler(_: object) -> None:
         nonlocal callcount
         callcount += 1
         if callcount < 2:
@@ -892,44 +941,60 @@ async def test_sync_callback_exception_retry(
 
     await emit(session, "retry.test", {})
     await session.commit()
-    await outbox._set_up_queues([sync_handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [sync_handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [sync_handler], timeout=2.0)
+    await run_worker(worker, [sync_handler], timeout=2.0)
 
     # assert - should be called twice (initial + 1 retry)
     assert callcount == 2
 
+    # reset
+    worker.listeners = prev_listeners
+
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_sync_callback_reject(emit: EmitType, session: AsyncSession, outbox: Outbox) -> None:
+async def test_sync_callback_reject(
+    emit: EmitType,
+    session: AsyncSession,
+    worker: Worker,
+    message_relay: MessageRelay,
+    rmq_connection: AbstractConnection,
+) -> None:
     """Test that sync callbacks can raise Reject exception."""
     # arrange
     callcount = 0
 
     @listen("reject.test", queue="test_sync_reject")
-    def sync_handler(data: object) -> None:
+    def sync_handler(_: object) -> None:
         nonlocal callcount
         callcount += 1
         raise Reject()
 
     await emit(session, "reject.test", {})
     await session.commit()
-    await outbox._set_up_queues([sync_handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [sync_handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [sync_handler], timeout=0.2)
+    await run_worker(worker, [sync_handler], timeout=0.2)
 
-    # assert - should be called once and sent to DLQ
+    # assert
     assert callcount == 1
-    assert await get_dlq_message_count(outbox, "test_sync_reject") == 1
+    assert await get_dlq_message_count(rmq_connection, "test_sync_reject") == 1
+
+    # reset
+    worker.listeners = prev_listeners
 
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_mixed_sync_async_listeners(
-    emit: EmitType, session: AsyncSession, outbox: Outbox
+    emit: EmitType, session: AsyncSession, worker: Worker, message_relay: MessageRelay
 ) -> None:
     """Test that sync and async listeners can coexist in the same worker."""
     # arrange
@@ -937,40 +1002,41 @@ async def test_mixed_sync_async_listeners(
     async_callcount = 0
 
     @listen("mixed.sync", queue="test_mixed_sync")
-    def sync_handler(data: object) -> None:
+    def sync_handler(_: object) -> None:
         nonlocal sync_callcount
         sync_callcount += 1
 
     @listen("mixed.async", queue="test_mixed_async")
-    async def async_handler(data: object) -> None:
+    async def async_handler(_: object) -> None:
         nonlocal async_callcount
         async_callcount += 1
 
     await emit(session, "mixed.sync", {})
     await emit(session, "mixed.async", {})
     await session.commit()
-    await outbox._set_up_queues([sync_handler, async_handler])
-    await outbox._consume_outbox_table()
+    prev_listeners = worker.listeners
+    worker.listeners = [sync_handler, async_handler]
+    await worker._set_up_queues()
+    await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(outbox, [sync_handler, async_handler], timeout=0.2)
+    await run_worker(worker, [sync_handler, async_handler], timeout=0.2)
 
     # assert - both should be called
     assert sync_callcount == 1
     assert async_callcount == 1
 
+    # reset
+    worker.listeners = prev_listeners
+
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_listener_direct_instantiation_with_sync(outbox: Outbox) -> None:
+async def test_listener_direct_instantiation_with_sync() -> None:
     """Test that Listener class works with sync callbacks when instantiated directly."""
+
     # arrange
-    from outbox import Listener
-
-    callcount = 0
-
-    def sync_func(data: object) -> None:
-        nonlocal callcount
-        callcount += 1
+    def sync_func(_: object) -> None:
+        pass
 
     listener = Listener("test.key", sync_func, queue="test_direct_sync")
 
@@ -980,14 +1046,14 @@ async def test_listener_direct_instantiation_with_sync(outbox: Outbox) -> None:
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_sync_callback_queue_name_generation(outbox: Outbox) -> None:
+async def test_sync_callback_queue_name_generation() -> None:
     """Test that queue names are auto-generated correctly for sync callbacks."""
 
     # arrange
     @listen("queue.test")
-    def my_sync_handler(data: object) -> None:
+    def my_sync_handler(_: object) -> None:
         pass
 
-    # assert - queue name should be generated from function module and name
+    # assert
     assert "my_sync_handler" in my_sync_handler.queue
-    assert "test_outbox" in my_sync_handler.queue
+    assert "test_worker" in my_sync_handler.queue

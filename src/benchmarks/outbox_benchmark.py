@@ -11,7 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from testcontainers.rabbitmq import RabbitMqContainer  # type: ignore[import-untyped]
 
-from outbox import Listener, OutboxMessage, bulk_emit, message_relay, outbox, setup, worker
+from outbox import Emitter, Listener, MessageRelay, OutboxMessage, Worker
+from outbox.utils import ensure_database
 
 
 def _generate_batch_sizes(
@@ -29,19 +30,17 @@ def _generate_batch_sizes(
 
 
 def message_relay_process(postgres_url: str, rabbitmq_url: str, batch_size: int) -> None:
-    setup(
+    message_relay = MessageRelay(
         db_engine_url=postgres_url,
         rmq_connection_url=rabbitmq_url,
         auto_create_table=False,  # Already created by main process
         enable_metrics=False,
         batch_size=batch_size,
     )
-    asyncio.run(message_relay())
+    asyncio.run(message_relay.run())
 
 
-def worker_process(
-    postgres_url: str, rabbitmq_url: str, prefetch_count: int, timestamp_list: list[float]
-) -> None:
+def worker_process(rabbitmq_url: str, prefetch_count: int, timestamp_list: list[float]) -> None:
     """Run a worker process that consumes messages."""
     # Track metrics locally in this process
     first_message_time: Optional[float] = None
@@ -56,15 +55,14 @@ def worker_process(
             first_message_time = now
         last_message_time = now
 
-    setup(
-        db_engine_url=postgres_url,
+    worker = Worker(
         rmq_connection_url=rabbitmq_url,
-        auto_create_table=False,  # Already created by main process
+        listeners=[Listener("benchmark.test", on_message, "benchmark.test")],
         enable_metrics=False,
         prefetch_count=prefetch_count,
     )
     try:
-        asyncio.run(worker([Listener("benchmark.test", on_message, "benchmark.test")]))
+        asyncio.run(worker.run())
     finally:
         timestamp_list.extend([cast(float, first_message_time), cast(float, last_message_time)])
 
@@ -95,14 +93,9 @@ async def benchmark(
         print(f"RabbitMQ: {rabbitmq_url}")
 
         # Setup in main process (creates table)
-        setup(
-            db_engine_url=postgres_url,
-            rmq_connection_url=rabbitmq_url,
-            auto_create_table=True,
-            enable_metrics=False,
-            batch_size=batch_size,
-        )
-        await outbox._ensure_database()
+        emitter = Emitter(db_engine_url=postgres_url, auto_create_table=True)
+        assert emitter.db_engine is not None
+        await ensure_database(emitter.db_engine)
 
         # Start message relay processes
         print(f"Starting {relay_count} message relay process(es)...")
@@ -124,7 +117,7 @@ async def benchmark(
             worker_processes.append(
                 multiprocessing.Process(
                     target=worker_process,
-                    args=(postgres_url, rabbitmq_url, prefetch_count, timestamp_list),
+                    args=(rabbitmq_url, prefetch_count, timestamp_list),
                 )
             )
             worker_processes[-1].start()
@@ -138,10 +131,10 @@ async def benchmark(
             "seconds..."
         )
         emit_start_time = time.perf_counter()
-        async with AsyncSession(outbox.db_engine) as session:
+        async with AsyncSession(emitter.db_engine) as session:
             message = OutboxMessage(routing_key="benchmark.test", body="*" * message_size)
             for emit_batch_size in _generate_batch_sizes(message_rate, duration):
-                await bulk_emit(
+                await emitter.bulk_emit(
                     session,
                     [message for _ in range(emit_batch_size)],
                 )

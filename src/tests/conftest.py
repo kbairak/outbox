@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engin
 from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from testcontainers.rabbitmq import RabbitMqContainer  # type: ignore[import-untyped]
 
-from outbox import Outbox
+from outbox import Emitter, MessageRelay, Worker
 
 from .utils import EmitType
 
@@ -40,21 +40,30 @@ async def rmq_connection() -> AsyncGenerator[AbstractConnection, None]:
             yield connection
 
 
-@pytest_asyncio.fixture(loop_scope="session")
-async def outbox(db_engine: AsyncEngine, rmq_connection: AbstractConnection) -> Outbox:
-    outbox = Outbox(
+@pytest.fixture
+def emitter(db_engine: AsyncEngine) -> Emitter:
+    return Emitter(db_engine=db_engine, auto_create_table=True)
+
+
+@pytest.fixture
+def emit(emitter: Emitter) -> EmitType:
+    return emitter.emit
+
+
+@pytest.fixture
+def message_relay(db_engine: AsyncEngine, rmq_connection: AbstractConnection) -> MessageRelay:
+    return MessageRelay(
         db_engine=db_engine,
         rmq_connection=rmq_connection,
         clean_up_after="NEVER",
         auto_create_table=True,
         enable_metrics=False,
     )
-    return outbox
 
 
 @pytest.fixture
-def emit(outbox: Outbox) -> EmitType:
-    return outbox.emit
+def worker(rmq_connection: AbstractConnection) -> Worker:
+    return Worker(rmq_connection=rmq_connection, enable_metrics=False)
 
 
 @pytest_asyncio.fixture(autouse=True, loop_scope="session")
