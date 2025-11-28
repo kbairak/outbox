@@ -97,8 +97,8 @@ worker = Worker(
     listeners=[
         Listener(
             binding_key="user.created",
-            callback=on_user_created,
             queue="analytics_service.on_user_created",  # optional, auto-generated if not provided
+            callback=on_user_created,
         )
     ]
 )
@@ -113,10 +113,350 @@ Listener("binding_key", callback, ...)
 listen("binding_key", ...)(callback)
 ```
 
+## Why
+
+### Intro to transactional outbox pattern
+
+When building applications, you often need to perform two operations together: save data to a database and trigger side effects (send an email, call an external API, publish an event). Both operations must succeed together or fail together to maintain consistency. Otherwise, if an error occurs between the database change and the triggering of side effects, your application will be left in an inconsistent state and manual intervention will be required.
+
+**Why traditional approaches fail:**
+
+- **Call side effect before commit**: If the database commit fails afterward, you've already triggered the side effect, leaving your system in an inconsistent state
+- **Call side effect after commit**: If the side effect fails, there's no way to retry it transactionally. The database operation succeeded but the side effect didn't
+- **Distributed transactions (2PC)**: Two-phase commit protocols are complex, slow, not always available across different systems, and can introduce coordination overhead
+
+**The outbox solution:**
+
+Instead of calling side effects directly, write event messages to an outbox table in the same database transaction as your business data. A separate reliable process (the message relay) reads from this table and publishes messages to your message broker.
+
+**Benefits:**
+
+- **Atomic operations**: Database changes and event publishing succeed or fail together
+- **Guaranteed delivery**: At-least-once delivery semantics ensure messages are eventually published
+- **No distributed transactions**: Everything happens within a single database transaction
+- **Reliable retries**: If publishing fails, the message relay will keep trying
+
+### Retried delays and DLQ (and why celery cannot do them)
+
+This library implements **exponential backoff** for failed messages using RabbitMQ's TTL-based delay queues. When a listener raises an exception, the message is sent to a delay queue (e.g., `outbox.delay_10s`) with a TTL. After the delay expires, RabbitMQ automatically routes the message back to the original queue for retry.
+
+**Dead-letter queues (DLQ):**
+
+After exhausting all retry attempts, messages are sent to a dead-letter queue for manual inspection. This allows you to investigate failures, fix bugs, and reprocess messages.
+
+**Why Celery struggles with this pattern:**
+
+Celery has very flexible retry mechanisms: You can trigger retries explicitly, you can retry only on specific exceptions, you can set max retries and it can apply jitter to distribute a burst of retries over a slightly longer period of time. The main issue with Celery's retries is that, in order for a task to support them, the worker will immediately ACK the message from RabbitMQ which will cause it to be dropped from the queue. After this point, the message only exists inside the worker's memory. If the worker crashes because of an error not handled by Python's exception handling (eg out-of-memory) or if the orchestrator kills the worker because of a deployment or downscaling or for whatever reason, the message will be lost forever.
+
+The trade-off of using this library instead of Celery is that we lose the jitter feature and that we end up with many delay exchanges/queues that will need to be managed. What we get in return is the certainty that messages will never be lost and the fact that we can take advantage of all RabbitMQ's routing mechanisms.
+
+### Why SQLAlchemy (Postgres), aio-pika (RabbitMQ) and Pydantic
+
+Both SQLAlchemy and Pydantic are popular and integrated into many existing frameworks and aio-pika is the go-to library for working with RabbitMQ in async Python applications. This makes this library compatible with many existing applications and frameworks. With SQLAlchemy we could target a lot of different databases, but we focused on Postgres because it is both proven, reliable and popular and because it features a LISTEN/NOTIFY system that makes the message relay more efficient by avoiding polling when there are no messages to send.
+
 ## Features
 
+### Overall
+
 <details>
-    <summary><h3>Bulk emit for high throughput</h3></summary>
+    <summary><h4>Automatic (de)serialization of Pydantic models</h4></summary>
+
+```python
+class User(BaseModel):
+    id: int
+    username: str
+
+# Main application
+async with AsyncSession(db_engine) as session:
+    await emitter.emit(session, "user.created", User(id=123, username="johndoe"))
+    await session.commit()
+
+# Worker process
+@listen("user.created")
+async def on_user_created(user: User):  # inspects type annotation
+    print(user)
+    # <<< User(id=123, username="johndoe")
+```
+
+</details>
+
+<details>
+    <summary><h4>Tracking IDs</h4></summary>
+
+While using the outbox pattern, you will be emitting messages from an entrypoint (usually and API endpoint) which will be picked up by listeners which will in turn emit their own messages and so on. It can be beneficial to assign tracking IDs so that you can track the entire history of emissions. This library assigns a UUID every time you emit, then the listener will get the tracking history of the current event and then, when it emits, will append its own UUID. You can get the whole list of UUIDs by invoking `outbox.get_tracking_ids()` inside the listener or by passing a `tracking_ids` parameter to the listener:
+
+```python
+from collections.abc import Sequence
+
+async def entrypoint():
+    async with AsyncSession(db_engine) as session:
+        await emitter.emit(session, "user.created", {"id": 123, "username": "johndoe"})
+        await session.commit()
+
+@listen("user.created")
+async def on_user_created(user, tracking_ids: Sequence[str]):
+    logger.info(f"User created {user.id}, tracking IDs: {tracking_ids}")
+    async with AsyncSession(db_engine) as session:
+        await emitter.emit(session, "user.welcome_email", {"id": user.id})
+        await emitter.emit(session, "user.created_notification", {"id": user.id})
+        await session.commit()
+
+@listen("user.welcome_email")
+async def on_user_welcome_email(user, tracking_ids: Sequence[str]):
+    logger.info(f"Welcome email sent for user {user.id}, tracking IDs: {tracking_ids}")
+
+@listen("user.created_notification")
+async def on_user_created_notification(user, tracking_ids):
+    logger.info(f"Notification created for user {user.id}, tracking IDs: {tracking_ids}")
+```
+
+The log statements in this case will output:
+
+```
+User created 123, tracking IDs: ['uuid1']
+Welcome email sent for user 123, tracking IDs: ['uuid1', 'uuid2']
+Notification created for user 123, tracking IDs: ['uuid1', 'uuid3']
+```
+
+If you want to include a UUID for the entrypoint as well, you have to wrap your initial emits (or the entire entrypoint) with `tracking()`:
+
+```python
+from outbox import tracking
+
+async def entrypoint():
+    with tracking():
+        async with AsyncSession(db_engine) as session:
+            await emitter.emit(session, "user.created", {"id": 123, "username": "johndoe"})
+            await session.commit()
+```
+
+In that case, your output would be:
+
+```
+User created 123, tracking IDs: ['uuid1', uuid2']
+Welcome email sent for user 123, tracking IDs: ['uuid1', 'uuid2', 'uuid3']
+Notification created for user 123, tracking IDs: ['uuid1', 'uuid2', 'uuid4']
+```
+
+</details>
+
+<details>
+    <summary><h4>Graceful shutdown</h4></summary>
+
+When the worker receives a SIGINT or SIGTERM, it will request a disconnect from all the queues. Any messages that are sent before the disconnect request is processed will be rejected by the worker with `requeue=True` (so they will be consumed by other workers, immediately or later). In the meantime, any messages that have already started being processed will keep being processed until the listener function terminates. When all pending tasks have finished, the worker will exit.
+
+Example sequence of events:
+
+```mermaid
+sequenceDiagram
+    participant Pub as Publisher
+    participant Q as RabbitMQ Queue
+    participant W as Worker
+    participant OW as Other Worker
+
+    W->>W: Start
+    Pub->>Q: Publish event 1
+    Q-->>W: Send event 1
+    W->>W: Start processing event 1
+
+    Note right of W: SIGINT or SIGTERM received
+    W->>Q: Request disconnect from all queues
+
+    Pub->>Q: Publish event 2
+    Q-->>W: Send event 2
+    W->>Q: Reject event 2 (requeue=True)
+
+    Q-->>W: Acknowledge disconnect request
+
+    Pub->>Q: Publish event 3
+    Note right of Q: Event 3 not sent to W
+
+    W->>W: Finish processing event 1
+    W->>Q: Ack event 1
+    W->>W: Exit
+
+    OW->>Q: Start and connect
+    Q-->>OW: Send event 2
+    Q-->>OW: Send event 3
+    OW->>OW: Process event 2
+    OW->>Q: Ack event 2
+    OW->>OW: Process event 3
+    OW->>Q: Ack event 3
+```
+
+</details>
+
+<details>
+    <summary><h4>Topic exchange and wildcard matching</h4></summary>
+
+```python
+# Main application
+async with AsyncSession(db_engine) as session:
+    await emit(session, "user.created", {"id": 123, "username": "johndoe"})
+    await session.commit()
+
+# Worker process
+@listen("user.*")
+async def on_user_event(user):
+    print(user)
+    # <<< {"id": 123, "username": "johndoe"}
+```
+
+If you are using this and you want to know the routing key inside the body of the listener, you can add a `routing_key` argument to the listener:
+
+```python
+# Main application
+async with AsyncSession(db_engine) as session:
+    await emit(session, "user.created", {"id": 123, "username": "johndoe"})
+    await session.commit()
+
+# Worker process
+@listen("user.*")
+async def on_user_event(routing_key: str, user):
+    logger.info(f"Received {routing_key=}")
+    # <<< Received routing_key=user.created
+    print(user)
+    # <<< {"id": 123, "username": "johndoe"}
+```
+
+</details>
+
+<details>
+    <summary><h4>Blocking I/O and CPU-bound work</h4></summary>
+
+The outbox pattern is designed for **async I/O-bound operations** like sending emails, calling external APIs, or writing to databases. For these tasks, the library's async approach using `asyncio.create_task()` provides excellent concurrency without blocking.
+
+However, there are two scenarios where you might need different handling:
+
+##### Blocking I/O (Legacy Codebases)
+
+If you're integrating the outbox pattern into an existing codebase with **synchronous/blocking I/O** code, the `@listen` decorator automatically detects and handles this. You can use regular (non-async) functions as callbacks:
+
+```python
+from outbox import listen
+
+# Async callback (preferred for new code)
+@listen("user.created")
+async def async_handler(user):
+    await send_email_async(user)  # Non-blocking async I/O
+
+# Sync callback (for legacy code with blocking I/O)
+@listen("order.created")
+def sync_handler(order):
+    send_email_blocking(order)  # Blocking I/O - automatically runs in thread pool
+    update_crm_blocking(order)   # Blocking I/O - automatically runs in thread pool
+```
+
+**How it works:**
+
+- The library detects if your callback is sync or async using `asyncio.iscoroutinefunction()`
+- Sync callbacks are automatically wrapped with `asyncio.to_thread()` to run in a thread pool
+- This prevents blocking the event loop while maintaining compatibility with legacy code
+- Concurrency is controlled by `prefetch_count` - at most N callbacks (sync or async) run simultaneously
+
+**Performance notes:**
+
+- Thread pool overhead exists but is minimal for I/O-bound work
+- Prefer async callbacks for new code - they're more efficient
+- This feature enables **gradual migration** from sync to async code
+
+For **CPU-bound work**, see Best Practices / Worker.
+
+</details>
+
+<details>
+    <summary><h4>Observability</h4></summary>
+
+Outbox provides optional Prometheus metrics for monitoring message flow and performance. Metrics automatically register to prometheus_client's global registry, so they work seamlessly with your existing Prometheus instrumentation:
+
+```python
+from prometheus_client import start_http_server, Counter
+from outbox import MessageRelay, Worker
+
+# Your application metrics
+my_counter = Counter('my_app_requests_total', 'Total requests')
+
+# Start Prometheus HTTP server once
+start_http_server(9090)
+
+# Outbox metrics are automatically included
+message_relay = MessageRelay(
+    db_engine_url="...",
+    rmq_connection_url="...",
+    enable_metrics=True,  # Default is True
+    exchange_name="orders",
+)
+
+worker = Worker(enable_metrics=True, ...)  # Default is True
+
+# Both your metrics and outbox metrics are served at :9090/metrics
+```
+
+##### Available Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `outbox_messages_published_total` | Counter | `exchange_name` | Messages successfully published from outbox table |
+| `outbox_publish_failures_total` | Counter | `exchange_name`, `failure_type`, `error_type` | Failed publish attempts to RabbitMQ |
+| `outbox_message_age_seconds` | Histogram | `exchange_name` | Time message spent in outbox table before publishing |
+| `outbox_poll_duration_seconds` | Histogram | `exchange_name` | Time to poll DB and publish one message |
+| `outbox_table_backlog` | Gauge | `exchange_name` | Current unsent messages in outbox table |
+| `outbox_messages_received_total` | Counter | `queue`, `exchange_name` | Messages received from RabbitMQ queue |
+| `outbox_messages_processed_total` | Counter | `queue`, `exchange_name`, `status` | Messages processed with outcome (success/failed/rejected) |
+| `outbox_retry_attempts_total` | Counter | `queue`, `delay_seconds` | Retry attempts by delay tier |
+| `outbox_message_processing_duration_seconds` | Histogram | `queue`, `exchange_name` | Handler execution time |
+| `outbox_dlq_messages` | Gauge | `queue` | Current messages in dead letter queue (updated every 30s) |
+| `outbox_active_consumers` | Gauge | `queue`, `exchange_name` | Active consumer connections |
+
+##### Disabling Metrics
+
+```python
+message_relay = MessageRelay(enable_metrics=False, ...)
+worker = Worker(enable_metrics=False, ...)
+```
+
+</details>
+
+### Emitter
+
+<details>
+    <summary><h4>API</h4></summary>
+
+##### `Emitter`
+
+Class for emitting messages to the outbox table.
+
+**Constructor parameters:**
+
+- `db_engine_url`: A string that indicates database dialect and connection arguments. Will be passed to SQLAlchemy. For async: `postgresql+asyncpg://<username>:<password>@<host>:<port>/<db_name>`. For sync: `postgresql+psycopg2://<username>:<password>@<host>:<port>/<db_name>`. Example: `postgresql+asyncpg://postgres:postgres@localhost:5432/postgres`
+- `db_engine`: If you already have a SQLAlchemy engine, you can pass it here instead of `db_engine_url` (you must pass either one or the other). Accepts both `AsyncEngine` (async) and `Engine` (sync)
+- `expiration`: Default expiration time for messages in RabbitMQ. Defaults to `None` (no expiration)
+- `table_name`: Name of the outbox table to use. Defaults to `outbox_table`
+- `auto_create_table`: If `True`, the outbox table will be automatically created if it does not exist. Defaults to `False`
+
+**Methods:**
+
+- `emit(session, routing_key, body, *, expiration=None, eta=None)`: Emit a single message to the outbox table. Automatically detects sync vs async based on session type
+  - `session`: A SQLAlchemy session (`Session` for sync, `AsyncSession` for async)
+  - `routing_key`: The routing key to use for the message
+  - `body`: The body of the message. If it is an instance of a Pydantic model, it will be serialized by Pydantic, if it is bytes, it will be used as is, otherwise outbox will attempt to serialize it with `json.dumps`
+  - `expiration`: The expiration time in seconds for the message. Overrides the default set in the constructor
+  - `eta`: The time at which the message should be sent. Can be a `datetime`, a `timedelta` or an interval in milliseconds
+
+- `emit_async(session, routing_key, body, *, expiration=None, eta=None)`: Async version of `emit()` (explicit)
+- `emit_sync(session, routing_key, body, *, expiration=None, eta=None)`: Sync version of `emit()` (explicit)
+
+- `bulk_emit(session, messages)`: Emit multiple messages in a single database operation. Automatically detects sync vs async based on session type
+  - `session`: A SQLAlchemy session (`Session` for sync, `AsyncSession` for async)
+  - `messages`: A sequence of `OutboxMessage` instances
+
+- `bulk_emit_async(session, messages)`: Async version of `bulk_emit()` (explicit)
+- `bulk_emit_sync(session, messages)`: Sync version of `bulk_emit()` (explicit)
+
+</details>
+
+<details>
+    <summary><h4>Bulk emit for high throughput</h4></summary>
 
 For performance-critical scenarios where you need to emit many messages at once, use `emitter.bulk_emit()` to insert multiple messages in a single database operation:
 
@@ -139,7 +479,7 @@ This is significantly faster than calling `emitter.emit()` individually when dea
 </details>
 
 <details>
-    <summary><h3>Sync and async emit support</h3></summary>
+    <summary><h4>Sync and async emit support</h4></summary>
 
 The `Emitter` supports both synchronous and asynchronous operations, allowing integration with legacy codebases that use blocking I/O:
 
@@ -170,21 +510,129 @@ Note: `MessageRelay` and `Worker` remain async-only, as they are standalone proc
 </details>
 
 <details>
-    <summary><h3>Emit inside database transaction</h3></summary>
+    <summary><h4>Delayed execution</h4></summary>
 
-You can (and should) call `emitter.emit` inside a database transaction. This way, data creation and triggering of side-effects will either succeed together or fail together. This is the main goal of the outbox pattern.
+You can cause an event to be sent some time in the future by setting the `eta` argument during `emitter.emit()`:
 
 ```python
-async with AsyncSession(db_engine) as session, session.begin():
-    session.add(User(id=123, username="johndoe"))
-    await emitter.emit(session, "user.created", {"id": 123, "username": "johndoe"})
-    # commit not needed because of `session.begin()`
+async with AsyncSession(db_engine) as session:
+    await emitter.emit(
+        session,
+        "user.created",
+        {"id": 123, "username": "johndoe"},
+        eta=datetime.datetime.now() + datetime.timedelta(minutes=5),
+    )
+    await session.commit()
 ```
 
 </details>
 
+### Message relay
+
 <details>
-    <summary><h3>Retries and dead-lettering</h3></summary>
+    <summary><h4>API</h4></summary>
+
+##### `MessageRelay`
+
+Class for relaying messages from the outbox table to RabbitMQ.
+
+**Constructor parameters:**
+
+- `db_engine_url`: Database connection string (same as Emitter)
+- `db_engine`: SQLAlchemy engine (same as Emitter)
+- `rmq_connection_url`: A string that indicates RabbitMQ connection parameters. Follows the pattern `amqp[s]://<username>:<password>@<host>:(<port>)/(virtualhost)`. Example: `amqp://guest:guest@localhost:5672/`
+- `rmq_connection`: If you already have a aio-pika connection, you can pass it here instead of `rmq_connection_url` (you must pass either one or the other)
+- `exchange_name`: Name of the RabbitMQ exchange to use. Defaults to `outbox`
+- `notification_timeout`: Maximum time (in seconds) to wait for a PostgreSQL NOTIFY before checking for scheduled messages. Acts as a safety timeout. Defaults to `60` seconds
+- `expiration`: Default expiration time for messages (same as Emitter)
+- `clean_up_after`: How long to keep messages in the outbox table after they are sent. Can be `IMMEDIATELY`, `NEVER`, or a `timedelta`. Defaults to `IMMEDIATELY`
+- `table_name`: Name of the outbox table (same as Emitter)
+- `batch_size`: Number of messages to fetch and publish concurrently in each batch from the outbox table. Defaults to `50`. Higher values improve throughput but increase transaction duration and memory usage. Set to `1` for sequential processing.
+- `auto_create_table`: Auto-create table if missing (same as Emitter)
+- `enable_metrics`: Enable Prometheus metrics. Defaults to `True`
+
+**Methods:**
+
+- `run()`: Start the message relay loop. Blocks until interrupted.
+
+</details>
+
+<details>
+    <summary><h4>Outbox table cleanup</h4></summary>
+
+You can choose a strategy for when already sent messages from the outbox table should be cleaned up by passing the `clean_up_after` argument to the MessageRelay constructor:
+
+```python
+message_relay = MessageRelay(
+    db_engine_url="...",
+    rmq_connection_url="...",
+    clean_up_after=datetime.timedelta(days=7)
+)
+```
+
+The options are:
+
+- **`IMMEDIATELY` (the default)**: messages are cleaned up immediately after being sent to RabbitMQ.
+- **`NEVER`**: messages are never cleaned up, you will have to do it manually.
+- **Any `datetime.timedelta` instance**.
+
+</details>
+
+### Worker
+
+<details>
+    <summary><h4>API</h4></summary>
+
+##### `Worker`
+
+Class for consuming messages from RabbitMQ and dispatching them to listeners.
+
+**Constructor parameters:**
+
+- `rmq_connection_url`: RabbitMQ connection string (same as MessageRelay)
+- `rmq_connection`: aio-pika connection object (same as MessageRelay)
+- `exchange_name`: Name of the RabbitMQ exchange (same as MessageRelay)
+- `retry_delays`: Default retry delays (in seconds) for all listeners. A sequence of delay times for exponential backoff. Defaults to `(1, 10, 60, 300)` (1s, 10s, 1m, 5m). Set to `()` for no retries.
+- `prefetch_count`: Number of messages to prefetch from RabbitMQ for each listener. Defaults to `10`
+- `enable_metrics`: Enable Prometheus metrics. Defaults to `True`
+- `listeners`: A sequence of `Listener` instances to consume messages for. Defaults to `()`
+
+**Methods:**
+
+- `run()`: Start the worker consuming messages. Blocks until SIGINT/SIGTERM is received.
+
+##### `listen()`
+
+A decorator that creates a `Listener` instance from a function.
+
+**Positional arguments:**
+
+- `binding_key`: The binding key to use for the listener. Supports wildcards, e.g. `user.*` will match `user.created`, `user.updated`, etc, according to RabbitMQ's topic exchange rules
+
+**Keyword-only arguments:**
+
+- `queue`: The name of the queue to use for the listener. If not provided (empty string), a name based on the callback's module and qualname will be auto-generated
+- `retry_delays`: Retry delays (in seconds) for this listener. Overrides the Worker's default retry_delays. Set to `()` for no retries.
+
+Returns a `Listener` instance that is also callable (delegates to the original function).
+
+##### `Listener`
+
+A dataclass representing a message handler.
+
+**Fields:**
+
+- `binding_key`: The binding key pattern to match messages against
+- `callback`: The async function to call when a message is received
+- `queue`: The queue name (auto-generated from callback if empty string)
+- `retry_delays`: Retry delays in seconds for this listener (None means use Worker's default)
+
+The `Listener` instance is callable and will delegate to the `callback` function, making it transparent for testing.
+
+</details>
+
+<details>
+    <summary><h4>Retries and dead-lettering</h4></summary>
 
 When a listener raises an exception, the library implements **exponential backoff** with delayed retries using RabbitMQ's TTL-based delay queues. Messages that fail are sent to a delay queue, and after the configured delay expires, they are automatically routed back to the original queue for retry.
 
@@ -256,148 +704,7 @@ async def process_order(order_id: int):
 </details>
 
 <details>
-    <summary><h3>Tracking IDs</h3></summary>
-
-While using the outbox pattern, you will be emitting messages from an entrypoint (usually and API endpoint) which will be picked up by listeners which will in turn emit their own messages and so on. It can be beneficial to assign tracking IDs so that you can track the entire history of emissions. This library assigns a UUID every time you emit, then the listener will get the tracking history of the current event and then, when it emits, will append its own UUID. You can get the whole list of UUIDs by invoking `outbox.get_tracking_ids()` inside the listener or by passing a `tracking_ids` parameter to the listener:
-
-```python
-from collections.abc import Sequence
-
-async def entrypoint():
-    async with AsyncSession(db_engine) as session:
-        await emitter.emit(session, "user.created", {"id": 123, "username": "johndoe"})
-        await session.commit()
-
-@listen("user.created")
-async def on_user_created(user, tracking_ids: Sequence[str]):
-    logger.info(f"User created {user.id}, tracking IDs: {tracking_ids}")
-    async with AsyncSession(db_engine) as session:
-        await emitter.emit(session, "user.welcome_email", {"id": user.id})
-        await emitter.emit(session, "user.created_notification", {"id": user.id})
-        await session.commit()
-
-@listen("user.welcome_email")
-async def on_user_welcome_email(user, tracking_ids: Sequence[str]):
-    logger.info(f"Welcome email sent for user {user.id}, tracking IDs: {tracking_ids}")
-
-@listen("user.created_notification")
-async def on_user_created_notification(user, tracking_ids):
-    logger.info(f"Notification created for user {user.id}, tracking IDs: {tracking_ids}")
-```
-
-The log statements in this case will output:
-
-```
-User created 123, tracking IDs: ['uuid1']
-Welcome email sent for user 123, tracking IDs: ['uuid1', 'uuid2']
-Notification created for user 123, tracking IDs: ['uuid1', 'uuid3']
-```
-
-If you want to include a UUID for the entrypoint as well, you have to wrap your initial emits (or the entire entrypoint) with `tracking()`:
-
-```python
-from outbox import tracking
-
-async def entrypoint():
-    with tracking():
-        async with AsyncSession(db_engine) as session:
-            await emitter.emit(session, "user.created", {"id": 123, "username": "johndoe"})
-            await session.commit()
-```
-
-In that case, your output would be:
-
-```
-User created 123, tracking IDs: ['uuid1', uuid2']
-Welcome email sent for user 123, tracking IDs: ['uuid1', 'uuid2', 'uuid3']
-Notification created for user 123, tracking IDs: ['uuid1', 'uuid2', 'uuid4']
-```
-
-</details>
-
-<details>
-    <summary><h3>Graceful shutdown</h3></summary>
-
-When the worker receives a SIGINT or SIGTERM, it will request a disconnect from all the queues. Any messages that are sent before the disconnect request is processed will be rejected by the worker with `requeue=True` (so they will be consumed by other workers, immediately or later). In the meantime, any messages that have already started being processed will keep being processed until the listener function terminates. When all pending tasks have finished, the worker will exit.
-
-Example sequence of events:
-
-```mermaid
-sequenceDiagram
-    participant Pub as Publisher
-    participant Q as RabbitMQ Queue
-    participant W as Worker
-    participant OW as Other Worker
-
-    W->>W: Start
-    Pub->>Q: Publish event 1
-    Q-->>W: Send event 1
-    W->>W: Start processing event 1
-
-    Note right of W: SIGINT or SIGTERM received
-    W->>Q: Request disconnect from all queues
-
-    Pub->>Q: Publish event 2
-    Q-->>W: Send event 2
-    W->>Q: Reject event 2 (requeue=True)
-
-    Q-->>W: Acknowledge disconnect request
-
-    Pub->>Q: Publish event 3
-    Note right of Q: Event 3 not sent to W
-
-    W->>W: Finish processing event 1
-    W->>Q: Ack event 1
-    W->>W: Exit
-
-    OW->>Q: Start and connect
-    Q-->>OW: Send event 2
-    Q-->>OW: Send event 3
-    OW->>OW: Process event 2
-    OW->>Q: Ack event 2
-    OW->>OW: Process event 3
-    OW->>Q: Ack event 3
-```
-
-</details>
-
-<details>
-    <summary><h3>Topic exchange and wildcard matching</h3></summary>
-
-```python
-# Main application
-async with AsyncSession(db_engine) as session:
-    await emit(session, "user.created", {"id": 123, "username": "johndoe"})
-    await session.commit()
-
-# Worker process
-@listen("user.*")
-async def on_user_event(user):
-    print(user)
-    # <<< {"id": 123, "username": "johndoe"}
-```
-
-If you are using this and you want to know the routing key inside the body of the listener, you can add a `routing_key` argument to the listener:
-
-```python
-# Main application
-async with AsyncSession(db_engine) as session:
-    await emit(session, "user.created", {"id": 123, "username": "johndoe"})
-    await session.commit()
-
-# Worker process
-@listen("user.*")
-async def on_user_event(routing_key: str, user):
-    logger.info(f"Received {routing_key=}")
-    # <<< Received routing_key=user.created
-    print(user)
-    # <<< {"id": 123, "username": "johndoe"}
-```
-
-</details>
-
-<details>
-    <summary><h3>Listener arguments</h3></summary>
+    <summary><h4>Listener arguments</h4></summary>
 
 Given everything we have discussed so far, the worker will populate the arguments of your listener functions based on their names and/or type annotations.
 
@@ -413,165 +720,12 @@ You must have exactly **one** argument that doesn't meet the above criteria, whi
 
 </details>
 
-<details>
-    <summary><h3>Delayed execution</h3></summary>
+## Best Practices
 
-You can cause an event to be sent some time in the future by setting the `eta` argument during `emitter.emit()`:
-
-```python
-async with AsyncSession(db_engine) as session:
-    await emitter.emit(
-        session,
-        "user.created",
-        {"id": 123, "username": "johndoe"},
-        eta=datetime.datetime.now() + datetime.timedelta(minutes=5),
-    )
-    await session.commit()
-```
-
-</details>
+### Overall
 
 <details>
-    <summary><h3>Automatic (de)serialization of Pydantic models</h3></summary>
-
-```python
-class User(BaseModel):
-    id: int
-    username: str
-
-# Main application
-async with AsyncSession(db_engine) as session:
-    await emitter.emit(session, "user.created", User(id=123, username="johndoe"))
-    await session.commit()
-
-# Worker process
-@listen("user.created")
-async def on_user_created(user: User):  # inspects type annotation
-    print(user)
-    # <<< User(id=123, username="johndoe")
-```
-
-</details>
-
-<details>
-    <summary><h3>Outbox table cleanup</h3></summary>
-
-You can choose a strategy for when already sent messages from the outbox table should be cleaned up by passing the `clean_up_after` argument to the MessageRelay constructor:
-
-```python
-message_relay = MessageRelay(
-    db_engine_url="...",
-    rmq_connection_url="...",
-    clean_up_after=datetime.timedelta(days=7)
-)
-```
-
-The options are:
-
-- **`IMMEDIATELY` (the default)**: messages are cleaned up immediately after being sent to RabbitMQ.
-- **`NEVER`**: messages are never cleaned up, you will have to do it manually.
-- **Any `datetime.timedelta` instance**.
-
-</details>
-
-<details>
-    <summary><h3>Blocking I/O and CPU-bound work</h3></summary>
-
-The outbox pattern is designed for **async I/O-bound operations** like sending emails, calling external APIs, or writing to databases. For these tasks, the library's async approach using `asyncio.create_task()` provides excellent concurrency without blocking.
-
-However, there are two scenarios where you might need different handling:
-
-#### Blocking I/O (Legacy Codebases)
-
-If you're integrating the outbox pattern into an existing codebase with **synchronous/blocking I/O** code, the `@listen` decorator automatically detects and handles this. You can use regular (non-async) functions as callbacks:
-
-```python
-from outbox import listen
-
-# Async callback (preferred for new code)
-@listen("user.created")
-async def async_handler(user):
-    await send_email_async(user)  # Non-blocking async I/O
-
-# Sync callback (for legacy code with blocking I/O)
-@listen("order.created")
-def sync_handler(order):
-    send_email_blocking(order)  # Blocking I/O - automatically runs in thread pool
-    update_crm_blocking(order)   # Blocking I/O - automatically runs in thread pool
-```
-
-**How it works:**
-
-- The library detects if your callback is sync or async using `asyncio.iscoroutinefunction()`
-- Sync callbacks are automatically wrapped with `asyncio.to_thread()` to run in a thread pool
-- This prevents blocking the event loop while maintaining compatibility with legacy code
-- Concurrency is controlled by `prefetch_count` - at most N callbacks (sync or async) run simultaneously
-
-**Performance notes:**
-
-- Thread pool overhead exists but is minimal for I/O-bound work
-- Prefer async callbacks for new code - they're more efficient
-- This feature enables **gradual migration** from sync to async code
-
-#### CPU-Bound Work
-
-If your listener needs to perform **CPU-intensive work** (image processing, data transformations, heavy computations), you should offload it to a **process pool** (not thread pool). This is **not built into the library** because:
-
-1. Most outbox use cases are I/O-bound, not CPU-bound
-2. Users have different needs (process pools, thread pools, custom executors)
-3. Python's standard library already makes this straightforward
-
-Here's how to handle CPU-bound work:
-
-```python
-import asyncio
-from concurrent.futures import ProcessPoolExecutor
-from outbox import listen
-
-# Create a process pool (do this once at startup)
-process_pool = ProcessPoolExecutor(max_workers=4)
-
-def cpu_intensive_task(image_data: bytes) -> bytes:
-    """This runs in a separate process, doesn't block the event loop"""
-    # Expensive CPU work: resize, filter, transform, etc.
-    from PIL import Image
-    import io
-
-    image = Image.open(io.BytesIO(image_data))
-    image.thumbnail((800, 600))
-
-    output = io.BytesIO()
-    image.save(output, format='JPEG')
-    return output.getvalue()
-
-@listen("image.uploaded")
-async def process_image(image_data: bytes):
-    """Listener remains async and non-blocking"""
-    loop = asyncio.get_event_loop()
-
-    # Offload CPU work to process pool
-    processed_data = await loop.run_in_executor(
-        process_pool,
-        cpu_intensive_task,
-        image_data
-    )
-
-    # Continue with I/O-bound work
-    await upload_to_storage(processed_data)
-```
-
-**Why process pool instead of thread pool for CPU work?**
-
-- Python's GIL (Global Interpreter Lock) prevents true parallelism in threads for CPU-bound tasks
-- Process pools bypass the GIL by using separate processes
-- For blocking I/O, threads are sufficient (and more efficient) because I/O releases the GIL
-
-This pattern gives you complete control over parallelism while keeping the library focused and simple.
-
-</details>
-
-<details>
-    <summary><h3>Logging</h3></summary>
+    <summary><h4>Logging</h4></summary>
 
 The library logs important events (emitted messages, processing results, retries, errors) using Python's standard logging module under the logger name `"outbox"`. Since the outbox pattern handles critical infrastructure (message processing, retries, dead-letter queues), **logs are enabled by default** to ensure you're aware of any issues.
 
@@ -608,11 +762,11 @@ For production, `logging.INFO` is recommended so you can track message flow with
 </details>
 
 <details>
-    <summary><h3>Database setup</h3></summary>
+    <summary><h4>Database setup</h4></summary>
 
 If you pass `auto_create_table=True` to the `Emitter` or `MessageRelay` constructors, then the library will automatically get-or-create the outbox table before it's needed (before emitting and during the message relay). This is fine for development environments or if your policies around the database are not particularly strict. If you want better control of your database, you can leave `auto_create_table=False`, which is the default, and do this:
 
-#### Using Alembic
+##### Using Alembic
 
 If you manage database migrations using Alembic, before deploying the code that uses this library, you should create a new empty migration:
 
@@ -687,7 +841,7 @@ def downgrade():
     op.drop_table("outbox_table")
 ```
 
-#### Using raw SQL
+##### Using raw SQL
 
 If you manage your database schema with SQL, run the following commands:
 
@@ -732,108 +886,7 @@ CREATE TRIGGER outbox_notify_trigger
 </details>
 
 <details>
-    <summary><h3>Connection resilience</h3></summary>
-
-The library uses `aio_pika.connect_robust()` for RabbitMQ connections, which provides automatic reconnection with full state recovery (queues, exchanges, bindings, and consumers). If RabbitMQ restarts or network issues occur, connections automatically recover without manual intervention.
-
-For additional control over connection resilience, you can pass connection objects directly to the class constructors:
-
-**PostgreSQL - Configure connection pooling:**
-
-```python
-from sqlalchemy.ext.asyncio import create_async_engine
-
-db_engine = create_async_engine(
-    "postgresql+asyncpg://user:password@localhost/dbname",
-    pool_pre_ping=True,        # Test connections before use (recommended)
-    pool_recycle=3600,         # Recycle connections after 1 hour
-    pool_size=5,               # Connection pool size
-    max_overflow=10,           # Max connections beyond pool_size
-)
-
-emitter = Emitter(db_engine=db_engine)
-message_relay = MessageRelay(db_engine=db_engine, rmq_connection_url="...")
-```
-
-**Key parameters:**
-
-- `pool_pre_ping=True` - Most important! Tests if a connection is alive before use, prevents "connection closed" errors
-- `pool_recycle=3600` - Closes and recreates connections after specified seconds to prevent stale connections
-- `pool_size` and `max_overflow` - Control connection pool sizing for your workload
-
-**RabbitMQ - Configure heartbeat and other connection parameters:**
-
-```python
-import aio_pika
-
-rmq_connection = await aio_pika.connect_robust(
-    "amqp://guest:guest@localhost:5672/",
-    heartbeat=30,              # Send heartbeats every 30 seconds (default: 60)
-)
-
-message_relay = MessageRelay(db_engine=db_engine, rmq_connection=rmq_connection)
-worker = Worker(rmq_connection=rmq_connection, ...)
-```
-
-Heartbeats detect dead connections and trigger automatic reconnection. The default timeout (60s) works for most cases, but you can adjust it based on your network reliability
-
-</details>
-
-<details>
-    <summary><h3>Observability</h3></summary>
-
-Outbox provides optional Prometheus metrics for monitoring message flow and performance. Metrics automatically register to prometheus_client's global registry, so they work seamlessly with your existing Prometheus instrumentation:
-
-```python
-from prometheus_client import start_http_server, Counter
-from outbox import MessageRelay, Worker
-
-# Your application metrics
-my_counter = Counter('my_app_requests_total', 'Total requests')
-
-# Start Prometheus HTTP server once
-start_http_server(9090)
-
-# Outbox metrics are automatically included
-message_relay = MessageRelay(
-    db_engine_url="...",
-    rmq_connection_url="...",
-    enable_metrics=True,  # Default is True
-    exchange_name="orders",
-)
-
-worker = Worker(enable_metrics=True, ...)  # Default is True
-
-# Both your metrics and outbox metrics are served at :9090/metrics
-```
-
-#### Available Metrics
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `outbox_messages_published_total` | Counter | `exchange_name` | Messages successfully published from outbox table |
-| `outbox_publish_failures_total` | Counter | `exchange_name`, `failure_type`, `error_type` | Failed publish attempts to RabbitMQ |
-| `outbox_message_age_seconds` | Histogram | `exchange_name` | Time message spent in outbox table before publishing |
-| `outbox_poll_duration_seconds` | Histogram | `exchange_name` | Time to poll DB and publish one message |
-| `outbox_table_backlog` | Gauge | `exchange_name` | Current unsent messages in outbox table |
-| `outbox_messages_received_total` | Counter | `queue`, `exchange_name` | Messages received from RabbitMQ queue |
-| `outbox_messages_processed_total` | Counter | `queue`, `exchange_name`, `status` | Messages processed with outcome (success/failed/rejected) |
-| `outbox_retry_attempts_total` | Counter | `queue`, `delay_seconds` | Retry attempts by delay tier |
-| `outbox_message_processing_duration_seconds` | Histogram | `queue`, `exchange_name` | Handler execution time |
-| `outbox_dlq_messages` | Gauge | `queue` | Current messages in dead letter queue (updated every 30s) |
-| `outbox_active_consumers` | Gauge | `queue`, `exchange_name` | Active consumer connections |
-
-#### Disabling Metrics
-
-```python
-message_relay = MessageRelay(enable_metrics=False, ...)
-worker = Worker(enable_metrics=False, ...)
-```
-
-</details>
-
-<details>
-    <summary><h3>Pre-provisioning RabbitMQ Resources</h3></summary>
+    <summary><h4>Pre-provisioning RabbitMQ Resources</h4></summary>
 
 ## The Problem
 
@@ -1184,113 +1237,134 @@ The library's declarative approach (`declare_exchange`/`declare_queue`) means:
 
 </details>
 
+### Emitter
+
 <details>
-    <summary><h3>API</h3></summary>
+    <summary><h4>Emit inside database transaction</h4></summary>
 
-#### `Emitter`
+You can (and should) call `emitter.emit` inside a database transaction. This way, data creation and triggering of side-effects will either succeed together or fail together. This is the main goal of the outbox pattern.
 
-Class for emitting messages to the outbox table.
+```python
+async with AsyncSession(db_engine) as session, session.begin():
+    session.add(User(id=123, username="johndoe"))
+    await emitter.emit(session, "user.created", {"id": 123, "username": "johndoe"})
+    # commit not needed because of `session.begin()`
+```
 
-**Constructor parameters:**
+</details>
 
-- `db_engine_url`: A string that indicates database dialect and connection arguments. Will be passed to SQLAlchemy. For async: `postgresql+asyncpg://<username>:<password>@<host>:<port>/<db_name>`. For sync: `postgresql+psycopg2://<username>:<password>@<host>:<port>/<db_name>`. Example: `postgresql+asyncpg://postgres:postgres@localhost:5432/postgres`
-- `db_engine`: If you already have a SQLAlchemy engine, you can pass it here instead of `db_engine_url` (you must pass either one or the other). Accepts both `AsyncEngine` (async) and `Engine` (sync)
-- `expiration`: Default expiration time for messages in RabbitMQ. Defaults to `None` (no expiration)
-- `table_name`: Name of the outbox table to use. Defaults to `outbox_table`
-- `auto_create_table`: If `True`, the outbox table will be automatically created if it does not exist. Defaults to `False`
+### Worker
 
-**Methods:**
+<details>
+    <summary><h4>CPU-Bound Work</h4></summary>
 
-- `emit(session, routing_key, body, *, expiration=None, eta=None)`: Emit a single message to the outbox table. Automatically detects sync vs async based on session type
-  - `session`: A SQLAlchemy session (`Session` for sync, `AsyncSession` for async)
-  - `routing_key`: The routing key to use for the message
-  - `body`: The body of the message. If it is an instance of a Pydantic model, it will be serialized by Pydantic, if it is bytes, it will be used as is, otherwise outbox will attempt to serialize it with `json.dumps`
-  - `expiration`: The expiration time in seconds for the message. Overrides the default set in the constructor
-  - `eta`: The time at which the message should be sent. Can be a `datetime`, a `timedelta` or an interval in milliseconds
+If your listener needs to perform **CPU-intensive work** (image processing, data transformations, heavy computations), you should offload it to a **process pool** (not thread pool). This is **not built into the library** because:
 
-- `emit_async(session, routing_key, body, *, expiration=None, eta=None)`: Async version of `emit()` (explicit)
-- `emit_sync(session, routing_key, body, *, expiration=None, eta=None)`: Sync version of `emit()` (explicit)
+1. Most outbox use cases are I/O-bound, not CPU-bound
+2. Users have different needs (process pools, thread pools, custom executors)
+3. Python's standard library already makes this straightforward
 
-- `bulk_emit(session, messages)`: Emit multiple messages in a single database operation. Automatically detects sync vs async based on session type
-  - `session`: A SQLAlchemy session (`Session` for sync, `AsyncSession` for async)
-  - `messages`: A sequence of `OutboxMessage` instances
+Here's how to handle CPU-bound work:
 
-- `bulk_emit_async(session, messages)`: Async version of `bulk_emit()` (explicit)
-- `bulk_emit_sync(session, messages)`: Sync version of `bulk_emit()` (explicit)
+```python
+import asyncio
+from concurrent.futures import ProcessPoolExecutor
+from outbox import listen
 
-#### `MessageRelay`
+# Create a process pool (do this once at startup)
+process_pool = ProcessPoolExecutor(max_workers=4)
 
-Class for relaying messages from the outbox table to RabbitMQ.
+def cpu_intensive_task(image_data: bytes) -> bytes:
+    """This runs in a separate process, doesn't block the event loop"""
+    # Expensive CPU work: resize, filter, transform, etc.
+    from PIL import Image
+    import io
 
-**Constructor parameters:**
+    image = Image.open(io.BytesIO(image_data))
+    image.thumbnail((800, 600))
 
-- `db_engine_url`: Database connection string (same as Emitter)
-- `db_engine`: SQLAlchemy engine (same as Emitter)
-- `rmq_connection_url`: A string that indicates RabbitMQ connection parameters. Follows the pattern `amqp[s]://<username>:<password>@<host>:(<port>)/(virtualhost)`. Example: `amqp://guest:guest@localhost:5672/`
-- `rmq_connection`: If you already have a aio-pika connection, you can pass it here instead of `rmq_connection_url` (you must pass either one or the other)
-- `exchange_name`: Name of the RabbitMQ exchange to use. Defaults to `outbox`
-- `notification_timeout`: Maximum time (in seconds) to wait for a PostgreSQL NOTIFY before checking for scheduled messages. Acts as a safety timeout. Defaults to `60` seconds
-- `expiration`: Default expiration time for messages (same as Emitter)
-- `clean_up_after`: How long to keep messages in the outbox table after they are sent. Can be `IMMEDIATELY`, `NEVER`, or a `timedelta`. Defaults to `IMMEDIATELY`
-- `table_name`: Name of the outbox table (same as Emitter)
-- `batch_size`: Number of messages to fetch and publish concurrently in each batch from the outbox table. Defaults to `50`. Higher values improve throughput but increase transaction duration and memory usage. Set to `1` for sequential processing.
-- `auto_create_table`: Auto-create table if missing (same as Emitter)
-- `enable_metrics`: Enable Prometheus metrics. Defaults to `True`
+    output = io.BytesIO()
+    image.save(output, format='JPEG')
+    return output.getvalue()
 
-**Methods:**
+@listen("image.uploaded")
+async def process_image(image_data: bytes):
+    """Listener remains async and non-blocking"""
+    loop = asyncio.get_event_loop()
 
-- `run()`: Start the message relay loop. Blocks until interrupted.
+    # Offload CPU work to process pool
+    processed_data = await loop.run_in_executor(
+        process_pool,
+        cpu_intensive_task,
+        image_data
+    )
 
-#### `Worker`
+    # Continue with I/O-bound work
+    await upload_to_storage(processed_data)
+```
 
-Class for consuming messages from RabbitMQ and dispatching them to listeners.
+**Why process pool instead of thread pool for CPU work?**
 
-**Constructor parameters:**
+- Python's GIL (Global Interpreter Lock) prevents true parallelism in threads for CPU-bound tasks
+- Process pools bypass the GIL by using separate processes
+- For blocking I/O, threads are sufficient (and more efficient) because I/O releases the GIL
 
-- `rmq_connection_url`: RabbitMQ connection string (same as MessageRelay)
-- `rmq_connection`: aio-pika connection object (same as MessageRelay)
-- `exchange_name`: Name of the RabbitMQ exchange (same as MessageRelay)
-- `retry_delays`: Default retry delays (in seconds) for all listeners. A sequence of delay times for exponential backoff. Defaults to `(1, 10, 60, 300)` (1s, 10s, 1m, 5m). Set to `()` for no retries.
-- `prefetch_count`: Number of messages to prefetch from RabbitMQ for each listener. Defaults to `10`
-- `enable_metrics`: Enable Prometheus metrics. Defaults to `True`
-- `listeners`: A sequence of `Listener` instances to consume messages for. Defaults to `()`
-
-**Methods:**
-
-- `run()`: Start the worker consuming messages. Blocks until SIGINT/SIGTERM is received.
-
-#### `listen()`
-
-A decorator that creates a `Listener` instance from a function.
-
-**Positional arguments:**
-
-- `binding_key`: The binding key to use for the listener. Supports wildcards, e.g. `user.*` will match `user.created`, `user.updated`, etc, according to RabbitMQ's topic exchange rules
-
-**Keyword-only arguments:**
-
-- `queue`: The name of the queue to use for the listener. If not provided (empty string), a name based on the callback's module and qualname will be auto-generated
-- `retry_delays`: Retry delays (in seconds) for this listener. Overrides the Worker's default retry_delays. Set to `()` for no retries.
-
-Returns a `Listener` instance that is also callable (delegates to the original function).
-
-#### `Listener`
-
-A dataclass representing a message handler.
-
-**Fields:**
-
-- `binding_key`: The binding key pattern to match messages against
-- `callback`: The async function to call when a message is received
-- `queue`: The queue name (auto-generated from callback if empty string)
-- `retry_delays`: Retry delays in seconds for this listener (None means use Worker's default)
-
-The `Listener` instance is callable and will delegate to the `callback` function, making it transparent for testing.
+This pattern gives you complete control over parallelism while keeping the library focused and simple.
 
 </details>
 
 <details>
-  <summary><h3>Benchmarks</h3></summary>
+    <summary><h4>Connection resilience</h4></summary>
+
+The library uses `aio_pika.connect_robust()` for RabbitMQ connections, which provides automatic reconnection with full state recovery (queues, exchanges, bindings, and consumers). If RabbitMQ restarts or network issues occur, connections automatically recover without manual intervention.
+
+For additional control over connection resilience, you can pass connection objects directly to the class constructors:
+
+**PostgreSQL - Configure connection pooling:**
+
+```python
+from sqlalchemy.ext.asyncio import create_async_engine
+
+db_engine = create_async_engine(
+    "postgresql+asyncpg://user:password@localhost/dbname",
+    pool_pre_ping=True,        # Test connections before use (recommended)
+    pool_recycle=3600,         # Recycle connections after 1 hour
+    pool_size=5,               # Connection pool size
+    max_overflow=10,           # Max connections beyond pool_size
+)
+
+emitter = Emitter(db_engine=db_engine)
+message_relay = MessageRelay(db_engine=db_engine, rmq_connection_url="...")
+```
+
+**Key parameters:**
+
+- `pool_pre_ping=True` - Most important! Tests if a connection is alive before use, prevents "connection closed" errors
+- `pool_recycle=3600` - Closes and recreates connections after specified seconds to prevent stale connections
+- `pool_size` and `max_overflow` - Control connection pool sizing for your workload
+
+**RabbitMQ - Configure heartbeat and other connection parameters:**
+
+```python
+import aio_pika
+
+rmq_connection = await aio_pika.connect_robust(
+    "amqp://guest:guest@localhost:5672/",
+    heartbeat=30,              # Send heartbeats every 30 seconds (default: 60)
+)
+
+message_relay = MessageRelay(db_engine=db_engine, rmq_connection=rmq_connection)
+worker = Worker(rmq_connection=rmq_connection, ...)
+```
+
+Heartbeats detect dead connections and trigger automatic reconnection. The default timeout (60s) works for most cases, but you can adjust it based on your network reliability
+
+</details>
+
+### Benchmarks
+
+<details>
+  <summary><h4>Performance Overview</h4></summary>
 
 The outbox pattern scales according to your needs - from ~3,500 msgs/sec with a single worker/relay to higher throughput with additional workers and relays. Performance is comparable to pure Celery, with the relay introducing minimal overhead despite providing transactional guarantees.
 
@@ -1299,11 +1373,11 @@ See [detailed benchmark results](src/benchmarks/README.md) for throughput scalin
 
 ## TODOs
 
-### Medium priority
+### High
+
+### Medium
 
 - [ ] Better/more error messages
-- [ ] Make tests faster (support ms delays?)
-- [ ] Split readme into features/best practices
 
 ### Low priority
 
