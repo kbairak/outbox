@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 from .log import logger
 from .metrics import metrics
-from .utils import Reject, tracking_ids_contextvar
+from .utils import Reject, parse_duration, tracking_ids_contextvar
 
 
 @dataclass
@@ -27,10 +27,10 @@ class Listener:
     binding_key: str
     callback: Union[Callable[..., Any], Callable[..., Coroutine[Any, Any, None]]]
     queue: str = ""
-    retry_delays: Optional[Sequence[int]] = None
+    retry_delays: Optional[Sequence[str]] = None
     _queue_obj: Optional[AbstractQueue] = None
     _consumer_tag: Optional[ConsumerTag] = None
-    _delay_exchanges: dict[int, AbstractExchange] = field(default_factory=dict)
+    _delay_exchanges: dict[str, AbstractExchange] = field(default_factory=dict)
     _exchange_name: Optional[str] = None
 
     def __post_init__(self) -> None:
@@ -194,19 +194,20 @@ class Listener:
             return
 
         # Get delay for this attempt
-        delay = retry_delays[attempt_count - 1]
+        delay_str = retry_delays[attempt_count - 1]
+        delay_ms = parse_duration(delay_str)
 
         # For instant retries (delay=0), use nack(requeue=True) to avoid unnecessary exchange/queue overhead
-        if delay == 0:
+        if delay_ms == 0:
             await message.nack(requeue=True)
-            metrics.retry_attempts.labels(queue=self.queue, delay_seconds=str(delay)).inc()
+            metrics.retry_attempts.labels(queue=self.queue, delay_seconds=delay_str).inc()
             logger.info(
                 f"Message requeued for instant retry (attempt {attempt_count}/{len(retry_delays)}) "
                 f"routing_key={message.routing_key}, {tracking_ids=}"
             )
             return
 
-        delay_exchange = self._delay_exchanges[delay]
+        delay_exchange = self._delay_exchanges[delay_str]
 
         # Prepare new headers with incremented delivery count and preserve original routing key
         new_headers = dict(message.headers) if message.headers else {}
@@ -245,18 +246,18 @@ class Listener:
         # Ack original message
         await message.ack()
 
-        metrics.retry_attempts.labels(queue=self.queue, delay_seconds=str(delay)).inc()
+        metrics.retry_attempts.labels(queue=self.queue, delay_seconds=delay_str).inc()
 
         logger.info(
             f"Message sent to delay exchange (attempt {attempt_count}/{len(retry_delays)}, "
-            f"delay {delay}s) routing_key={self.queue}, original_routing_key={message.routing_key}, {tracking_ids=}"
+            f"delay {delay_str}) routing_key={self.queue}, original_routing_key={message.routing_key}, {tracking_ids=}"
         )
 
 
 def listen(
     binding_key: str,
     queue: str = "",
-    retry_delays: Optional[Sequence[int]] = None,
+    retry_delays: Optional[Sequence[str]] = None,
 ) -> Callable[[Union[Callable[..., Any], Callable[..., Coroutine[Any, Any, None]]]], Listener]:
     def decorator(
         func: Union[Callable[..., Any], Callable[..., Coroutine[Any, Any, None]]],
@@ -272,7 +273,7 @@ class Worker:
     rmq_connection_url: Optional[str] = None
     listeners: Sequence[Listener] = field(default_factory=list)
     exchange_name: str = "outbox"
-    retry_delays: Sequence[int] = (1, 10, 60, 300)
+    retry_delays: Sequence[str] = ("1s", "10s", "1m", "5m")
     prefetch_count: int = 10
     enable_metrics: bool = True
     # Instance attribute (not just local var) to allow tests to simulate shutdown signals
@@ -383,32 +384,39 @@ class Worker:
             f"{self.exchange_name}.dlx", aio_pika.ExchangeType.DIRECT, durable=True
         )
 
-        # Collect all unique delay values across all listeners
-        # TODO: Minor: Use a reduce statement to create all_delays faster (with fewer LOC)
-        all_delays = set(self.retry_delays)
+        # Collect all unique delay strings from worker default and listener overrides
+        all_delay_strs: set[str] = set(self.retry_delays)
         for listener in self.listeners:
             if listener.retry_delays:
-                all_delays.update(listener.retry_delays)
+                all_delay_strs.update(listener.retry_delays)
+
+        # Parse and validate all delay strings upfront (before any RabbitMQ operations)
+        # Create a delay_str -> delay_ms mapping for efficient lookup
+        delay_map: dict[str, int] = {}
+        for delay_str in all_delay_strs:
+            delay_ms = parse_duration(delay_str)  # Let ValueError propagate naturally
+            delay_map[delay_str] = delay_ms
 
         # Create delay exchanges (fanout type) and their queues
         # Skip delay=0 since instant retries use nack(requeue=True)
         delay_exchanges = {}
-        for delay in all_delays:
-            if delay == 0:
+        for delay_str, delay_ms in delay_map.items():
+            if delay_ms == 0:
                 continue  # Instant retries handled by nack(requeue=True), no exchange needed
 
-            exchange_and_queue_name = f"{self.exchange_name}.delay_{delay}s"
+            # Use duration string directly in queue name (clean, no float precision issues)
+            exchange_and_queue_name = f"{self.exchange_name}.delay_{delay_str}"
             delay_exchange = await channel.declare_exchange(
                 exchange_and_queue_name, aio_pika.ExchangeType.FANOUT, durable=True
             )
-            delay_exchanges[delay] = delay_exchange
+            delay_exchanges[delay_str] = delay_exchange
 
             # Create delay queue and bind to delay exchange
             delay_queue = await channel.declare_queue(
                 exchange_and_queue_name,
                 durable=True,
                 arguments={
-                    "x-message-ttl": int(delay * 1000),
+                    "x-message-ttl": delay_ms,
                     "x-dead-letter-exchange": "",  # Default exchange (routes by queue name)
                     "x-queue-type": "quorum",
                 },

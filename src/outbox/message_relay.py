@@ -13,11 +13,10 @@ from aio_pika.message import encode_expiration
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
-from outbox.database import OutboxTable
-from outbox.utils import ensure_database_async
-
+from .database import OutboxTable
 from .log import logger
 from .metrics import metrics
+from .utils import ensure_database_async
 
 
 @dataclass

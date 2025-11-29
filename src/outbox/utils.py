@@ -1,7 +1,8 @@
+import re
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Awaitable, Generator, Optional, Union, overload
+from typing import Generator
 
 from sqlalchemy import Engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -85,3 +86,51 @@ def tracking() -> Generator[None, None, None]:
     token = tracking_ids_contextvar.set(tracking_ids)
     yield
     tracking_ids_contextvar.reset(token)
+
+
+def parse_duration(s: str) -> int:
+    """Convert a duration string to milliseconds
+
+    Valid inputs: 0, 0m, 0s, 0ms, 1m, 30s, 500ms, 1m30s, 1m500ms, 30s500ms, 1m30s500ms
+    Invalid inputs: 1h, 60m, 61m, 60s, 61s, 1000ms, 1001ms, 01m, 01s, 01ms, combinations of these
+        and negative values
+    """
+
+    if s in ("0", "0ms", "0s", "0m"):
+        return 0
+
+    match = re.search(r"^([^0]\d*m)?([^0]\d*s)?([^0]\d*ms)?$", s)
+    if match is None:
+        raise ValueError(f"Invalid duration string: {s!r}")
+    minutes_string, seconds_string, milliseconds_string = match.groups()
+
+    result = 0
+
+    if minutes_string:
+        minutes = int(minutes_string[:-1])
+        if not 1 <= minutes <= 59:
+            raise ValueError(
+                f"Invalid value for minutes {minutes_string!r}, must be between 1 and 60"
+            )
+        result += minutes * 60 * 1000
+
+    if seconds_string:
+        seconds = int(seconds_string[:-1])
+        if not 1 <= seconds <= 59:
+            raise ValueError(
+                f"Invalid value for seconds {seconds_string!r}, must be between 1 and 60"
+            )
+        result += seconds * 1000
+
+    if milliseconds_string:
+        milliseconds = int(milliseconds_string[:-2])
+        if not 1 <= milliseconds <= 999:
+            raise ValueError(
+                f"Invalid value for milliseconds {milliseconds_string!r}, must be between 1 and 999"
+            )
+        result += milliseconds
+
+    if result == 0:
+        raise ValueError(f"Invalid duration string: {s!r}")
+
+    return result

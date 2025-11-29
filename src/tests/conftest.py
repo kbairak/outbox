@@ -5,6 +5,7 @@ import pytest
 import pytest_asyncio
 from aio_pika.abc import AbstractConnection
 from sqlalchemy import Engine, create_engine, text
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import Session
 from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
@@ -86,6 +87,9 @@ def worker(rmq_connection: AbstractConnection) -> Worker:
 async def cleanup_database(db_engine: AsyncEngine) -> AsyncGenerator[None, None]:
     """Clean up the outbox table after each test to ensure test isolation"""
     yield
-    async with AsyncSession(db_engine) as session:
-        await session.execute(text("TRUNCATE TABLE outbox_table"))
-        await session.commit()
+    try:
+        async with AsyncSession(db_engine) as session:
+            await session.execute(text("TRUNCATE TABLE outbox_table"))
+            await session.commit()
+    except ProgrammingError:
+        pass

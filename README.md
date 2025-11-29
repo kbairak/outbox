@@ -638,13 +638,19 @@ When a listener raises an exception, the library implements **exponential backof
 
 **Configuring retry delays:**
 
-You can control retry behavior by configuring `retry_delays` - a sequence of delay times in seconds. For example, `retry_delays=(1, 10, 60, 300)` means:
+You can control retry behavior by configuring `retry_delays` - a sequence of delay duration strings. For example, `retry_delays=("1s", "10s", "1m", "5m")` means:
 
 - First failure: wait 1 second before retry (attempt 2)
 - Second failure: wait 10 seconds before retry (attempt 3)
-- Third failure: wait 60 seconds before retry (attempt 4)
-- Fourth failure: wait 300 seconds before retry (attempt 5)
+- Third failure: wait 1 minute before retry (attempt 4)
+- Fourth failure: wait 5 minutes before retry (attempt 5)
 - Fifth failure: send to dead-letter queue
+
+**Duration format** (from `parse_duration` function):
+
+Valid inputs: `0`, `0m`, `0s`, `0ms`, `1m`, `30s`, `500ms`, `1m30s`, `1m500ms`, `30s500ms`, `1m30s500ms`
+
+Invalid inputs: `1h`, `60m`, `61m`, `60s`, `61s`, `1000ms`, `1001ms`, `01m`, `01s`, `01ms`, combinations of these and negative values
 
 Configure retry delays at two levels, with per-listener overriding global:
 
@@ -652,12 +658,17 @@ Configure retry delays at two levels, with per-listener overriding global:
 from outbox import Worker, listen, Reject
 
 # Per-listener override
-@listen("user.created", retry_delays=(5, 30))  # Only 2 retries with these delays
+@listen("user.created", retry_delays=("5s", "30s"))  # Only 2 retries with these delays
 async def on_user_created(user):
     if some_transient_error:
         raise Exception("Will retry with configured delays")
     if some_permanent_error:
         raise Reject()  # Skip retries, send directly to DLQ
+
+# Fast retries for time-sensitive operations
+@listen("order.created", retry_delays=("500ms", "2s", "5s"))
+async def on_order_created(order):
+    pass
 
 # Disable retries for a specific listener
 @listen("user.deleted", retry_delays=())  # No retries - straight to DLQ on failure
@@ -665,7 +676,7 @@ async def on_user_deleted(user):
     pass  # Failures go directly to DLQ
 
 # Global default for all listeners
-worker = Worker(retry_delays=(1, 10, 60, 300), ...)
+worker = Worker(retry_delays=("1s", "10s", "1m", "5m"), ...)
 ```
 
 **Special cases:**
@@ -1363,13 +1374,9 @@ Heartbeats detect dead connections and trigger automatic reconnection. The defau
 
 ### Benchmarks
 
-<details>
-  <summary><h4>Performance Overview</h4></summary>
-
 The outbox pattern scales according to your needs - from ~3,500 msgs/sec with a single worker/relay to higher throughput with additional workers and relays. Performance is comparable to pure Celery, with the relay introducing minimal overhead despite providing transactional guarantees.
 
 See [detailed benchmark results](src/benchmarks/README.md) for throughput scaling, parameter tuning recommendations, and Celery comparison.
-</details>
 
 ## TODOs
 

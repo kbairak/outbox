@@ -62,7 +62,7 @@ async def main() -> None:
     worker = Worker(
         rmq_connection_url="amqp://guest:guest@localhost:5672/",
         listeners=(on_user_event, on_user_created, on_user_updated, on_user_deleted),
-        retry_delays=(1, 2, 3),
+        retry_delays=("1s", "2s", "3s"),
     )
     worker_task = asyncio.create_task(worker.run())
 

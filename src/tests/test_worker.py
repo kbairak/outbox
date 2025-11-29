@@ -133,7 +133,7 @@ async def test_retry(
     callcount = 0
     retrieved_argument = None
 
-    @listen("routing_key", queue="test_retry_queue", retry_delays=(1, 1))
+    @listen("routing_key", queue="test_retry_queue", retry_delays=("100ms", "100ms"))
     async def handler(person: object) -> None:
         nonlocal callcount, retrieved_argument
         callcount += 1
@@ -149,7 +149,7 @@ async def test_retry(
     await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(worker, [handler], timeout=3.0)
+    await run_worker(worker, [handler], timeout=0.5)
 
     # assert
     assert callcount == 3
@@ -168,7 +168,7 @@ async def test_instant_retry(
     callcount = 0
     retrieved_argument = None
 
-    @listen("routing_key", queue="test_instant_retry_queue", retry_delays=(0, 0, 1))
+    @listen("routing_key", queue="test_instant_retry_queue", retry_delays=("0ms", "0ms", "100ms"))
     async def handler(person: object) -> None:
         nonlocal callcount, retrieved_argument
         callcount += 1
@@ -183,8 +183,8 @@ async def test_instant_retry(
     await worker._set_up_queues()
     await message_relay._consume_outbox_table()
 
-    # test - first two retries should be instant (delay=0), third has 1s delay
-    await run_worker(worker, [handler], timeout=2.0)
+    # test - first two retries should be instant (delay=0), third has 100ms delay
+    await run_worker(worker, [handler], timeout=0.4)
 
     # assert - should succeed after 2 instant retries + 1 delayed retry
     assert callcount == 4
@@ -448,7 +448,7 @@ async def test_graceful_shutdown(
     async def handler(_: object) -> None:
         nonlocal before, after
         before += 1
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(0.3)
         after += 1
 
     await emit(session, "routing_key", {})
@@ -460,7 +460,7 @@ async def test_graceful_shutdown(
 
     worker_task = asyncio.create_task(worker.run())
 
-    await asyncio.sleep(0.2)  # Give some time for the task to reach `sleep`
+    await asyncio.sleep(0.15)  # Give some time for the task to reach `sleep`
     assert (before, after) == (1, 0)
 
     # test
@@ -486,7 +486,7 @@ async def test_messages_not_lost_during_graceful_shutdown(
     async def handler(_: object) -> None:
         nonlocal before, after
         before += 1
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(0.3)
         after += 1
 
     await emit(session, "routing_key", {})
@@ -498,14 +498,14 @@ async def test_messages_not_lost_during_graceful_shutdown(
 
     worker_task = asyncio.create_task(worker.run())
 
-    await asyncio.sleep(0.2)  # Give some time for the task to reach `sleep`
+    await asyncio.sleep(0.15)  # Give some time for the task to reach `sleep`
     assert (before, after) == (1, 0)
 
     assert worker._shutdown_future is not None
     worker._shutdown_future.set_result(None)  # Simulate SIGINT/TERM
 
     # Send another message while the worker is in shutdown mode
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.1)
     await emit(session, "routing_key", {})
     await session.commit()
     await message_relay._consume_outbox_table()
@@ -516,7 +516,7 @@ async def test_messages_not_lost_during_graceful_shutdown(
     # test
     # Start the worker again
     worker_task = asyncio.create_task(worker.run())
-    await asyncio.sleep(0.4)  # Give some time for the task to reach `sleep`
+    await asyncio.sleep(0.2)  # Give some time for the task to reach `sleep`
     assert (before, after) == (2, 1)
 
     # assert
@@ -631,7 +631,7 @@ async def test_emit_retry_delays(
 ) -> None:
     # arrange - test that default retry_delays from Outbox are used
     prev_retry_delays = worker.retry_delays
-    worker.retry_delays = (1, 1)
+    worker.retry_delays = ("100ms", "100ms")
     await emit(session, "r1", {})
     await session.commit()
 
@@ -649,7 +649,7 @@ async def test_emit_retry_delays(
     await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(worker, [handler], timeout=3.0)
+    await run_worker(worker, [handler], timeout=0.5)
 
     # assert
     assert callcount == 3
@@ -674,7 +674,7 @@ async def test_listen_retry_delays(
 
     callcount = 0
 
-    @listen("r1", retry_delays=(1,) * 2, queue="test_listen_retry_delays_queue")
+    @listen("r1", retry_delays=("100ms", "100ms"), queue="test_listen_retry_delays_queue")
     async def handler(_: object) -> None:
         nonlocal callcount
         callcount += 1
@@ -687,7 +687,7 @@ async def test_listen_retry_delays(
     await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(worker, [handler], timeout=3.0)
+    await run_worker(worker, [handler], timeout=0.5)
 
     # assert
     assert callcount == 3
@@ -707,7 +707,7 @@ async def test_setup_retry_delays(
 ) -> None:
     # arrange
     prev_retry_delays = worker.retry_delays
-    worker.retry_delays = (1, 1)
+    worker.retry_delays = ("100ms", "100ms")
 
     await emit(session, "r1", {})
     await session.commit()
@@ -726,7 +726,7 @@ async def test_setup_retry_delays(
     await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(worker, [handler], timeout=3.0)
+    await run_worker(worker, [handler], timeout=0.5)
 
     # assert
     assert callcount == 3
@@ -745,7 +745,7 @@ async def test_wildcard_routing_key_preserved_through_retries(
     callcount = 0
     retrieved_routing_keys = []
 
-    @listen("order.*", queue="test_wildcard_retry_queue", retry_delays=(1, 1))
+    @listen("order.*", queue="test_wildcard_retry_queue", retry_delays=("100ms", "100ms"))
     async def handler(routing_key: str, _: object) -> None:
         nonlocal callcount
         callcount += 1
@@ -761,7 +761,7 @@ async def test_wildcard_routing_key_preserved_through_retries(
     await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(worker, [handler], timeout=3.0)
+    await run_worker(worker, [handler], timeout=0.5)
 
     # assert - routing key should be preserved across all retry attempts
     assert callcount == 3
@@ -780,14 +780,14 @@ async def test_retry_routes_to_single_queue_only(
     queue1_callcount = 0
     queue2_callcount = 0
 
-    @listen("user.*", queue="test_retry_isolation_queue1", retry_delays=(1,))
+    @listen("user.*", queue="test_retry_isolation_queue1", retry_delays=("100ms",))
     async def handler1(_: object) -> None:
         nonlocal queue1_callcount
         queue1_callcount += 1
         if queue1_callcount == 1:
             raise ValueError("Simulated failure in queue1")
 
-    @listen("*.created", queue="test_retry_isolation_queue2", retry_delays=(1,))
+    @listen("*.created", queue="test_retry_isolation_queue2", retry_delays=("100ms",))
     async def handler2(_: object) -> None:
         nonlocal queue2_callcount
         queue2_callcount += 1
@@ -801,7 +801,7 @@ async def test_retry_routes_to_single_queue_only(
     await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(worker, [handler1, handler2], timeout=1.3)
+    await run_worker(worker, [handler1, handler2], timeout=0.35)
 
     # assert
     # Queue1: called twice (initial + 1 retry after failure)
@@ -932,7 +932,7 @@ async def test_sync_callback_exception_retry(
     # arrange
     callcount = 0
 
-    @listen("retry.test", queue="test_sync_retry", retry_delays=(1,))
+    @listen("retry.test", queue="test_sync_retry", retry_delays=("100ms",))
     def sync_handler(_: object) -> None:
         nonlocal callcount
         callcount += 1
@@ -947,7 +947,7 @@ async def test_sync_callback_exception_retry(
     await message_relay._consume_outbox_table()
 
     # test
-    await run_worker(worker, [sync_handler], timeout=2.0)
+    await run_worker(worker, [sync_handler], timeout=0.35)
 
     # assert - should be called twice (initial + 1 retry)
     assert callcount == 2

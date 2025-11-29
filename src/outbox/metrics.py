@@ -4,7 +4,7 @@ This module provides optional Prometheus metrics collection. If metrics are disa
 implementations are used instead.
 
 Usage:
-    from outbox.metrics import metrics
+    from .metrics import metrics
 
     metrics.enable_metrics(True)  # Enable metrics collection
     metrics.messages_published.labels(exchange_name="outbox").inc()
