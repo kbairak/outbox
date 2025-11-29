@@ -1,18 +1,45 @@
 import re
+import reprlib
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Generator
+from typing import Any, Generator
 
+import aio_pika
+from aio_pika.abc import AbstractConnection
 from sqlalchemy import Engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.orm import Session
 
 from outbox.database import Base
+from outbox.log import logger
 
 
 class Reject(Exception):
     pass
+
+
+# Configure reprlib for intelligent body truncation
+_body_repr = reprlib.Repr()
+_body_repr.maxstring = 100  # Truncate strings at 100 chars
+_body_repr.maxother = 200  # Truncate other reprs at 200 chars
+_body_repr.maxlist = 5  # Show first 5 list items
+_body_repr.maxdict = 5  # Show first 5 dict items
+
+
+def truncate_body(body: Any) -> str:
+    """Truncate body using reprlib to preserve structure."""
+    return _body_repr.repr(body)
+
+
+async def get_rmq_connection(rmq_connection_url: str) -> AbstractConnection:
+    try:
+        return await aio_pika.connect_robust(rmq_connection_url)
+    except Exception as exc:
+        raise ValueError(
+            f"Failed to connect to RabbitMQ at '{rmq_connection_url}': {exc}\n"
+            "Example: rmq_connection_url='amqp://guest:guest@localhost/'"
+        ) from exc
 
 
 _table_created: set[str] = set()
@@ -43,31 +70,43 @@ def ensure_database_sync(db_engine: Engine) -> None:
     if str(db_engine.url) in _table_created:
         return
 
-    Base.metadata.create_all(db_engine)
+    logger.info("Setting up outbox table with triggers")
+    try:
+        Base.metadata.create_all(db_engine)
 
-    # Create NOTIFY trigger for instant message delivery
-    with Session(db_engine) as session:
-        for notify_statement in notify_statements:
-            session.execute(notify_statement)
-        session.commit()
+        # Create NOTIFY trigger for instant message delivery
+        with Session(db_engine) as session:
+            for notify_statement in notify_statements:
+                session.execute(notify_statement)
+            session.commit()
 
-    _table_created.add(str(db_engine.url))
+        _table_created.add(str(db_engine.url))
+        logger.debug("Outbox table and triggers created successfully")
+    except Exception as exc:
+        logger.error(f"Failed to create outbox table: {exc}", exc_info=True)
+        raise
 
 
 async def ensure_database_async(db_engine: AsyncEngine) -> None:
     if str(db_engine.url) in _table_created:
         return
 
-    async with db_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    logger.info("Setting up outbox table with triggers")
+    try:
+        async with db_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
 
-    # Create NOTIFY trigger for instant message delivery
-    async with AsyncSession(db_engine) as session:
-        for notify_statement in notify_statements:
-            await session.execute(notify_statement)
-        await session.commit()
+        # Create NOTIFY trigger for instant message delivery
+        async with AsyncSession(db_engine) as session:
+            for notify_statement in notify_statements:
+                await session.execute(notify_statement)
+            await session.commit()
 
-    _table_created.add(str(db_engine.url))
+        _table_created.add(str(db_engine.url))
+        logger.debug("Outbox table and triggers created successfully")
+    except Exception as exc:
+        logger.error(f"Failed to create outbox table: {exc}", exc_info=True)
+        raise
 
 
 tracking_ids_contextvar: ContextVar[tuple[str, ...]] = ContextVar[tuple[str, ...]](
@@ -126,7 +165,8 @@ def parse_duration(s: str) -> int:
         milliseconds = int(milliseconds_string[:-2])
         if not 1 <= milliseconds <= 999:
             raise ValueError(
-                f"Invalid value for milliseconds {milliseconds_string!r}, must be between 1 and 999"
+                f"Invalid value for milliseconds {milliseconds_string!r}, must be between 1 and "
+                "999"
             )
         result += milliseconds
 

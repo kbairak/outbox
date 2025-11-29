@@ -52,21 +52,35 @@ class Emitter:
         rows = []
         now = datetime.datetime.now(datetime.timezone.utc)
         for message in messages:
-            if isinstance(message.body, BaseModel):
-                body = message.body.model_dump_json().encode()
-            elif not isinstance(message.body, bytes):
-                body = json.dumps(message.body).encode()
-            else:
-                body = message.body
+            try:
+                if isinstance(message.body, BaseModel):
+                    body = message.body.model_dump_json().encode()
+                elif not isinstance(message.body, bytes):
+                    body = json.dumps(message.body).encode()
+                else:
+                    body = message.body
+            except (TypeError, ValueError) as exc:
+                # Don't log - user called emit(), they'll see the exception
+                raise ValueError(
+                    f"Cannot serialize message body for routing_key={message.routing_key!r}: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
             if message.expiration is not None:
                 milliseconds = encode_expiration(message.expiration)
-                assert milliseconds is not None
+                if milliseconds is None:
+                    raise ValueError(
+                        "Invalid expiration value: encode_expiration returned None for "
+                        f"{message.expiration!r}"
+                    )
                 expiration = datetime.timedelta(milliseconds=int(milliseconds))
             else:
                 expiration = None
             if message.eta is not None:
                 milliseconds = encode_expiration(message.eta)
-                assert milliseconds is not None
+                if milliseconds is None:
+                    raise ValueError(
+                        f"Invalid eta value: encode_expiration returned None for {message.eta!r}"
+                    )
                 send_after = now + datetime.timedelta(milliseconds=int(milliseconds))
             else:
                 send_after = now
@@ -92,21 +106,34 @@ class Emitter:
         rows = []
         now = datetime.datetime.now(datetime.timezone.utc)
         for message in messages:
-            if isinstance(message.body, BaseModel):
-                body = message.body.model_dump_json().encode()
-            elif not isinstance(message.body, bytes):
-                body = json.dumps(message.body).encode()
-            else:
-                body = message.body
+            try:
+                if isinstance(message.body, BaseModel):
+                    body = message.body.model_dump_json().encode()
+                elif not isinstance(message.body, bytes):
+                    body = json.dumps(message.body).encode()
+                else:
+                    body = message.body
+            except (TypeError, ValueError) as exc:
+                # Don't log - user called emit(), they'll see the exception
+                raise ValueError(
+                    f"Cannot serialize message body for routing_key={message.routing_key!r}: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
             if message.expiration is not None:
                 milliseconds = encode_expiration(message.expiration)
-                assert milliseconds is not None
+                if milliseconds is None:
+                    raise ValueError(
+                        f"Invalid expiration value: encode_expiration returned None for {message.expiration!r}"
+                    )
                 expiration = datetime.timedelta(milliseconds=int(milliseconds))
             else:
                 expiration = None
             if message.eta is not None:
                 milliseconds = encode_expiration(message.eta)
-                assert milliseconds is not None
+                if milliseconds is None:
+                    raise ValueError(
+                        f"Invalid eta value: encode_expiration returned None for {message.eta!r}"
+                    )
                 send_after = now + datetime.timedelta(milliseconds=int(milliseconds))
             else:
                 send_after = now

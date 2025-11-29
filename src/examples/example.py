@@ -8,7 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from outbox import Emitter, MessageRelay, Worker, listen
 
+logging.basicConfig(level=logging.DEBUG)
 logging.getLogger("outbox").setLevel(logging.DEBUG)
+logging.getLogger("aio_pika").setLevel(logging.INFO)
+logging.getLogger("aiormq").setLevel(logging.INFO)
 
 start_http_server(8000)
 
@@ -32,28 +35,28 @@ class User(BaseModel):
 @listen(binding_key="user.*", queue="on_user_event")
 async def on_user_event(user: User, routing_key: str) -> None:
     if random.random() < 0.5:
-        raise Exception()
+        raise Exception("Listener error")
     print(f"User event other ({routing_key}): {user=}")
 
 
 @listen(binding_key="user.created", queue="on_user_created")
 async def on_user_created(user: User, routing_key: str) -> None:
     if random.random() < 0.6:
-        raise Exception()
+        raise Exception("Listener error")
     print(f"User event {routing_key}: {user=}")
 
 
 @listen(binding_key="user.updated", queue="on_user_updated")
 async def on_user_updated(user: User, routing_key: str) -> None:
     if random.random() < 0.7:
-        raise Exception()
+        raise Exception("Listener error")
     print(f"User event {routing_key}: {user=}")
 
 
 @listen(binding_key="user.deleted", queue="on_user_deleted")
 async def on_user_deleted(user: User, routing_key: str) -> None:
     if random.random() < 0.8:
-        raise Exception()
+        raise Exception("Listener error")
     print(f"User event {routing_key}: {user=}")
 
 

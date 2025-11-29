@@ -1418,11 +1418,9 @@ See [detailed benchmark results](src/benchmarks/README.md) for throughput scalin
 
 ## TODOs
 
-### High
+### High priority
 
-### Medium
-
-- [ ] Better/more error messages
+### Medium priority
 
 ### Low priority
 

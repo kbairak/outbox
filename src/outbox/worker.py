@@ -19,7 +19,13 @@ from pydantic import BaseModel
 
 from .log import logger
 from .metrics import metrics
-from .utils import Reject, parse_duration, tracking_ids_contextvar
+from .utils import (
+    Reject,
+    get_rmq_connection,
+    parse_duration,
+    tracking_ids_contextvar,
+    truncate_body,
+)
 
 
 @dataclass
@@ -51,7 +57,9 @@ class Listener:
                 return await asyncio.to_thread(_sync_callback, *args, **kwargs)
 
             # Preserve function signature for introspection
-            async_wrapper.__signature__ = inspect.signature(sync_callback)  # type: ignore[attr-defined]
+            async_wrapper.__signature__ = (  # type: ignore[attr-defined]
+                inspect.signature(sync_callback)
+            )
 
             self.callback = async_wrapper
 
@@ -91,7 +99,7 @@ class Listener:
             # If retry_delays is empty, messages go to DLQ (see exception handler below)
             if retry_delays and attempt_count > len(retry_delays) + 1:
                 logger.warning(
-                    f"Message {message.routing_key} with tracking IDs {tracking_ids_contextvar} exceeded "
+                    f"Message {message.routing_key} with tracking IDs {tracking_ids} exceeded "
                     f"retry attempts ({attempt_count} > {len(retry_delays) + 1}), sending to DLQ"
                 )
                 await message.nack(requeue=False)
@@ -117,12 +125,22 @@ class Listener:
                 body = json.loads(message.body)
         except Exception as exc:
             logger.error(
-                f"Failed to deserialize message body {routing_key=}, {tracking_ids_contextvar=}, {body=}, "
-                f"{exc=}"
+                f"Failed to deserialize message body {routing_key=}, {tracking_ids=}, "
+                f"error={type(exc).__name__}: {exc}",
+                exc_info=True,
             )
-            raise  # TODO: Will (should) this crash the worker?
+            await message.nack(requeue=False)  # Send to DLQ instead of crashing
+            metrics.messages_processed.labels(
+                queue=self.queue,
+                exchange_name=self._exchange_name,
+                status="deserialization_failed",
+            ).inc()
+            tracking_ids_contextvar.reset(token)
+            return  # Don't crash worker
         else:
-            logger.info(f"Processing message {routing_key=}, {tracking_ids_contextvar=}, {body=}")
+            logger.debug(
+                f"Processing message {routing_key=}, {tracking_ids=}, body={truncate_body(body)}"
+            )
 
         kwargs: dict[str, Any] = {body_param_key: body}
         if "routing_key" in parameters:
@@ -142,29 +160,27 @@ class Listener:
             await self.callback(**kwargs)
         except Reject:
             logger.warning(
-                f"Rejecting, this message will end up in DLQ {routing_key=}, {tracking_ids_contextvar=}, "
-                f"{body=}"
+                f"Rejecting, this message will end up in DLQ {routing_key=}, "
+                f"{tracking_ids=}, body={truncate_body(body)}"
             )
             await message.nack(requeue=False)
             metrics.messages_processed.labels(
                 queue=self.queue, exchange_name=self._exchange_name, status="rejected"
             ).inc()
-        except Exception:
-            if retry_delays:
-                logger.warning(f"Retrying {routing_key=}, {tracking_ids_contextvar=}, {body=}")
-                await self._delayed_retry(message, attempt_count, tracking_ids)
-            else:
-                # TODO: Check if this is really needed, maybe _delayed_retry() will take care of it
-                logger.warning(
-                    f"No retries configured, sending to DLQ {routing_key=}, {tracking_ids_contextvar=}, "
-                    f"{body=}"
-                )
-                await message.nack(requeue=False)
+        except Exception as exc:
+            # Catch everything - programming errors will pile up in DLQ, forcing fix
+            logger.warning(
+                f"Handler failed with {type(exc).__name__}: {exc}, retrying "
+                f"{routing_key=}, {tracking_ids=}, body={truncate_body(body)}, "
+                f"attempt={attempt_count}/{len(retry_delays)}",
+                exc_info=True,
+            )
+            await self._delayed_retry(message, attempt_count, tracking_ids)
             metrics.messages_processed.labels(
                 queue=self.queue, exchange_name=self._exchange_name, status="failed"
             ).inc()
         else:
-            logger.info(f"Success {routing_key=}, {tracking_ids_contextvar=}, {body=}")
+            logger.debug(f"Successfully processed {routing_key=}, {tracking_ids=}")
             await message.ack()
             metrics.messages_processed.labels(
                 queue=self.queue, exchange_name=self._exchange_name, status="success"
@@ -197,7 +213,8 @@ class Listener:
         delay_str = retry_delays[attempt_count - 1]
         delay_ms = parse_duration(delay_str)
 
-        # For instant retries (delay=0), use nack(requeue=True) to avoid unnecessary exchange/queue overhead
+        # For instant retries (delay=0), use nack(requeue=True) to avoid unnecessary exchange/queue
+        # overhead
         if delay_ms == 0:
             await message.nack(requeue=True)
             metrics.retry_attempts.labels(queue=self.queue, delay_seconds=delay_str).inc()
@@ -250,7 +267,8 @@ class Listener:
 
         logger.info(
             f"Message sent to delay exchange (attempt {attempt_count}/{len(retry_delays)}, "
-            f"delay {delay_str}) routing_key={self.queue}, original_routing_key={message.routing_key}, {tracking_ids=}"
+            f"delay {delay_str}) routing_key={self.queue}, "
+            f"original_routing_key={message.routing_key}, {tracking_ids=}"
         )
 
 
@@ -285,11 +303,8 @@ class Worker:
             raise ValueError("You cannot set both rmq_connection and rmq_connection_url")
 
     async def run(self) -> None:
-        if self.rmq_connection is None:
-            if self.rmq_connection_url is not None:
-                self.rmq_connection = await aio_pika.connect_robust(self.rmq_connection_url)
-            else:
-                raise ValueError("RabbitMQ connection is not set up.")
+        if self.rmq_connection is None and self.rmq_connection_url is not None:
+            self.rmq_connection = await get_rmq_connection(self.rmq_connection_url)
         if self.rmq_connection is None:
             logger.warning("Cannot update DLQ metrics: RabbitMQ connection not available")
             return
@@ -307,7 +322,11 @@ class Worker:
             asyncio.create_task(self._update_dlq_metrics()) if self.enable_metrics else None
         )
 
-        logger.info(f"Starting worker on exchange: {self.exchange_name} ...")
+        logger.info(
+            f"Starting worker on exchange '{self.exchange_name}' with "
+            f"{len(self.listeners)} listeners, prefetch_count={self.prefetch_count}, "
+            f"retry_delays={self.retry_delays}"
+        )
         for listener in self.listeners:
             assert listener._queue_obj is not None
 
@@ -328,7 +347,7 @@ class Worker:
 
         await self._shutdown_future
 
-        logger.info("Received shutdown signal, waiting or ongoing tasks and exiting...")
+        logger.info("Received shutdown signal, waiting for ongoing tasks and exiting...")
 
         for listener in self.listeners:
             if listener._consumer_tag is None:
@@ -359,9 +378,10 @@ class Worker:
                 for listener in self.listeners:
                     dlq_name = f"{listener.queue}.dlq"
                     try:
-                        dlq = await channel.get_queue(dlq_name, ensure=False)
+                        dlq = await channel.get_queue(dlq_name)
+                        declaration_result = await dlq.declare()
                         metrics.dlq_messages.labels(queue=listener.queue).set(
-                            float(dlq.declaration_result.message_count or 0)
+                            float(declaration_result.message_count or 0)
                         )
                     except Exception as exc:
                         logger.debug(f"Failed to get DLQ message count for {dlq_name}: {exc}")
@@ -377,12 +397,30 @@ class Worker:
 
         channel = await self.rmq_connection.channel()
         await channel.set_qos(prefetch_count=self.prefetch_count)
-        exchange = await channel.declare_exchange(
-            self.exchange_name, aio_pika.ExchangeType.TOPIC, durable=True
-        )
-        dead_letter_exchange = await channel.declare_exchange(
-            f"{self.exchange_name}.dlx", aio_pika.ExchangeType.DIRECT, durable=True
-        )
+
+        try:
+            exchange = await channel.declare_exchange(
+                self.exchange_name, aio_pika.ExchangeType.TOPIC, durable=True
+            )
+        except Exception as exc:
+            logger.error(
+                f"Failed to declare exchange '{self.exchange_name}': {exc}. "
+                f"Check RabbitMQ permissions and connection.",
+                exc_info=True,
+            )
+            raise  # Re-raise original aio-pika exception
+
+        try:
+            dead_letter_exchange = await channel.declare_exchange(
+                f"{self.exchange_name}.dlx", aio_pika.ExchangeType.DIRECT, durable=True
+            )
+        except Exception as exc:
+            logger.error(
+                f"Failed to declare dead letter exchange '{self.exchange_name}.dlx': {exc}. "
+                f"Check RabbitMQ permissions and connection.",
+                exc_info=True,
+            )
+            raise  # Re-raise original aio-pika exception
 
         # Collect all unique delay strings from worker default and listener overrides
         all_delay_strs: set[str] = set(self.retry_delays)
