@@ -119,12 +119,6 @@ consume(binding_key="...", queue="...", ...)(callback)
 
 When building applications, you often need to perform two operations together: save data to a database and trigger side effects (send an email, call an external API, publish an event). Both operations must succeed together or fail together to maintain consistency. Otherwise, if an error occurs between the database change and the triggering of side effects, your application will be left in an inconsistent state and manual intervention will be required.
 
-**Why traditional approaches fail:**
-
-- **Call side effect before commit**: If the database commit fails afterward, you've already triggered the side effect, leaving your system in an inconsistent state
-- **Call side effect after commit**: If the side effect fails, there's no way to retry it transactionally. The database operation succeeded but the side effect didn't
-- **Distributed transactions (2PC)**: Two-phase commit protocols are complex, slow, not always available across different systems, and can introduce coordination overhead
-
 **The outbox solution:**
 
 Instead of calling side effects directly, write event messages to an outbox table in the same database transaction as your business data. A separate reliable process (the message relay) reads from this table and publishes messages to your message broker.
@@ -138,7 +132,7 @@ Instead of calling side effects directly, write event messages to an outbox tabl
 
 ### Retried delays and DLQ (and why celery cannot do them)
 
-This library implements **exponential backoff** for failed messages using RabbitMQ's TTL-based delay queues. When a consumer raises an exception, the message is sent to a delay queue (e.g., `outbox.delay_10s`) with a TTL. After the delay expires, RabbitMQ automatically routes the message back to the original queue for retry.
+This library implements **delayed retries** for failed messages using RabbitMQ's TTL-based delay queues. When a consumer raises an exception, the message is sent to a delay queue (e.g., `outbox.delay_10s`) with a TTL. After the delay expires, RabbitMQ automatically routes the message back to the original queue for retry.
 
 **Dead-letter queues (DLQ):**
 
@@ -148,7 +142,7 @@ After exhausting all retry attempts, messages are sent to a dead-letter queue fo
 
 Celery has very flexible retry mechanisms: You can trigger retries explicitly, you can retry only on specific exceptions, you can set max retries and it can apply jitter to distribute a burst of retries over a slightly longer period of time. The main issue with Celery's retries is that, in order for a task to support them, the worker will immediately ACK the message from RabbitMQ which will cause it to be dropped from the queue. After this point, the message only exists inside the worker's memory. If the worker crashes because of an error not handled by Python's exception handling (eg out-of-memory) or if the orchestrator kills the worker because of a deployment or downscaling or for whatever reason, the message will be lost forever.
 
-The trade-off of using this library instead of Celery is that we lose the jitter feature and that we end up with many delay exchanges/queues that will need to be managed. What we get in return is the certainty that messages will never be lost and the fact that we can take advantage of all RabbitMQ's routing mechanisms.
+The trade-off of using this library instead of Celery is that we lose the jitter feature and that we end up with many delay exchanges/queues that will need to be managed. What we get in return is the certainty that messages will never be lost and the fact that we can take advantage of all of RabbitMQ's routing mechanisms.
 
 ### Why SQLAlchemy (Postgres), aio-pika (RabbitMQ) and Pydantic
 
@@ -241,52 +235,6 @@ Notification created for user 123, tracking IDs: ['uuid1', 'uuid2', 'uuid4']
 </details>
 
 <details>
-    <summary><h4>Graceful shutdown</h4></summary>
-
-When the worker receives a SIGINT or SIGTERM, it will request a disconnect from all the queues. Any messages that are sent before the disconnect request is processed will be rejected by the worker with `requeue=True` (so they will be consumed by other workers, immediately or later). In the meantime, any messages that have already started being processed will keep being processed until the consumer function terminates. When all pending tasks have finished, the worker will exit.
-
-Example sequence of events:
-
-```mermaid
-sequenceDiagram
-    participant Pub as Publisher
-    participant Q as RabbitMQ Queue
-    participant W as Worker
-    participant OW as Other Worker
-
-    W->>W: Start
-    Pub->>Q: Publish event 1
-    Q-->>W: Send event 1
-    W->>W: Start processing event 1
-
-    Note right of W: SIGINT or SIGTERM received
-    W->>Q: Request disconnect from all queues
-
-    Pub->>Q: Publish event 2
-    Q-->>W: Send event 2
-    W->>Q: Reject event 2 (requeue=True)
-
-    Q-->>W: Acknowledge disconnect request
-
-    Pub->>Q: Publish event 3
-    Note right of Q: Event 3 not sent to W
-
-    W->>W: Finish processing event 1
-    W->>Q: Ack event 1
-    W->>W: Exit
-
-    OW->>Q: Start and connect
-    Q-->>OW: Send event 2
-    Q-->>OW: Send event 3
-    OW->>OW: Process event 2
-    OW->>Q: Ack event 2
-    OW->>OW: Process event 3
-    OW->>Q: Ack event 3
-```
-
-</details>
-
-<details>
     <summary><h4>Topic exchange and wildcard matching</h4></summary>
 
 ```python
@@ -318,49 +266,6 @@ async def on_user_event(routing_key: str, user):
     print(user)
     # <<< {"id": 123, "username": "johndoe"}
 ```
-
-</details>
-
-<details>
-    <summary><h4>Blocking I/O and CPU-bound work</h4></summary>
-
-The outbox pattern is designed for **async I/O-bound operations** like sending emails, calling external APIs, or writing to databases. For these tasks, the library's async approach using `asyncio.create_task()` provides excellent concurrency without blocking.
-
-However, there are two scenarios where you might need different handling:
-
-##### Blocking I/O (Legacy Codebases)
-
-If you're integrating the outbox pattern into an existing codebase with **synchronous/blocking I/O** code, the `@consume` decorator automatically detects and handles this. You can use regular (non-async) functions as callbacks:
-
-```python
-from outbox import consume
-
-# Async callback (preferred for new code)
-@consume(binding_key="user.created", queue="async_handler")
-async def async_handler(user):
-    await send_email_async(user)  # Non-blocking async I/O
-
-# Sync callback (for legacy code with blocking I/O)
-@consume(binding_key="order.created", queue="sync_handler")
-def sync_handler(order):
-    send_email_blocking(order)  # Blocking I/O - automatically runs in thread pool
-    update_crm_blocking(order)   # Blocking I/O - automatically runs in thread pool
-```
-
-**How it works:**
-
-- The library detects if your callback is sync or async using `asyncio.iscoroutinefunction()`
-- Sync callbacks are automatically wrapped with `asyncio.to_thread()` to run in a thread pool
-- This prevents blocking the event loop while maintaining compatibility with legacy code
-- Concurrency is controlled by `prefetch_count` - at most N callbacks (sync or async) run simultaneously
-
-**Performance notes:**
-
-- Thread pool overhead exists but is minimal for I/O-bound work
-- Prefer async callbacks for new code - they're more efficient
-- This feature enables **gradual migration** from sync to async code
-
-For **CPU-bound work**, see Best Practices / Worker.
 
 </details>
 
@@ -453,6 +358,12 @@ Class for publishing messages to the outbox table.
 - `bulk_publish_async(session, messages)`: Async version of `bulk_publish()` (explicit)
 - `bulk_publish_sync(session, messages)`: Sync version of `bulk_publish()` (explicit)
 
+- `OutboxMessage`: A dataclass representing a message to be published. Used in `bulk_publish()`
+  - `routing_key`: The routing key to use for the message
+  - `body`: The body of the message. If it is an instance of a Pydantic model, it will be serialized by Pydantic, if it is bytes, it will be used as is, otherwise outbox will attempt to serialize it with `json.dumps`
+  - `expiration`: The expiration time in seconds for the message. Overrides the default set in the constructor
+  - `eta`: The time at which the message should be sent. Can be a `datetime`, a `timedelta` or an interval in milliseconds
+
 </details>
 
 <details>
@@ -499,7 +410,7 @@ with Session(db_engine) as session, session.begin():
 
 The `publish()` and `bulk_publish()` methods automatically detect whether you're using a sync `Session` or async `AsyncSession`. You can also use the explicit `publish_sync()`/`publish_async()` and `bulk_publish_sync()`/`bulk_publish_async()` methods.
 
-**Installation:** To use sync publishin, install the `noasync` dependency group to add psycopg2:
+**Installation:** To use sync publishing, install the `noasync` dependency group to add psycopg2:
 
 ```bash
 uv pip install --group noasync
@@ -634,7 +545,7 @@ The `Consumer` instance is callable and will delegate to the `callback` function
 <details>
     <summary><h4>Retries and dead-lettering</h4></summary>
 
-When a consumer raises an exception, the library implements **exponential backoff** with delayed retries using RabbitMQ's TTL-based delay queues. Messages that fail are sent to a delay queue, and after the configured delay expires, they are automatically routed back to the original queue for retry.
+When a consumer raises an exception, the library implements delayed retries using RabbitMQ's TTL-based delay queues. Messages that fail are sent to a delay queue, and after the configured delay expires, they are automatically routed back to the original queue for retry.
 
 **Configuring retry delays:**
 
@@ -715,6 +626,53 @@ async def process_order(order_id: int):
 </details>
 
 <details>
+    <summary><h4>Graceful shutdown</h4></summary>
+
+When the worker receives a SIGINT or SIGTERM, it will request a disconnect from all the queues. Any messages that are sent before the disconnect request is processed will be rejected by the worker with `requeue=True` (so they will be consumed by other workers, immediately or later). In the meantime, any messages that have already started being processed will keep being processed until the consumer function terminates. When all pending tasks have finished, the worker will exit.
+
+Example sequence of events:
+
+```mermaid
+sequenceDiagram
+    participant Pub as Publisher
+    participant Q as RabbitMQ Queue
+    participant W as Worker
+    participant OW as Other Worker
+
+    W->>Q: Start and connect
+    Pub->>Q: Publish message 1
+    Q-->>W: Send message 1
+    W->>W: Start processing message 1
+
+    Note right of W: SIGINT or SIGTERM received
+    W->>Q: Request disconnect from all queues
+
+    Pub->>Q: Publish message 2
+    Q-->>W: Send message 2
+    W->>Q: Reject message 2 (requeue=True)
+    Note left of Q: message 2 held in the queue
+
+    Q-->>W: Acknowledge disconnect request
+
+    Pub->>Q: Publish message 3
+    Note right of Q: Message 3 not sent to W
+
+    W->>W: Finish processing message 1
+    W->>Q: Ack message 1
+    W->>W: Exit
+
+    OW->>Q: Start and connect
+    Q-->>OW: Send message 2
+    Q-->>OW: Send message 3
+    OW->>OW: Process message 2
+    OW->>OW: Process message 3
+    OW->>Q: Ack message 2
+    OW->>Q: Ack message 3
+```
+
+</details>
+
+<details>
     <summary><h4>Consumer callback arguments</h4></summary>
 
 Given everything we have discussed so far, the worker will populate the arguments of your consumer functions based on their names and/or type annotations.
@@ -724,10 +682,52 @@ If you arguments are named:
 - `routing_key`: it will be populated with the routing key of the message (this may be useful if the binding key of the queue uses wildcards)
 - `message`: it will be populated with the raw aio-pika message object
 - `tracking_ids`: it will be populated with the tracking IDs of the message
-- `queue_name`: it will be populated with the name of the queue that the consumer is consuming from (may be useful if it was automatically generated by the library)
 - `attempt_count`: it will be populated with the number of attempts that have been made to process the message (starting from 1)
 
 You must have exactly **one** argument that doesn't meet the above criteria, which will be populated with the body of the message. If you supply a type annotation that is a subclass of `pydantic.BaseModel`, the library will automatically deserialize the body into an instance of that class. If you don't supply a type annotation, the library will attempt to deserialize it with `json.loads`. If that fails, you will receive the contents of the message as bytes.
+
+</details>
+
+<details>
+    <summary><h4>Blocking I/O and CPU-bound work</h4></summary>
+
+The outbox pattern is designed for **async I/O-bound operations** like sending emails, calling external APIs, or writing to databases. For these tasks, the library's async approach using `asyncio.create_task()` provides excellent concurrency without blocking.
+
+However, there are two scenarios where you might need different handling:
+
+##### Blocking I/O (Legacy Codebases)
+
+If you're integrating the outbox pattern into an existing codebase with **synchronous/blocking I/O** code, the `@consume` decorator automatically detects and handles this. You can use regular (non-async) functions as callbacks:
+
+```python
+from outbox import consume
+
+# Async callback (preferred for new code)
+@consume(binding_key="user.created", queue="async_handler")
+async def async_handler(user):
+    await send_email_async(user)  # Non-blocking async I/O
+
+# Sync callback (for legacy code with blocking I/O)
+@consume(binding_key="order.created", queue="sync_handler")
+def sync_handler(order):
+    send_email_blocking(order)  # Blocking I/O - automatically runs in thread pool
+    update_crm_blocking(order)   # Blocking I/O - automatically runs in thread pool
+```
+
+**How it works:**
+
+- The library detects if your callback is sync or async using `asyncio.iscoroutinefunction()`
+- Sync callbacks are automatically wrapped with `asyncio.to_thread()` to run in a thread pool
+- This prevents blocking the event loop while maintaining compatibility with legacy code
+- Concurrency is controlled by `prefetch_count` - at most N callbacks (sync or async) run simultaneously
+
+**Performance notes:**
+
+- Thread pool overhead exists but is minimal for I/O-bound work
+- Prefer async callbacks for new code - they're more efficient
+- This feature enables **gradual migration** from sync to async code
+
+For **CPU-bound work**, see Best Practices / Worker.
 
 </details>
 
@@ -746,10 +746,7 @@ If you haven't configured logging in your application, you'll see log output aut
 import logging
 
 # Configure logging for your entire application
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO)
 
 # Or control just the outbox logger
 logging.getLogger("outbox").setLevel(logging.WARNING)  # Only warnings and errors
@@ -1287,19 +1284,6 @@ worker = Worker(
 )
 ```
 
-This pattern works even when services consume from different exchanges:
-
-```python
-# orders-service consuming from payments exchange
-worker = Worker(
-    exchange_name="payments",
-    consumers=[
-        consume(binding_key="payment.completed", queue="orders.on_payment_completed")(handler),
-        # Queue name shows ownership, independent of exchange
-    ]
-)
-```
-
 Benefits: clear ownership in RabbitMQ UI, simplified infrastructure-as-code, easy filtering by service.
 
 </details>
@@ -1420,9 +1404,11 @@ See [detailed benchmark results](src/benchmarks/README.md) for throughput scalin
 
 ### High priority
 
+- [ ] Graceful shutdown for message relay
+- [ ] Drop SQLAlchemy dependency, use asyncpg (and psycopg) connection directly
+
 ### Medium priority
 
 ### Low priority
 
 - [ ] Use msgpack (optionally) to reduce size
-- [ ] Maybe not everything quorum-able should be quorum. Perhaps configuration

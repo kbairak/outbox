@@ -75,7 +75,6 @@ class Consumer:
             "routing_key",
             "message",
             "tracking_ids",
-            "queue_name",
             "attempt_count",
         }
         if len(parameter_keys) != 1:
@@ -149,8 +148,6 @@ class Consumer:
             kwargs["message"] = message
         if "tracking_ids" in parameters:
             kwargs["tracking_ids"] = tracking_ids
-        if "queue_name" in parameters:
-            kwargs["queue_name"] = self.queue
         if "attempt_count" in parameters:
             kwargs["attempt_count"] = attempt_count
 
