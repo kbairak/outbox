@@ -29,28 +29,28 @@ class User(BaseModel):
     last_name: str
 
 
-@listen("user.*")
+@listen(binding_key="user.*", queue="on_user_event")
 async def on_user_event(user: User, routing_key: str) -> None:
     if random.random() < 0.5:
         raise Exception()
     print(f"User event other ({routing_key}): {user=}")
 
 
-@listen("user.created")
+@listen(binding_key="user.created", queue="on_user_created")
 async def on_user_created(user: User, routing_key: str) -> None:
     if random.random() < 0.6:
         raise Exception()
     print(f"User event {routing_key}: {user=}")
 
 
-@listen("user.updated")
+@listen(binding_key="user.updated", queue="on_user_updated")
 async def on_user_updated(user: User, routing_key: str) -> None:
     if random.random() < 0.7:
         raise Exception()
     print(f"User event {routing_key}: {user=}")
 
 
-@listen("user.deleted")
+@listen(binding_key="user.deleted", queue="on_user_deleted")
 async def on_user_deleted(user: User, routing_key: str) -> None:
     if random.random() < 0.8:
         raise Exception()

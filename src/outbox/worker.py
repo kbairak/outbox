@@ -25,8 +25,8 @@ from .utils import Reject, parse_duration, tracking_ids_contextvar
 @dataclass
 class Listener:
     binding_key: str
+    queue: str
     callback: Union[Callable[..., Any], Callable[..., Coroutine[Any, Any, None]]]
-    queue: str = ""
     retry_delays: Optional[Sequence[str]] = None
     _queue_obj: Optional[AbstractQueue] = None
     _consumer_tag: Optional[ConsumerTag] = None
@@ -256,13 +256,13 @@ class Listener:
 
 def listen(
     binding_key: str,
-    queue: str = "",
+    queue: str,
     retry_delays: Optional[Sequence[str]] = None,
 ) -> Callable[[Union[Callable[..., Any], Callable[..., Coroutine[Any, Any, None]]]], Listener]:
     def decorator(
         func: Union[Callable[..., Any], Callable[..., Coroutine[Any, Any, None]]],
     ) -> Listener:
-        return Listener(binding_key, func, queue, retry_delays)
+        return Listener(binding_key, queue, func, retry_delays)
 
     return decorator
 

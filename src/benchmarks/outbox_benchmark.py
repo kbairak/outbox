@@ -57,7 +57,9 @@ def worker_process(rabbitmq_url: str, prefetch_count: int, timestamp_list: list[
 
     worker = Worker(
         rmq_connection_url=rabbitmq_url,
-        listeners=[Listener("benchmark.test", on_message, "benchmark.test")],
+        listeners=[
+            Listener(binding_key="benchmark.test", queue="benchmark.test", callback=on_message)
+        ],
         enable_metrics=False,
         prefetch_count=prefetch_count,
     )

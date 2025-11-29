@@ -69,7 +69,7 @@ import asyncio
 
 from outbox import Worker, listen
 
-@listen("user.created")
+@listen(binding_key="user.created", queue="on_user_created")
 async def on_user_created(user):
     print(user)
     # <<< {"id": 123, "username": "johndoe"}
@@ -109,8 +109,8 @@ asyncio.run(worker.run())
 Both approaches are equivalent. The decorator is more concise, while the explicit `Listener` instantiation gives you more control and makes it clear which handlers are registered. Essentially, these are identical:
 
 ```python
-Listener("binding_key", callback, ...)
-listen("binding_key", ...)(callback)
+Listener(binding_key="...", queue="...", callback=..., ...)
+listen(binding_key="...", queue="...", ...)(callback)
 ```
 
 ## Why
@@ -172,7 +172,7 @@ async with AsyncSession(db_engine) as session:
     await session.commit()
 
 # Worker process
-@listen("user.created")
+@listen(binding_key="user.created", queue="on_user_created")
 async def on_user_created(user: User):  # inspects type annotation
     print(user)
     # <<< User(id=123, username="johndoe")
@@ -193,7 +193,7 @@ async def entrypoint():
         await emitter.emit(session, "user.created", {"id": 123, "username": "johndoe"})
         await session.commit()
 
-@listen("user.created")
+@listen(binding_key="user.created", queue="on_user_created")
 async def on_user_created(user, tracking_ids: Sequence[str]):
     logger.info(f"User created {user.id}, tracking IDs: {tracking_ids}")
     async with AsyncSession(db_engine) as session:
@@ -201,11 +201,11 @@ async def on_user_created(user, tracking_ids: Sequence[str]):
         await emitter.emit(session, "user.created_notification", {"id": user.id})
         await session.commit()
 
-@listen("user.welcome_email")
+@listen(binding_key="user.welcome_email", queue="on_user_welcome_email")
 async def on_user_welcome_email(user, tracking_ids: Sequence[str]):
     logger.info(f"Welcome email sent for user {user.id}, tracking IDs: {tracking_ids}")
 
-@listen("user.created_notification")
+@listen(binding_key="user.created_notification", queue="on_user_created_notification")
 async def on_user_created_notification(user, tracking_ids):
     logger.info(f"Notification created for user {user.id}, tracking IDs: {tracking_ids}")
 ```
@@ -296,7 +296,7 @@ async with AsyncSession(db_engine) as session:
     await session.commit()
 
 # Worker process
-@listen("user.*")
+@listen(binding_key="user.*", queue="on_user_event")
 async def on_user_event(user):
     print(user)
     # <<< {"id": 123, "username": "johndoe"}
@@ -311,7 +311,7 @@ async with AsyncSession(db_engine) as session:
     await session.commit()
 
 # Worker process
-@listen("user.*")
+@listen(binding_key="user.*", queue="on_user_event")
 async def on_user_event(routing_key: str, user):
     logger.info(f"Received {routing_key=}")
     # <<< Received routing_key=user.created
@@ -336,12 +336,12 @@ If you're integrating the outbox pattern into an existing codebase with **synchr
 from outbox import listen
 
 # Async callback (preferred for new code)
-@listen("user.created")
+@listen(binding_key="user.created", queue="async_handler")
 async def async_handler(user):
     await send_email_async(user)  # Non-blocking async I/O
 
 # Sync callback (for legacy code with blocking I/O)
-@listen("order.created")
+@listen(binding_key="order.created", queue="sync_handler")
 def sync_handler(order):
     send_email_blocking(order)  # Blocking I/O - automatically runs in thread pool
     update_crm_blocking(order)   # Blocking I/O - automatically runs in thread pool
@@ -658,7 +658,7 @@ Configure retry delays at two levels, with per-listener overriding global:
 from outbox import Worker, listen, Reject
 
 # Per-listener override
-@listen("user.created", retry_delays=("5s", "30s"))  # Only 2 retries with these delays
+@listen(binding_key="user.created", queue="on_user_created", retry_delays=("5s", "30s"))  # Only 2 retries with these delays
 async def on_user_created(user):
     if some_transient_error:
         raise Exception("Will retry with configured delays")
@@ -666,12 +666,12 @@ async def on_user_created(user):
         raise Reject()  # Skip retries, send directly to DLQ
 
 # Fast retries for time-sensitive operations
-@listen("order.created", retry_delays=("500ms", "2s", "5s"))
+@listen(binding_key="order.created", queue="on_order_created", retry_delays=("500ms", "2s", "5s"))
 async def on_order_created(order):
     pass
 
 # Disable retries for a specific listener
-@listen("user.deleted", retry_delays=())  # No retries - straight to DLQ on failure
+@listen(binding_key="user.deleted", queue="on_user_deleted", retry_delays=())  # No retries - straight to DLQ on failure
 async def on_user_deleted(user):
     pass  # Failures go directly to DLQ
 
@@ -702,7 +702,7 @@ The library implements **at-least-once delivery semantics**, meaning messages ma
 - RabbitMQ redeliveries
 
 ```python
-@listen("order.created")
+@listen(binding_key="order.created", queue="process_order")
 async def process_order(order_id: int):
     # ✅ Good: Check if already processed
     if await is_order_processed(order_id):
@@ -932,8 +932,6 @@ Default value for `exchange_name` is `"outbox"`.
 | `{listener.queue}.dlq` | Yes | `x-queue-type`: `quorum` | Dead letter queue for messages that exhausted retries |
 | `{exchange_name}.delay_{N}s` | Yes | `x-message-ttl`: `{N * 1000}` ms<br>`x-dead-letter-exchange`: `""` (default exchange)<br>`x-queue-type`: `quorum` | Delay queue for retry backoff (one per unique delay value). Routes back to specific queue via default exchange. |
 
-**Listener queue naming**: If not specified in `@listen(queue=...)`, auto-generated as `{module}.{function_name}`
-
 ### Bindings
 
 | Exchange | Binding | Queue | Purpose |
@@ -970,7 +968,7 @@ locals {
 
   listeners = [
     {
-      queue       = "myapp.user_handler"
+      queue       = "orders.user_handler"
       binding_key = "user.created"
     }
   ]
@@ -979,9 +977,8 @@ locals {
 
 **Important notes:**
 
-1. **Sync retry_delays**: The `local.retry_delays` list in Terraform **must match** your `Worker(retry_delays=...)` in Python
+1. **Sync retry_delays**: The `local.retry_delays` list in Terraform **must match** your `Worker(retry_delays=...)` as well as all your retry_delays overrides in `@listen()` decorators
 2. **Sync listener queues**: The `local.listeners` list must include all your `@listen()` decorators
-3. **Queue naming**: Use explicit `queue="..."` in `@listen()` to avoid auto-generated names that are hard to predict
 
 </details>
 
@@ -1267,6 +1264,47 @@ async with AsyncSession(db_engine) as session, session.begin():
 ### Worker
 
 <details>
+    <summary><h4>Queue Naming for Multi-Service Deployments</h4></summary>
+
+When running multiple services, prefix queue names with your service identifier for clear ownership:
+
+```python
+# orders-service
+worker = Worker(
+    exchange_name="events",
+    listeners=[
+        listen(binding_key="payment.completed", queue="orders.on_payment_completed")(handler),
+        listen(binding_key="user.created", queue="orders.on_user_created")(handler),
+    ]
+)
+
+# payments-service
+worker = Worker(
+    exchange_name="events",
+    listeners=[
+        listen(binding_key="order.created", queue="payments.on_order_created")(handler),
+    ]
+)
+```
+
+This pattern works even when services consume from different exchanges:
+
+```python
+# orders-service consuming from payments exchange
+worker = Worker(
+    exchange_name="payments",
+    listeners=[
+        listen(binding_key="payment.completed", queue="orders.on_payment_completed")(handler),
+        # Queue name shows ownership, independent of exchange
+    ]
+)
+```
+
+Benefits: clear ownership in RabbitMQ UI, simplified infrastructure-as-code, easy filtering by service.
+
+</details>
+
+<details>
     <summary><h4>CPU-Bound Work</h4></summary>
 
 If your listener needs to perform **CPU-intensive work** (image processing, data transformations, heavy computations), you should offload it to a **process pool** (not thread pool). This is **not built into the library** because:
@@ -1298,7 +1336,7 @@ def cpu_intensive_task(image_data: bytes) -> bytes:
     image.save(output, format='JPEG')
     return output.getvalue()
 
-@listen("image.uploaded")
+@listen(binding_key="image.uploaded", queue="process_image")
 async def process_image(image_data: bytes):
     """Listener remains async and non-blocking"""
     loop = asyncio.get_event_loop()
@@ -1389,8 +1427,5 @@ See [detailed benchmark results](src/benchmarks/README.md) for throughput scalin
 ### Low priority
 
 - [ ] No 'application/json' content type if body is bytes
-- [ ] Delay exchange/queue names to include minutes and/or hours (`XmYYs` instead of `XXXXs`)
-- [ ] Add `queue_prefix` setup arg (or maybe automatic queue name should be prefixed with `exchange_name`)
 - [ ] Use msgpack (optionally) to reduce size
-- [ ] Nested dependencies
 - [ ] Maybe not everything quorum-able should be quorum. Perhaps configuration

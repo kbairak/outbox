@@ -15,7 +15,7 @@ from .utils import EmitType, Person, get_dlq_message_count, run_worker
 @pytest.mark.asyncio(loop_scope="session")
 async def test_register_listener() -> None:
     # test
-    @listen("test_register_listener_binding_key", queue="test_register_listener_queue")
+    @listen(binding_key="test_register_listener_binding_key", queue="test_register_listener_queue")
     async def handler(_: object) -> None:  # pragma: no cover
         pass
 
@@ -34,7 +34,7 @@ async def test_worker(
     callcount = 0
     retrieved_argument = None
 
-    @listen("routing_key", queue="test_worker_queue")
+    @listen(binding_key="routing_key", queue="test_worker_queue")
     async def handler(person: object) -> None:
         nonlocal callcount, retrieved_argument
         callcount += 1
@@ -66,7 +66,7 @@ async def test_worker_with_pydantic(
     callcount = 0
     retrieved_argument = None
 
-    @listen("routing_key", queue="test_worker_with_pydantic_queue")
+    @listen(binding_key="routing_key", queue="test_worker_with_pydantic_queue")
     async def handler(person: Person) -> None:
         nonlocal callcount, retrieved_argument
         callcount += 1
@@ -99,7 +99,7 @@ async def test_worker_with_wildcard(
     retrieved_routing_key = None
     retrieved_argument = None
 
-    @listen("routing_key.*", queue="test_worker_with_wildcard_queue")
+    @listen(binding_key="routing_key.*", queue="test_worker_with_wildcard_queue")
     async def handler(routing_key: str, person: object) -> None:
         nonlocal callcount, retrieved_routing_key, retrieved_argument
         callcount += 1
@@ -133,7 +133,7 @@ async def test_retry(
     callcount = 0
     retrieved_argument = None
 
-    @listen("routing_key", queue="test_retry_queue", retry_delays=("100ms", "100ms"))
+    @listen(binding_key="routing_key", queue="test_retry_queue", retry_delays=("100ms", "100ms"))
     async def handler(person: object) -> None:
         nonlocal callcount, retrieved_argument
         callcount += 1
@@ -168,7 +168,11 @@ async def test_instant_retry(
     callcount = 0
     retrieved_argument = None
 
-    @listen("routing_key", queue="test_instant_retry_queue", retry_delays=("0ms", "0ms", "100ms"))
+    @listen(
+        binding_key="routing_key",
+        queue="test_instant_retry_queue",
+        retry_delays=("0ms", "0ms", "100ms"),
+    )
     async def handler(person: object) -> None:
         nonlocal callcount, retrieved_argument
         callcount += 1
@@ -204,7 +208,7 @@ async def test_no_retry_with_setup(
     callcount = 0
     retrieved_argument = None
 
-    @listen("routing_key", queue="test_no_retry_with_setup_queue")
+    @listen(binding_key="routing_key", queue="test_no_retry_with_setup_queue")
     async def handler(person: object) -> None:
         nonlocal callcount, retrieved_argument
         callcount += 1
@@ -239,7 +243,7 @@ async def test_no_retry_with_listen(
     callcount = 0
     retrieved_argument = None
 
-    @listen("routing_key", retry_delays=(), queue="test_no_retry_with_listen_queue")
+    @listen(binding_key="routing_key", retry_delays=(), queue="test_no_retry_with_listen_queue")
     async def handler(person: object) -> None:
         nonlocal callcount, retrieved_argument
         callcount += 1
@@ -278,7 +282,7 @@ async def test_no_retry_with_empty_delays_setup(
     worker.retry_delays = ()
     callcount = 0
 
-    @listen("routing_key", queue="test_no_retry_with_empty_delays_setup_queue")
+    @listen(binding_key="routing_key", queue="test_no_retry_with_empty_delays_setup_queue")
     async def handler(_: object) -> None:
         nonlocal callcount
         callcount += 1
@@ -316,7 +320,11 @@ async def test_no_retry_with_empty_delays_listen(
     # arrange - empty retry_delays on listener means no retries, go to DLQ
     callcount = 0
 
-    @listen("routing_key", retry_delays=(), queue="test_no_retry_with_empty_delays_listen_queue")
+    @listen(
+        binding_key="routing_key",
+        retry_delays=(),
+        queue="test_no_retry_with_empty_delays_listen_queue",
+    )
     async def handler(_: object) -> None:
         nonlocal callcount
         callcount += 1
@@ -350,7 +358,7 @@ async def test_emit_and_consume_binary(
     callcount = 0
     retrieved_argument = None
 
-    @listen("routing_key", queue="test_emit_and_consume_binary_queue")
+    @listen(binding_key="routing_key", queue="test_emit_and_consume_binary_queue")
     async def handler(person: bytes) -> None:
         nonlocal callcount, retrieved_argument
         callcount += 1
@@ -384,7 +392,7 @@ async def test_dead_letter(
     rmq_connection: AbstractConnection,
 ) -> None:
     # arrange
-    @listen("routing_key", queue="test_dead_letter_queue_name")
+    @listen(binding_key="routing_key", queue="test_dead_letter_queue_name")
     async def handler(_: object) -> None:
         raise Reject("test")
 
@@ -414,7 +422,7 @@ async def test_dead_letter_with_expiration(
     rmq_connection: AbstractConnection,
 ) -> None:
     # arrange
-    @listen("routing_key", queue="test_dead_letter_with_expiration_queue_name2")
+    @listen(binding_key="routing_key", queue="test_dead_letter_with_expiration_queue_name2")
     async def handler(_: object) -> None:
         raise Exception("test")
 
@@ -444,7 +452,7 @@ async def test_graceful_shutdown(
     # arrange
     before, after = 0, 0
 
-    @listen("routing_key", queue="test_graceful_shutdown_queue")
+    @listen(binding_key="routing_key", queue="test_graceful_shutdown_queue")
     async def handler(_: object) -> None:
         nonlocal before, after
         before += 1
@@ -482,7 +490,9 @@ async def test_messages_not_lost_during_graceful_shutdown(
     # arrange
     before, after = 0, 0
 
-    @listen("routing_key", queue="test_messages_not_lost_during_graceful_shutdown_queue")
+    @listen(
+        binding_key="routing_key", queue="test_messages_not_lost_during_graceful_shutdown_queue"
+    )
     async def handler(_: object) -> None:
         nonlocal before, after
         before += 1
@@ -548,7 +558,7 @@ async def test_tracking_ids(
         await emit(session, "r1", {})
         await session.commit()
 
-    @listen("r1", queue="test_tracking_ids_queue_1")
+    @listen(binding_key="r1", queue="test_tracking_ids_queue_1")
     async def handler1(_: object) -> None:
         logs.append(get_tracking_ids())
         await emit(session, "r2", {})
@@ -556,7 +566,7 @@ async def test_tracking_ids(
         await session.commit()
         await message_relay._consume_outbox_table()
 
-    @listen("r2", queue="test_tracking_ids_queue_2")
+    @listen(binding_key="r2", queue="test_tracking_ids_queue_2")
     async def handler2(_: object) -> None:
         logs.append(get_tracking_ids())
 
@@ -594,7 +604,7 @@ async def test_tracking_ids_with_parameter(
         await emit(session, "r1", {})
         await session.commit()
 
-    @listen("r1", queue="test_tracking_ids_with_parameter_queue1")
+    @listen(binding_key="r1", queue="test_tracking_ids_with_parameter_queue1")
     async def handler1(_: object, tracking_ids: Sequence[str]) -> None:
         logs.append(tracking_ids)
         await emit(session, "r2", {})
@@ -602,7 +612,7 @@ async def test_tracking_ids_with_parameter(
         await session.commit()
         await message_relay._consume_outbox_table()
 
-    @listen("r2", queue="test_tracking_ids_with_parameter_queue2")
+    @listen(binding_key="r2", queue="test_tracking_ids_with_parameter_queue2")
     async def handler2(_: object, tracking_ids: Sequence[str]) -> None:
         logs.append(tracking_ids)
 
@@ -637,7 +647,7 @@ async def test_emit_retry_delays(
 
     callcount = 0
 
-    @listen("r1", queue="test_emit_retry_delays_queue")
+    @listen(binding_key="r1", queue="test_emit_retry_delays_queue")
     async def handler(_: object) -> None:
         nonlocal callcount
         callcount += 1
@@ -674,7 +684,9 @@ async def test_listen_retry_delays(
 
     callcount = 0
 
-    @listen("r1", retry_delays=("100ms", "100ms"), queue="test_listen_retry_delays_queue")
+    @listen(
+        binding_key="r1", retry_delays=("100ms", "100ms"), queue="test_listen_retry_delays_queue"
+    )
     async def handler(_: object) -> None:
         nonlocal callcount
         callcount += 1
@@ -714,7 +726,7 @@ async def test_setup_retry_delays(
 
     callcount = 0
 
-    @listen("r1", queue="test_setup_retry_delays_queue")
+    @listen(binding_key="r1", queue="test_setup_retry_delays_queue")
     async def handler(_: object) -> None:
         nonlocal callcount
         callcount += 1
@@ -745,7 +757,9 @@ async def test_wildcard_routing_key_preserved_through_retries(
     callcount = 0
     retrieved_routing_keys = []
 
-    @listen("order.*", queue="test_wildcard_retry_queue", retry_delays=("100ms", "100ms"))
+    @listen(
+        binding_key="order.*", queue="test_wildcard_retry_queue", retry_delays=("100ms", "100ms")
+    )
     async def handler(routing_key: str, _: object) -> None:
         nonlocal callcount
         callcount += 1
@@ -780,14 +794,14 @@ async def test_retry_routes_to_single_queue_only(
     queue1_callcount = 0
     queue2_callcount = 0
 
-    @listen("user.*", queue="test_retry_isolation_queue1", retry_delays=("100ms",))
+    @listen(binding_key="user.*", queue="test_retry_isolation_queue1", retry_delays=("100ms",))
     async def handler1(_: object) -> None:
         nonlocal queue1_callcount
         queue1_callcount += 1
         if queue1_callcount == 1:
             raise ValueError("Simulated failure in queue1")
 
-    @listen("*.created", queue="test_retry_isolation_queue2", retry_delays=("100ms",))
+    @listen(binding_key="*.created", queue="test_retry_isolation_queue2", retry_delays=("100ms",))
     async def handler2(_: object) -> None:
         nonlocal queue2_callcount
         queue2_callcount += 1
@@ -822,7 +836,7 @@ async def test_sync_callback(
     callcount = 0
     retrieved_data = None
 
-    @listen("sync.test", queue="test_sync_callback")
+    @listen(binding_key="sync.test", queue="test_sync_callback")
     def sync_handler(data: object) -> None:
         nonlocal callcount, retrieved_data
         callcount += 1
@@ -855,7 +869,7 @@ async def test_sync_callback_with_pydantic(
     callcount = 0
     retrieved_person = None
 
-    @listen("person.created", queue="test_sync_pydantic")
+    @listen(binding_key="person.created", queue="test_sync_pydantic")
     def sync_handler(person: Person) -> None:
         nonlocal callcount, retrieved_person
         callcount += 1
@@ -889,7 +903,7 @@ async def test_sync_callback_with_special_params(
     retrieved_tracking_ids = None
     retrieved_queue_name = None
 
-    @listen("special.test", queue="test_sync_special_params")
+    @listen(binding_key="special.test", queue="test_sync_special_params")
     def sync_handler(
         _: object,
         routing_key: str,
@@ -932,7 +946,7 @@ async def test_sync_callback_exception_retry(
     # arrange
     callcount = 0
 
-    @listen("retry.test", queue="test_sync_retry", retry_delays=("100ms",))
+    @listen(binding_key="retry.test", queue="test_sync_retry", retry_delays=("100ms",))
     def sync_handler(_: object) -> None:
         nonlocal callcount
         callcount += 1
@@ -968,7 +982,7 @@ async def test_sync_callback_reject(
     # arrange
     callcount = 0
 
-    @listen("reject.test", queue="test_sync_reject")
+    @listen(binding_key="reject.test", queue="test_sync_reject")
     def sync_handler(_: object) -> None:
         nonlocal callcount
         callcount += 1
@@ -1001,12 +1015,12 @@ async def test_mixed_sync_async_listeners(
     sync_callcount = 0
     async_callcount = 0
 
-    @listen("mixed.sync", queue="test_mixed_sync")
+    @listen(binding_key="mixed.sync", queue="test_mixed_sync")
     def sync_handler(_: object) -> None:
         nonlocal sync_callcount
         sync_callcount += 1
 
-    @listen("mixed.async", queue="test_mixed_async")
+    @listen(binding_key="mixed.async", queue="test_mixed_async")
     async def async_handler(_: object) -> None:
         nonlocal async_callcount
         async_callcount += 1
@@ -1038,22 +1052,8 @@ async def test_listener_direct_instantiation_with_sync() -> None:
     def sync_func(_: object) -> None:
         pass
 
-    listener = Listener("test.key", sync_func, queue="test_direct_sync")
+    listener = Listener(binding_key="test.key", queue="test_direct_sync", callback=sync_func)
 
     # assert - callback should be wrapped to async
     assert asyncio.iscoroutinefunction(listener.callback)
     assert listener.queue == "test_direct_sync"
-
-
-@pytest.mark.asyncio(loop_scope="session")
-async def test_sync_callback_queue_name_generation() -> None:
-    """Test that queue names are auto-generated correctly for sync callbacks."""
-
-    # arrange
-    @listen("queue.test")
-    def my_sync_handler(_: object) -> None:
-        pass
-
-    # assert
-    assert "my_sync_handler" in my_sync_handler.queue
-    assert "test_worker" in my_sync_handler.queue
