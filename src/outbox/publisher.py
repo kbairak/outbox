@@ -3,7 +3,7 @@ import json
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Awaitable, Optional, Union, overload
+from typing import Any, Awaitable, Optional, TypedDict, Union, overload
 
 from aio_pika.abc import DateType
 from aio_pika.message import encode_expiration
@@ -23,6 +23,15 @@ class OutboxMessage:
     body: Any
     expiration: DateType = None
     eta: Optional[DateType] = None
+
+
+class OutboxRowDict(TypedDict):
+    routing_key: str
+    body: bytes
+    tracking_ids: list[str]
+    created_at: datetime.datetime
+    expiration: Optional[datetime.timedelta]
+    send_after: datetime.datetime
 
 
 @dataclass
@@ -49,51 +58,7 @@ class Publisher:
 
         if self.auto_create_table and self.db_engine is not None:
             await ensure_database_async(self.db_engine)
-        rows = []
-        now = datetime.datetime.now(datetime.timezone.utc)
-        for message in messages:
-            try:
-                if isinstance(message.body, BaseModel):
-                    body = message.body.model_dump_json().encode()
-                elif not isinstance(message.body, bytes):
-                    body = json.dumps(message.body).encode()
-                else:
-                    body = message.body
-            except (TypeError, ValueError) as exc:
-                # Don't log - user called publish(), they'll see the exception
-                raise ValueError(
-                    f"Cannot serialize message body for routing_key={message.routing_key!r}: "
-                    f"{type(exc).__name__}: {exc}"
-                ) from exc
-            if message.expiration is not None:
-                milliseconds = encode_expiration(message.expiration)
-                if milliseconds is None:
-                    raise ValueError(
-                        "Invalid expiration value: encode_expiration returned None for "
-                        f"{message.expiration!r}"
-                    )
-                expiration = datetime.timedelta(milliseconds=int(milliseconds))
-            else:
-                expiration = None
-            if message.eta is not None:
-                milliseconds = encode_expiration(message.eta)
-                if milliseconds is None:
-                    raise ValueError(
-                        f"Invalid eta value: encode_expiration returned None for {message.eta!r}"
-                    )
-                send_after = now + datetime.timedelta(milliseconds=int(milliseconds))
-            else:
-                send_after = now
-            rows.append(
-                {
-                    "routing_key": message.routing_key,
-                    "body": body,
-                    "tracking_ids": list(get_tracking_ids() + (str(uuid.uuid4()),)),
-                    "created_at": now,
-                    "expiration": expiration,
-                    "send_after": send_after,
-                }
-            )
+        rows = self._convert_messages_to_rows(messages)
         await session.execute(insert(OutboxTable).values(rows))
         logger.info(f"Published {len(rows)} messages to outbox")
 
@@ -103,51 +68,7 @@ class Publisher:
 
         if self.auto_create_table and self.db_engine is not None:
             ensure_database_sync(self.db_engine)
-        rows = []
-        now = datetime.datetime.now(datetime.timezone.utc)
-        for message in messages:
-            try:
-                if isinstance(message.body, BaseModel):
-                    body = message.body.model_dump_json().encode()
-                elif not isinstance(message.body, bytes):
-                    body = json.dumps(message.body).encode()
-                else:
-                    body = message.body
-            except (TypeError, ValueError) as exc:
-                # Don't log - user called publish(), they'll see the exception
-                raise ValueError(
-                    f"Cannot serialize message body for routing_key={message.routing_key!r}: "
-                    f"{type(exc).__name__}: {exc}"
-                ) from exc
-            if message.expiration is not None:
-                milliseconds = encode_expiration(message.expiration)
-                if milliseconds is None:
-                    raise ValueError(
-                        "Invalid expiration value: encode_expiration returned None for "
-                        f"{message.expiration!r}"
-                    )
-                expiration = datetime.timedelta(milliseconds=int(milliseconds))
-            else:
-                expiration = None
-            if message.eta is not None:
-                milliseconds = encode_expiration(message.eta)
-                if milliseconds is None:
-                    raise ValueError(
-                        f"Invalid eta value: encode_expiration returned None for {message.eta!r}"
-                    )
-                send_after = now + datetime.timedelta(milliseconds=int(milliseconds))
-            else:
-                send_after = now
-            rows.append(
-                {
-                    "routing_key": message.routing_key,
-                    "body": body,
-                    "tracking_ids": list(get_tracking_ids() + (str(uuid.uuid4()),)),
-                    "created_at": now,
-                    "expiration": expiration,
-                    "send_after": send_after,
-                }
-            )
+        rows = self._convert_messages_to_rows(messages)
         session.execute(insert(OutboxTable).values(rows))
         logger.info(f"Published {len(rows)} messages to outbox")
 
@@ -230,3 +151,52 @@ class Publisher:
             return self.publish_async(session, routing_key, body, expiration=expiration, eta=eta)
         else:  # pragma: no cover
             raise Exception("Unreachable code")
+
+    @staticmethod
+    def _convert_messages_to_rows(messages: Sequence[OutboxMessage]) -> list[OutboxRowDict]:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        rows = []
+        for message in messages:
+            try:
+                if isinstance(message.body, BaseModel):
+                    body = message.body.model_dump_json().encode()
+                elif not isinstance(message.body, bytes):
+                    body = json.dumps(message.body).encode()
+                else:
+                    body = message.body
+            except (TypeError, ValueError) as exc:
+                # Don't log - user called publish(), they'll see the exception
+                raise ValueError(
+                    f"Cannot serialize message body for routing_key={message.routing_key!r}: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            if message.expiration is not None:
+                milliseconds = encode_expiration(message.expiration)
+                if milliseconds is None:
+                    raise ValueError(
+                        "Invalid expiration value: encode_expiration returned None for "
+                        f"{message.expiration!r}"
+                    )
+                expiration = datetime.timedelta(milliseconds=int(milliseconds))
+            else:
+                expiration = None
+            if message.eta is not None:
+                milliseconds = encode_expiration(message.eta)
+                if milliseconds is None:
+                    raise ValueError(
+                        f"Invalid eta value: encode_expiration returned None for {message.eta!r}"
+                    )
+                send_after = now + datetime.timedelta(milliseconds=int(milliseconds))
+            else:
+                send_after = now
+            rows.append(
+                OutboxRowDict(
+                    routing_key=message.routing_key,
+                    body=body,
+                    tracking_ids=list(get_tracking_ids() + (str(uuid.uuid4()),)),
+                    created_at=now,
+                    expiration=expiration,
+                    send_after=send_after,
+                )
+            )
+        return rows

@@ -1424,6 +1424,5 @@ See [detailed benchmark results](src/benchmarks/README.md) for throughput scalin
 
 ### Low priority
 
-- [ ] No 'application/json' content type if body is bytes
 - [ ] Use msgpack (optionally) to reduce size
 - [ ] Maybe not everything quorum-able should be quorum. Perhaps configuration
