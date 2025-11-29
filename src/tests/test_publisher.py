@@ -5,16 +5,16 @@ from sqlalchemy import Engine, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
-from outbox import Emitter, OutboxMessage
+from outbox import OutboxMessage, Publisher
 from outbox.database import OutboxTable
 
-from .utils import EmitType, Person
+from .utils import Person, PublishType
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_emit(emit: EmitType, session: AsyncSession) -> None:
+async def test_publish(publish: PublishType, session: AsyncSession) -> None:
     # act
-    await emit(session, "test_routing_key", "test_body")
+    await publish(session, "test_routing_key", "test_body")
 
     # assert
     messages = (await session.execute(select(OutboxTable))).scalars().all()
@@ -25,12 +25,12 @@ async def test_emit(emit: EmitType, session: AsyncSession) -> None:
     assert messages[0].sent_at is None
 
 
-def test_emit_sync(db_engine_sync: Engine, session_sync: Session) -> None:
+def test_publish_sync(db_engine_sync: Engine, session_sync: Session) -> None:
     # setup
-    emitter = Emitter(db_engine=db_engine_sync, auto_create_table=True)
+    publisher = Publisher(db_engine=db_engine_sync, auto_create_table=True)
 
     # act
-    emitter.emit_sync(session_sync, "test_routing_key", "test_body")
+    publisher.publish_sync(session_sync, "test_routing_key", "test_body")
 
     # assert
     messages = (session_sync.execute(select(OutboxTable))).scalars().all()
@@ -42,13 +42,13 @@ def test_emit_sync(db_engine_sync: Engine, session_sync: Session) -> None:
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_bulk_emit(emitter: Emitter, session: AsyncSession) -> None:
+async def test_bulk_publish(publisher: Publisher, session: AsyncSession) -> None:
     # act
     messages = [
         OutboxMessage(routing_key="test_key_1", body="test_body_1"),
         OutboxMessage(routing_key="test_key_2", body="test_body_2"),
     ]
-    await emitter.bulk_emit(session, messages)
+    await publisher.bulk_publish(session, messages)
     await session.commit()
 
     # assert
@@ -65,9 +65,9 @@ async def test_bulk_emit(emitter: Emitter, session: AsyncSession) -> None:
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_emit_with_pydantic(emit: EmitType, session: AsyncSession) -> None:
+async def test_publish_with_pydantic(publish: PublishType, session: AsyncSession) -> None:
     # act
-    await emit(session, "my_routing_key", Person(name="MyName"))
+    await publish(session, "my_routing_key", Person(name="MyName"))
 
     # assert
     messages = (await session.execute(select(OutboxTable))).scalars().all()

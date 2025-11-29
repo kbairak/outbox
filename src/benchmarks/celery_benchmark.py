@@ -119,9 +119,9 @@ def benchmark(
         print("Waiting for workers to be ready...")
         time.sleep(5)
 
-        # Emit tasks at controlled rate
+        # Publish tasks at controlled rate
         print(
-            f"Emitting {message_count:,} tasks at {message_rate:,} msgs/sec for {duration} seconds..."
+            f"Publishing {message_count:,} tasks at {message_rate:,} msgs/sec for {duration} seconds..."
         )
 
         start_time = time.perf_counter()
@@ -130,10 +130,10 @@ def benchmark(
         for batch_size in _generate_batch_sizes(message_rate, duration):
             group([process_message.s(junk) for _ in range(batch_size)]).apply_async()
 
-        emit_duration = time.perf_counter() - start_time
-        actual_rate = message_count / emit_duration
+        publish_duration = time.perf_counter() - start_time
+        actual_rate = message_count / publish_duration
         print(
-            f"Emitted {message_count:,} tasks in {emit_duration:.2f}s "
+            f"Published {message_count:,} tasks in {publish_duration:.2f}s "
             f"(target: {message_rate:,} msgs/sec, actual: {actual_rate:.0f} msgs/sec)"
         )
 
@@ -163,7 +163,7 @@ def benchmark(
         print(f"Target Rate:       {message_rate:,} msgs/sec")
         print(f"Message Size:      {message_size} bytes")
         print(f"Duration:          {duration} seconds")
-        print(f"Tasks Emitted:     {message_count:,}")
+        print(f"Tasks Published:     {message_count:,}")
         print(f"Processing Rate:   {processing_rate:,.0f} msgs/sec")
 
         # Clean up timestamp files
@@ -176,7 +176,7 @@ def benchmark(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Run Celery benchmark - emits tasks at specified rate for 5 seconds"
+        description="Run Celery benchmark - publishes tasks at specified rate for 5 seconds"
     )
     parser.add_argument(
         "--message-rate",

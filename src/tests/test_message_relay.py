@@ -7,12 +7,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from outbox import MessageRelay
 from outbox.database import OutboxTable
-from tests.utils import EmitType
+from tests.utils import PublishType
 
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_message_relay(
-    emit: EmitType, message_relay: MessageRelay, session: AsyncSession
+    publish: PublishType, message_relay: MessageRelay, session: AsyncSession
 ) -> None:
     # arrange
     rmq_connection_mock = AsyncMock(name="rmq_connection")
@@ -21,7 +21,7 @@ async def test_message_relay(
     rmq_connection_mock.channel.return_value = (channel_mock := AsyncMock(name="channel"))
     channel_mock.declare_exchange.return_value = (exchange_mock := AsyncMock(name="exchange"))
 
-    await emit(session, "test_routing_key", "test_body")
+    await publish(session, "test_routing_key", "test_body")
     await session.commit()
 
     # test
@@ -44,7 +44,7 @@ async def test_message_relay(
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_message_relay_batch(
-    emit: EmitType, message_relay: MessageRelay, session: AsyncSession
+    publish: PublishType, message_relay: MessageRelay, session: AsyncSession
 ) -> None:
     # arrange
     prev_batch_size = message_relay.batch_size
@@ -55,9 +55,9 @@ async def test_message_relay_batch(
     rmq_connection_mock.channel.return_value = (channel_mock := AsyncMock(name="channel"))
     channel_mock.declare_exchange.return_value = (exchange_mock := AsyncMock(name="exchange"))
 
-    await emit(session, "test_routing_key_1", "test_body_1")
-    await emit(session, "test_routing_key_2", "test_body_2")
-    await emit(session, "test_routing_key_3", "test_body_3")
+    await publish(session, "test_routing_key_1", "test_body_1")
+    await publish(session, "test_routing_key_2", "test_body_2")
+    await publish(session, "test_routing_key_3", "test_body_3")
     await session.commit()
 
     # act - process one batch

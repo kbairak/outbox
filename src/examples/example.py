@@ -6,7 +6,7 @@ from prometheus_client import start_http_server
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
-from outbox import Emitter, MessageRelay, Worker, listen
+from outbox import MessageRelay, Publisher, Worker, consume
 
 logging.basicConfig(level=logging.DEBUG)
 logging.getLogger("outbox").setLevel(logging.DEBUG)
@@ -17,7 +17,7 @@ start_http_server(8000)
 
 db_engine = create_async_engine("postgresql+asyncpg://postgres:postgres@localhost/postgres")
 
-emitter = Emitter(db_engine=db_engine, auto_create_table=True)
+publisher = Publisher(db_engine=db_engine, auto_create_table=True)
 
 message_relay = MessageRelay(
     db_engine=db_engine,
@@ -32,31 +32,31 @@ class User(BaseModel):
     last_name: str
 
 
-@listen(binding_key="user.*", queue="on_user_event")
+@consume(binding_key="user.*", queue="on_user_event")
 async def on_user_event(user: User, routing_key: str) -> None:
     if random.random() < 0.5:
-        raise Exception("Listener error")
+        raise Exception("Consumer error")
     print(f"User event other ({routing_key}): {user=}")
 
 
-@listen(binding_key="user.created", queue="on_user_created")
+@consume(binding_key="user.created", queue="on_user_created")
 async def on_user_created(user: User, routing_key: str) -> None:
     if random.random() < 0.6:
-        raise Exception("Listener error")
+        raise Exception("Consumer error")
     print(f"User event {routing_key}: {user=}")
 
 
-@listen(binding_key="user.updated", queue="on_user_updated")
+@consume(binding_key="user.updated", queue="on_user_updated")
 async def on_user_updated(user: User, routing_key: str) -> None:
     if random.random() < 0.7:
-        raise Exception("Listener error")
+        raise Exception("Consumer error")
     print(f"User event {routing_key}: {user=}")
 
 
-@listen(binding_key="user.deleted", queue="on_user_deleted")
+@consume(binding_key="user.deleted", queue="on_user_deleted")
 async def on_user_deleted(user: User, routing_key: str) -> None:
     if random.random() < 0.8:
-        raise Exception("Listener error")
+        raise Exception("Consumer error")
     print(f"User event {routing_key}: {user=}")
 
 
@@ -64,7 +64,7 @@ async def main() -> None:
     message_relay_task = asyncio.create_task(message_relay.run())
     worker = Worker(
         rmq_connection_url="amqp://guest:guest@localhost:5672/",
-        listeners=(on_user_event, on_user_created, on_user_updated, on_user_deleted),
+        consumers=(on_user_event, on_user_created, on_user_updated, on_user_deleted),
         retry_delays=("1s", "2s", "3s"),
     )
     worker_task = asyncio.create_task(worker.run())
@@ -85,7 +85,7 @@ async def main() -> None:
                 continue
 
             async with AsyncSession(db_engine) as session, session.begin():
-                await emitter.emit(session, routing_key, user)
+                await publisher.publish(session, routing_key, user)
     except EOFError:
         pass
     finally:

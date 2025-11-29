@@ -26,7 +26,7 @@ class OutboxMessage:
 
 
 @dataclass
-class Emitter:
+class Publisher:
     db_engine: Optional[Union[AsyncEngine, Engine]] = None
     db_engine_url: Optional[str] = None
     expiration: Optional[DateType] = None
@@ -41,11 +41,11 @@ class Emitter:
         if self.table_name is not None:
             OutboxTable.__tablename__ = self.table_name
 
-    async def bulk_emit_async(
+    async def bulk_publish_async(
         self, session: AsyncSession, messages: Sequence[OutboxMessage]
     ) -> None:
         if not isinstance(self.db_engine, AsyncEngine):
-            raise ValueError("db_engine must be an AsyncEngine for async bulk_emit")
+            raise ValueError("db_engine must be an AsyncEngine for async bulk_publish")
 
         if self.auto_create_table and self.db_engine is not None:
             await ensure_database_async(self.db_engine)
@@ -60,7 +60,7 @@ class Emitter:
                 else:
                     body = message.body
             except (TypeError, ValueError) as exc:
-                # Don't log - user called emit(), they'll see the exception
+                # Don't log - user called publish(), they'll see the exception
                 raise ValueError(
                     f"Cannot serialize message body for routing_key={message.routing_key!r}: "
                     f"{type(exc).__name__}: {exc}"
@@ -95,11 +95,11 @@ class Emitter:
                 }
             )
         await session.execute(insert(OutboxTable).values(rows))
-        logger.info(f"Emitted {len(rows)} messages to outbox")
+        logger.info(f"Published {len(rows)} messages to outbox")
 
-    def bulk_emit_sync(self, session: Session, messages: Sequence[OutboxMessage]) -> None:
+    def bulk_publish_sync(self, session: Session, messages: Sequence[OutboxMessage]) -> None:
         if not isinstance(self.db_engine, Engine):
-            raise ValueError("db_engine must be an Engine for sync bulk_emit")
+            raise ValueError("db_engine must be an Engine for sync bulk_publish")
 
         if self.auto_create_table and self.db_engine is not None:
             ensure_database_sync(self.db_engine)
@@ -114,7 +114,7 @@ class Emitter:
                 else:
                     body = message.body
             except (TypeError, ValueError) as exc:
-                # Don't log - user called emit(), they'll see the exception
+                # Don't log - user called publish(), they'll see the exception
                 raise ValueError(
                     f"Cannot serialize message body for routing_key={message.routing_key!r}: "
                     f"{type(exc).__name__}: {exc}"
@@ -123,7 +123,8 @@ class Emitter:
                 milliseconds = encode_expiration(message.expiration)
                 if milliseconds is None:
                     raise ValueError(
-                        f"Invalid expiration value: encode_expiration returned None for {message.expiration!r}"
+                        "Invalid expiration value: encode_expiration returned None for "
+                        f"{message.expiration!r}"
                     )
                 expiration = datetime.timedelta(milliseconds=int(milliseconds))
             else:
@@ -148,28 +149,28 @@ class Emitter:
                 }
             )
         session.execute(insert(OutboxTable).values(rows))
-        logger.info(f"Emitted {len(rows)} messages to outbox")
+        logger.info(f"Published {len(rows)} messages to outbox")
 
     @overload
-    def bulk_emit(self, session: Session, messages: Sequence[OutboxMessage]) -> None: ...
+    def bulk_publish(self, session: Session, messages: Sequence[OutboxMessage]) -> None: ...
 
     @overload
-    def bulk_emit(
+    def bulk_publish(
         self, session: AsyncSession, messages: Sequence[OutboxMessage]
     ) -> Awaitable[None]: ...
 
-    def bulk_emit(
+    def bulk_publish(
         self, session: Union[Session, AsyncSession], messages: Sequence[OutboxMessage]
     ) -> Optional[Awaitable[None]]:
         if isinstance(session, Session):
-            self.bulk_emit_sync(session, messages)
+            self.bulk_publish_sync(session, messages)
             return None
         elif isinstance(session, AsyncSession):
-            return self.bulk_emit_async(session, messages)
+            return self.bulk_publish_async(session, messages)
         else:  # pragma: no cover
             raise Exception("Unreachable code")
 
-    async def emit_async(
+    async def publish_async(
         self,
         session: AsyncSession,
         routing_key: str,
@@ -178,9 +179,9 @@ class Emitter:
         expiration: Optional[DateType] = None,
         eta: Optional[DateType] = None,
     ) -> None:
-        await self.bulk_emit_async(session, [OutboxMessage(routing_key, body, expiration, eta)])
+        await self.bulk_publish_async(session, [OutboxMessage(routing_key, body, expiration, eta)])
 
-    def emit_sync(
+    def publish_sync(
         self,
         session: Session,
         routing_key: str,
@@ -189,10 +190,10 @@ class Emitter:
         expiration: Optional[DateType] = None,
         eta: Optional[DateType] = None,
     ) -> None:
-        self.bulk_emit_sync(session, [OutboxMessage(routing_key, body, expiration, eta)])
+        self.bulk_publish_sync(session, [OutboxMessage(routing_key, body, expiration, eta)])
 
     @overload
-    def emit(
+    def publish(
         self,
         session: Session,
         routing_key: str,
@@ -203,7 +204,7 @@ class Emitter:
     ) -> None: ...
 
     @overload
-    def emit(
+    def publish(
         self,
         session: AsyncSession,
         routing_key: str,
@@ -213,7 +214,7 @@ class Emitter:
         eta: Optional[DateType] = None,
     ) -> Awaitable[None]: ...
 
-    def emit(
+    def publish(
         self,
         session: Union[Session, AsyncSession],
         routing_key: str,
@@ -223,9 +224,9 @@ class Emitter:
         eta: Optional[DateType] = None,
     ) -> Optional[Awaitable[None]]:
         if isinstance(session, Session):
-            self.emit_sync(session, routing_key, body, expiration=expiration, eta=eta)
+            self.publish_sync(session, routing_key, body, expiration=expiration, eta=eta)
             return None
         elif isinstance(session, AsyncSession):
-            return self.emit_async(session, routing_key, body, expiration=expiration, eta=eta)
+            return self.publish_async(session, routing_key, body, expiration=expiration, eta=eta)
         else:  # pragma: no cover
             raise Exception("Unreachable code")

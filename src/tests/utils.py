@@ -6,14 +6,14 @@ from aio_pika.abc import AbstractConnection, DateType
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from outbox import Listener, Worker
+from outbox import Consumer, Worker
 
 
 class Person(BaseModel):
     name: str
 
 
-class EmitType(Protocol):
+class PublishType(Protocol):
     def __call__(
         self,
         session: AsyncSession,
@@ -25,14 +25,14 @@ class EmitType(Protocol):
     ) -> Awaitable[None]: ...
 
 
-async def run_worker(worker: Worker, listeners: Sequence[Listener], timeout: float) -> None:
-    prev_listeners = worker.listeners
-    worker.listeners = listeners
+async def run_worker(worker: Worker, consumers: Sequence[Consumer], timeout: float) -> None:
+    prev_consumers = worker.consumers
+    worker.consumers = consumers
     try:
         await asyncio.wait_for(worker.run(), timeout=timeout)
     except asyncio.TimeoutError:
         pass
-    worker.listeners = prev_listeners
+    worker.consumers = prev_consumers
 
 
 async def get_dlq_message_count(rmq_connection: AbstractConnection, queue_name: str) -> int:

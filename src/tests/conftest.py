@@ -11,9 +11,9 @@ from sqlalchemy.orm import Session
 from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from testcontainers.rabbitmq import RabbitMqContainer  # type: ignore[import-untyped]
 
-from outbox import Emitter, MessageRelay, Worker
+from outbox import MessageRelay, Publisher, Worker
 
-from .utils import EmitType
+from .utils import PublishType
 
 
 @pytest_asyncio.fixture(scope="session", loop_scope="session")
@@ -58,13 +58,13 @@ async def rmq_connection() -> AsyncGenerator[AbstractConnection, None]:
 
 
 @pytest.fixture
-def emitter(db_engine: AsyncEngine) -> Emitter:
-    return Emitter(db_engine=db_engine, auto_create_table=True)
+def publisher(db_engine: AsyncEngine) -> Publisher:
+    return Publisher(db_engine=db_engine, auto_create_table=True)
 
 
 @pytest.fixture
-def emit(emitter: Emitter) -> EmitType:
-    return emitter.emit_async
+def publish(publisher: Publisher) -> PublishType:
+    return publisher.publish_async
 
 
 @pytest.fixture

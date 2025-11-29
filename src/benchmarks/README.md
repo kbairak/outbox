@@ -7,11 +7,11 @@ Comprehensive benchmark suite for measuring outbox pattern performance with conf
 The benchmark:
 
 1. Spins up PostgreSQL and RabbitMQ containers using testcontainers
-2. Emits messages at a controlled rate for **5 seconds** using adaptive batching
+2. Publishes messages at a controlled rate for **5 seconds** using adaptive batching
 3. Measures end-to-end throughput and latency
 4. Reports whether the system kept up with the target emission rate
 
-**Key Design**: Messages are emitted smoothly throughout the duration using an adaptive algorithm that adjusts batch sizes based on elapsed time. This creates realistic, steady traffic patterns instead of periodic bursts.
+**Key Design**: Messages are published smoothly throughout the duration using an adaptive algorithm that adjusts batch sizes based on elapsed time. This creates realistic, steady traffic patterns instead of periodic bursts.
 
 ## Usage
 
@@ -29,7 +29,7 @@ usage: outbox_benchmark.py [-h] [--message-rate MESSAGE_RATE]
                            [--worker-count WORKER_COUNT]
                            [--relay-count RELAY_COUNT]
 
-Run outbox benchmark - emits messages at specified rate for 5 seconds
+Run outbox benchmark - publishes messages at specified rate for 5 seconds
 
 options:
   -h, --help            show this help message and exit
@@ -64,8 +64,8 @@ PostgreSQL: postgresql+asyncpg://test:test@localhost:61153/test
 RabbitMQ: amqp://guest:guest@localhost:61158/
 Starting 1 message relay process(es)...
 Starting 1 worker process(es)...
-Emitting 5,000 messages at 1,000 msgs/sec for 5.0 seconds...
-Emitted 5,000 messages in 5.02s (target: 1,000 msgs/sec, actual: 996 msgs/sec)
+Publishing 5,000 messages at 1,000 msgs/sec for 5.0 seconds...
+Published 5,000 messages in 5.02s (target: 1,000 msgs/sec, actual: 996 msgs/sec)
 Waiting for messages to be processed...
 Terminating relay processes...
 Terminating worker processes...
@@ -83,7 +83,7 @@ Batch Size:        50
 Prefetch Count:    10
 Message Size:      256 bytes
 Duration:          5.0 seconds
-Messages Emitted:  5,000
+Messages Published:  5,000
 Messages Processed:5,000
 Total Duration:    6.06s
 Processing Rate:   995 msgs/sec
@@ -175,7 +175,7 @@ Configuration: 5,000 msgs/sec, 2 relays, 4 workers
 
 When relays run in **separate processes** (not asyncio tasks), the system scales well:
 
-- No GIL contention between emitter, relays, and workers
+- No GIL contention between publisher, relays, and workers
 - True parallel execution across all components
 - Linear scaling up to database limits
 
@@ -272,7 +272,7 @@ The benchmark uses a multi-process architecture:
 
 ```
 Main Process
-├── Emits messages smoothly using adaptive batching
+├── Publishes messages smoothly using adaptive batching
 ├── Commits to PostgreSQL outbox table
 └── No GIL contention with other components
 

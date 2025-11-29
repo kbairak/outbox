@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from testcontainers.rabbitmq import RabbitMqContainer  # type: ignore[import-untyped]
 
-from outbox import Emitter, Listener, MessageRelay, OutboxMessage, Worker
+from outbox import Consumer, MessageRelay, OutboxMessage, Publisher, Worker
 from outbox.utils import ensure_database_async
 
 
@@ -57,8 +57,8 @@ def worker_process(rabbitmq_url: str, prefetch_count: int, timestamp_list: list[
 
     worker = Worker(
         rmq_connection_url=rabbitmq_url,
-        listeners=[
-            Listener(binding_key="benchmark.test", queue="benchmark.test", callback=on_message)
+        consumers=[
+            Consumer(binding_key="benchmark.test", queue="benchmark.test", callback=on_message)
         ],
         enable_metrics=False,
         prefetch_count=prefetch_count,
@@ -95,10 +95,10 @@ async def benchmark(
         print(f"RabbitMQ: {rabbitmq_url}")
 
         # Setup in main process (creates table)
-        emitter = Emitter(db_engine_url=postgres_url, auto_create_table=True)
-        assert emitter.db_engine is not None
-        assert isinstance(emitter.db_engine, AsyncEngine)
-        await ensure_database_async(emitter.db_engine)
+        publisher = Publisher(db_engine_url=postgres_url, auto_create_table=True)
+        assert publisher.db_engine is not None
+        assert isinstance(publisher.db_engine, AsyncEngine)
+        await ensure_database_async(publisher.db_engine)
 
         # Start message relay processes
         print(f"Starting {relay_count} message relay process(es)...")
@@ -128,25 +128,25 @@ async def benchmark(
         # Give workers and relay time to initialize
         await asyncio.sleep(2)
 
-        # Emit messages at controlled rate
+        # Publish messages at controlled rate
         print(
-            f"Emitting {message_count:,} messages at {message_rate:,} msgs/sec for {duration} "
+            f"Publishing {message_count:,} messages at {message_rate:,} msgs/sec for {duration} "
             "seconds..."
         )
-        emit_start_time = time.perf_counter()
-        async with AsyncSession(emitter.db_engine) as session:
+        publish_start_time = time.perf_counter()
+        async with AsyncSession(publisher.db_engine) as session:
             message = OutboxMessage(routing_key="benchmark.test", body="*" * message_size)
-            for emit_batch_size in _generate_batch_sizes(message_rate, duration):
-                await emitter.bulk_emit(
+            for publish_batch_size in _generate_batch_sizes(message_rate, duration):
+                await publisher.bulk_publish(
                     session,
-                    [message for _ in range(emit_batch_size)],
+                    [message for _ in range(publish_batch_size)],
                 )
                 await session.commit()
 
-        emit_duration = time.perf_counter() - emit_start_time
-        actual_rate = message_count / emit_duration if emit_duration > 0 else 0
+        publish_duration = time.perf_counter() - publish_start_time
+        actual_rate = message_count / publish_duration if publish_duration > 0 else 0
         print(
-            f"Emitted {message_count:,} messages in {emit_duration:.2f}s "
+            f"Published {message_count:,} messages in {publish_duration:.2f}s "
             f"(target: {message_rate:,} msgs/sec, actual: {actual_rate:.0f} msgs/sec)"
         )
 
@@ -203,14 +203,14 @@ async def benchmark(
         print(f"Batch Size:        {batch_size}")
         print(f"Prefetch Count:    {prefetch_count}")
         print(f"Message Size:      {message_size} bytes")
-        print(f"Emit duration:     {duration} seconds")
-        print(f"Messages Emitted:  {message_count:,}")
+        print(f"Publish duration:     {duration} seconds")
+        print(f"Messages published:  {message_count:,}")
         print(f"Processing Rate:   {throughput:,.0f} msgs/sec")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Run outbox benchmark - emits messages at specified rate for 5 seconds"
+        description="Run outbox benchmark - publishes messages at specified rate for 5 seconds"
     )
     parser.add_argument(
         "--message-rate",

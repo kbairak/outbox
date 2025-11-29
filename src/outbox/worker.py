@@ -29,7 +29,7 @@ from .utils import (
 
 
 @dataclass
-class Listener:
+class Consumer:
     binding_key: str
     queue: str
     callback: Union[Callable[..., Any], Callable[..., Coroutine[Any, Any, None]]]
@@ -272,15 +272,15 @@ class Listener:
         )
 
 
-def listen(
+def consume(
     binding_key: str,
     queue: str,
     retry_delays: Optional[Sequence[str]] = None,
-) -> Callable[[Union[Callable[..., Any], Callable[..., Coroutine[Any, Any, None]]]], Listener]:
+) -> Callable[[Union[Callable[..., Any], Callable[..., Coroutine[Any, Any, None]]]], Consumer]:
     def decorator(
         func: Union[Callable[..., Any], Callable[..., Coroutine[Any, Any, None]]],
-    ) -> Listener:
-        return Listener(binding_key, queue, func, retry_delays)
+    ) -> Consumer:
+        return Consumer(binding_key, queue, func, retry_delays)
 
     return decorator
 
@@ -289,7 +289,7 @@ def listen(
 class Worker:
     rmq_connection: Optional[AbstractConnection] = None
     rmq_connection_url: Optional[str] = None
-    listeners: Sequence[Listener] = field(default_factory=list)
+    consumers: Sequence[Consumer] = field(default_factory=list)
     exchange_name: str = "outbox"
     retry_delays: Sequence[str] = ("1s", "10s", "1m", "5m")
     prefetch_count: int = 10
@@ -324,38 +324,38 @@ class Worker:
 
         logger.info(
             f"Starting worker on exchange '{self.exchange_name}' with "
-            f"{len(self.listeners)} listeners, prefetch_count={self.prefetch_count}, "
+            f"{len(self.consumers)} consumers, prefetch_count={self.prefetch_count}, "
             f"retry_delays={self.retry_delays}"
         )
-        for listener in self.listeners:
-            assert listener._queue_obj is not None
+        for consumer in self.consumers:
+            assert consumer._queue_obj is not None
 
             async def _task(
-                message: AbstractIncomingMessage, listener: Listener = listener
+                message: AbstractIncomingMessage, consumer: Consumer = consumer
             ) -> None:
                 if self._shutdown_future is not None and self._shutdown_future.done():
                     await message.nack(requeue=True)
                     return
-                task = asyncio.create_task(listener._handle(message))
+                task = asyncio.create_task(consumer._handle(message))
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
 
-            listener._consumer_tag = await listener._queue_obj.consume(_task)
+            consumer._consumer_tag = await consumer._queue_obj.consume(_task)
             metrics.active_consumers.labels(
-                queue=listener.queue, exchange_name=self.exchange_name
+                queue=consumer.queue, exchange_name=self.exchange_name
             ).inc()
 
         await self._shutdown_future
 
         logger.info("Received shutdown signal, waiting for ongoing tasks and exiting...")
 
-        for listener in self.listeners:
-            if listener._consumer_tag is None:
+        for consumer in self.consumers:
+            if consumer._consumer_tag is None:
                 continue
-            assert listener._queue_obj is not None
-            await listener._queue_obj.cancel(listener._consumer_tag)
+            assert consumer._queue_obj is not None
+            await consumer._queue_obj.cancel(consumer._consumer_tag)
             metrics.active_consumers.labels(
-                queue=listener.queue, exchange_name=self.exchange_name
+                queue=consumer.queue, exchange_name=self.exchange_name
             ).dec()
 
         if tasks:
@@ -375,12 +375,12 @@ class Worker:
 
             try:
                 channel = await self.rmq_connection.channel()
-                for listener in self.listeners:
-                    dlq_name = f"{listener.queue}.dlq"
+                for consumer in self.consumers:
+                    dlq_name = f"{consumer.queue}.dlq"
                     try:
                         dlq = await channel.get_queue(dlq_name)
                         declaration_result = await dlq.declare()
-                        metrics.dlq_messages.labels(queue=listener.queue).set(
+                        metrics.dlq_messages.labels(queue=consumer.queue).set(
                             float(declaration_result.message_count or 0)
                         )
                     except Exception as exc:
@@ -422,11 +422,11 @@ class Worker:
             )
             raise  # Re-raise original aio-pika exception
 
-        # Collect all unique delay strings from worker default and listener overrides
+        # Collect all unique delay strings from worker default and consumer overrides
         all_delay_strs: set[str] = set(self.retry_delays)
-        for listener in self.listeners:
-            if listener.retry_delays:
-                all_delay_strs.update(listener.retry_delays)
+        for consumer in self.consumers:
+            if consumer.retry_delays:
+                all_delay_strs.update(consumer.retry_delays)
 
         # Parse and validate all delay strings upfront (before any RabbitMQ operations)
         # Create a delay_str -> delay_ms mapping for efficient lookup
@@ -462,30 +462,30 @@ class Worker:
             # Bind to fanout exchange (no routing key needed)
             await delay_queue.bind(delay_exchange)
 
-        # Set up listener queues and inject configuration
-        for listener in self.listeners:
+        # Set up consumer queues and inject configuration
+        for consumer in self.consumers:
             # Inject default retry_delays, delay exchanges, and exchange_name
-            if listener.retry_delays is None:
-                listener.retry_delays = self.retry_delays
-            listener._delay_exchanges = delay_exchanges
-            listener._exchange_name = self.exchange_name
+            if consumer.retry_delays is None:
+                consumer.retry_delays = self.retry_delays
+            consumer._delay_exchanges = delay_exchanges
+            consumer._exchange_name = self.exchange_name
 
             dead_letter_queue_obj = await channel.declare_queue(
-                f"{listener.queue}.dlq", durable=True, arguments={"x-queue-type": "quorum"}
+                f"{consumer.queue}.dlq", durable=True, arguments={"x-queue-type": "quorum"}
             )
-            await dead_letter_queue_obj.bind(dead_letter_exchange, listener.queue)
+            await dead_letter_queue_obj.bind(dead_letter_exchange, consumer.queue)
 
             logger.debug(
-                f"Binding queue {listener.queue} to exchange {self.exchange_name} with "
-                f"binding key {listener.binding_key}"
+                f"Binding queue {consumer.queue} to exchange {self.exchange_name} with "
+                f"binding key {consumer.binding_key}"
             )
-            listener._queue_obj = await channel.declare_queue(
-                listener.queue,
+            consumer._queue_obj = await channel.declare_queue(
+                consumer.queue,
                 durable=True,
                 arguments={
                     "x-dead-letter-exchange": f"{self.exchange_name}.dlx",
-                    "x-dead-letter-routing-key": listener.queue,
+                    "x-dead-letter-routing-key": consumer.queue,
                     "x-queue-type": "quorum",
                 },
             )
-            await listener._queue_obj.bind(exchange, listener.binding_key)
+            await consumer._queue_obj.bind(exchange, consumer.binding_key)
