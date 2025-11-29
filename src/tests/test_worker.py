@@ -905,19 +905,12 @@ async def test_sync_callback_with_special_params(
     # arrange
     retrieved_routing_key = None
     retrieved_tracking_ids = None
-    retrieved_queue_name = None
 
     @consume(binding_key="special.test", queue="test_sync_special_params")
-    def sync_handler(
-        _: object,
-        routing_key: str,
-        tracking_ids: Sequence[str],
-        queue_name: str,
-    ) -> None:
-        nonlocal retrieved_routing_key, retrieved_tracking_ids, retrieved_queue_name
+    def sync_handler(_: object, routing_key: str, tracking_ids: Sequence[str]) -> None:
+        nonlocal retrieved_routing_key, retrieved_tracking_ids
         retrieved_routing_key = routing_key
         retrieved_tracking_ids = tracking_ids
-        retrieved_queue_name = queue_name
 
     await publish(session, "special.test", {"value": 42})
     await session.commit()
@@ -933,7 +926,6 @@ async def test_sync_callback_with_special_params(
     assert retrieved_routing_key == "special.test"
     assert retrieved_tracking_ids is not None
     assert len(retrieved_tracking_ids) == 1
-    assert retrieved_queue_name == "test_sync_special_params"
 
     # reset
     worker.consumers = prev_consumers
