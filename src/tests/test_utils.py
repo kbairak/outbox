@@ -9,7 +9,7 @@ def test_parse_duration_zeros() -> None:
     assert parse_duration("0s") == 0
     assert parse_duration("0m") == 0
     with pytest.raises(ValueError, match=r".*"):
-        parse_duration("0h")
+        parse_duration("0w")
 
 
 def test_parse_duration_milliseconds() -> None:

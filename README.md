@@ -830,6 +830,7 @@ For **CPU-bound work**, see Best Practices / Worker.
 Ensure the outbox table exists with proper schema, indexes, and triggers (async version).
 
 **Parameters:**
+
 - `db`: PostgreSQL connection URL string or `asyncpg.Connection` object
 - `table_name`: Table name. Defaults to `"outbox_table"`
 
@@ -840,6 +841,7 @@ Ensure the outbox table exists with proper schema, indexes, and triggers (async 
 Ensure the outbox table exists with proper schema, indexes, and triggers (sync version).
 
 **Parameters:**
+
 - `db`: PostgreSQL connection URL string or `psycopg2.Connection` object
 - `table_name`: Table name. Defaults to `"outbox_table"`
 
@@ -1072,7 +1074,7 @@ The outbox library creates the following RabbitMQ resources:
 |--------------|------|---------|---------|
 | `{exchange_name}` | TOPIC | Yes | Main exchange for routing messages from relay to consumers |
 | `{exchange_name}.dlx` | DIRECT | Yes | Dead letter exchange for failed messages |
-| `{exchange_name}.delay_{N}s` | FANOUT | Yes | Delay exchange for retry backoff (one per unique delay value) |
+| `{exchange_name}.delay_{duration}` | FANOUT | Yes | Delay exchange for retry backoff (one per unique delay value, e.g., `delay_1s`, `delay_10s`, `delay_1m`) |
 
 Default value for `exchange_name` is `"outbox"`.
 
@@ -1082,7 +1084,7 @@ Default value for `exchange_name` is `"outbox"`.
 |--------------|---------|-----------|---------|
 | `{consumer.queue}` | Yes | `x-dead-letter-exchange`: `{exchange_name}.dlx`<br>`x-dead-letter-routing-key`: `{consumer.queue}`<br>`x-queue-type`: `quorum` | Consumer's main queue |
 | `{consumer.queue}.dlq` | Yes | `x-queue-type`: `quorum` | Dead letter queue for messages that exhausted retries |
-| `{exchange_name}.delay_{N}s` | Yes | `x-message-ttl`: `{N * 1000}` ms<br>`x-dead-letter-exchange`: `""` (default exchange)<br>`x-queue-type`: `quorum` | Delay queue for retry backoff (one per unique delay value). Routes back to specific queue via default exchange. |
+| `{exchange_name}.delay_{duration}` | Yes | `x-message-ttl`: milliseconds (e.g., 1000 for "1s", 60000 for "1m")<br>`x-dead-letter-exchange`: `""` (default exchange)<br>`x-queue-type`: `quorum` | Delay queue for retry backoff (one per unique delay value). Routes back to specific queue via default exchange. |
 
 ### Bindings
 
@@ -1090,7 +1092,7 @@ Default value for `exchange_name` is `"outbox"`.
 |----------|---------|-------|---------|
 | `{exchange_name}` | `{consumer.binding_key}` | `{consumer.queue}` | Routes messages to consumer (supports wildcards like `user.*`) |
 | `{exchange_name}.dlx` | `{consumer.queue}` | `{consumer.queue}.dlq` | Routes failed messages to DLQ |
-| `{exchange_name}.delay_{N}s` | (none - fanout) | `{exchange_name}.delay_{N}s` | Routes messages to delay queue |
+| `{exchange_name}.delay_{duration}` | (none - fanout) | `{exchange_name}.delay_{duration}` | Routes messages to delay queue |
 
 **Key insight**: Delay exchanges/queues are **shared** across all consumers. The number created depends on the **unique set** of delay values across global `setup(retry_delays=...)` and all per-consumer `@consume(retry_delays=...)` overrides.
 
@@ -1116,7 +1118,14 @@ provider "rabbitmq" {
 # Variables for configuration
 locals {
   exchange_name = "outbox"
-  retry_delays  = [1, 10, 60, 300]  # Must match your Worker(retry_delays=...)
+
+  # Map duration strings to milliseconds (must match your Worker(retry_delays=...))
+  retry_delays = {
+    "1s"  = 1000
+    "10s" = 10000
+    "1m"  = 60000
+    "5m"  = 300000
+  }
 
   consumers = [
     {
@@ -1129,7 +1138,7 @@ locals {
 
 **Important notes:**
 
-1. **Sync retry_delays**: The `local.retry_delays` list in Terraform **must match** your `Worker(retry_delays=...)` as well as all your retry_delays overrides in `@consume()` decorators
+1. **Sync retry_delays**: The keys in `local.retry_delays` (e.g., `"1s"`, `"10s"`) **must match** the duration strings in your `Worker(retry_delays=...)` as well as all your retry_delays overrides in `@consume()` decorators
 2. **Sync consumer queues**: The `local.consumers` list must include all your `@consume()` decorators
 
 </details>
@@ -1162,9 +1171,9 @@ resource "rabbitmq_exchange" "dlx" {
 
 # Delay exchanges (one per unique delay value)
 resource "rabbitmq_exchange" "delay" {
-  for_each = toset([for d in local.retry_delays : tostring(d)])
+  for_each = local.retry_delays
 
-  name  = "${local.exchange_name}.delay_${each.key}s"
+  name  = "${local.exchange_name}.delay_${each.key}"
   vhost = "/"
 
   settings {
@@ -1175,15 +1184,15 @@ resource "rabbitmq_exchange" "delay" {
 
 # Delay queues (one per unique delay value)
 resource "rabbitmq_queue" "delay" {
-  for_each = toset([for d in local.retry_delays : tostring(d)])
+  for_each = local.retry_delays
 
-  name  = "${local.exchange_name}.delay_${each.key}s"
+  name  = "${local.exchange_name}.delay_${each.key}"
   vhost = "/"
 
   settings {
     durable = true
     arguments = {
-      "x-message-ttl"           = tonumber(each.key) * 1000
+      "x-message-ttl"           = each.value
       "x-dead-letter-exchange"  = ""  # Default exchange (routes by queue name)
       "x-queue-type"            = "quorum"
     }
@@ -1192,11 +1201,11 @@ resource "rabbitmq_queue" "delay" {
 
 # Bind delay queues to their delay exchanges
 resource "rabbitmq_binding" "delay" {
-  for_each = toset([for d in local.retry_delays : tostring(d)])
+  for_each = local.retry_delays
 
-  source      = "${local.exchange_name}.delay_${each.key}s"
+  source      = "${local.exchange_name}.delay_${each.key}"
   vhost       = "/"
-  destination = "${local.exchange_name}.delay_${each.key}s"
+  destination = "${local.exchange_name}.delay_${each.key}"
   destination_type = "queue"
   routing_key = ""  # Fanout exchange ignores routing key
 
@@ -1354,9 +1363,9 @@ in vhost '/' refused for user 'myapp'
 aio_pika.exceptions.ChannelPreconditionFailed: NOT_FOUND - no exchange '{exchange_name}.delay_5s' in vhost '/'
 ```
 
-**Cause**: Added `retry_delays=(5, 15)` to a consumer but didn't create corresponding delay exchanges/queues in Terraform
+**Cause**: Added `retry_delays=("5s", "15s")` to a consumer but didn't create corresponding delay exchanges/queues in Terraform
 
-**Solution**: Update `local.retry_delays` in Terraform to include new delay values, run `terraform apply`
+**Solution**: Update `local.retry_delays` in Terraform to include new delay values (e.g., `"5s" = 5000, "15s" = 15000`), run `terraform apply`
 
 ### Publishing Failure (Missing Write Permission)
 
@@ -1586,12 +1595,9 @@ See [detailed benchmark results](src/benchmarks/README.md) for throughput scalin
 
 ### High priority
 
-- [ ] Graceful shutdown for message relay
-
 ### Medium priority
-
-- [ ] Terraform examples to use string delays like "5s", "1m"
 
 ### Low priority
 
 - [ ] Use msgpack (optionally) to reduce size
+- [ ] Graceful shutdown for message relay

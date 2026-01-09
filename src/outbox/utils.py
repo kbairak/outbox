@@ -190,39 +190,42 @@ def parse_duration(s: str) -> int:
         and negative values
     """
 
-    if s in ("0", "0ms", "0s", "0m"):
+    if s in ("0", "0ms", "0s", "0m", "0h", "0d"):
         return 0
 
-    match = re.search(r"^([^0]\d*m)?([^0]\d*s)?([^0]\d*ms)?$", s)
+    match = re.search(r"^([^0]\d*d)?([^0]\d*h)?([^0]\d*m)?([^0]\d*s)?([^0]\d*ms)?$", s)
     if match is None:
         raise ValueError(f"Invalid duration string: {s!r}")
-    minutes_string, seconds_string, milliseconds_string = match.groups()
+    days_string, hours_string, minutes_string, seconds_string, milliseconds_string = match.groups()
 
     result = 0
+
+    if days_string:
+        days = int(days_string[:-1])
+        result += days * 24 * 60 * 60 * 1000
+
+    if hours_string:
+        hours = int(hours_string[:-1])
+        if not 1 <= hours <= 23:
+            raise ValueError(f"Invalid value for {hours=}, must be between 1 and 23")
+        result += hours * 60 * 60 * 1000
 
     if minutes_string:
         minutes = int(minutes_string[:-1])
         if not 1 <= minutes <= 59:
-            raise ValueError(
-                f"Invalid value for minutes {minutes_string!r}, must be between 1 and 60"
-            )
+            raise ValueError(f"Invalid value for {minutes=}, must be between 1 and 60")
         result += minutes * 60 * 1000
 
     if seconds_string:
         seconds = int(seconds_string[:-1])
         if not 1 <= seconds <= 59:
-            raise ValueError(
-                f"Invalid value for seconds {seconds_string!r}, must be between 1 and 60"
-            )
+            raise ValueError(f"Invalid value for {seconds=}, must be between 1 and 60")
         result += seconds * 1000
 
     if milliseconds_string:
         milliseconds = int(milliseconds_string[:-2])
         if not 1 <= milliseconds <= 999:
-            raise ValueError(
-                f"Invalid value for milliseconds {milliseconds_string!r}, must be between 1 and "
-                "999"
-            )
+            raise ValueError(f"Invalid value for {milliseconds=}, must be between 1 and 999")
         result += milliseconds
 
     if result == 0:
