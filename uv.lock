@@ -808,7 +808,6 @@ dependencies = [
     { name = "asyncpg-stubs" },
     { name = "prometheus-client" },
     { name = "pydantic" },
-    { name = "sqlalchemy", extra = ["asyncio"] },
 ]
 
 [package.dev-dependencies]
@@ -821,8 +820,10 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "ruff" },
+    { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "testcontainers", extra = ["rabbitmq"] },
     { name = "ty" },
+    { name = "types-psycopg2" },
 ]
 noasync = [
     { name = "psycopg2-binary" },
@@ -836,7 +837,6 @@ requires-dist = [
     { name = "asyncpg-stubs", specifier = ">=0.30.0" },
     { name = "prometheus-client", specifier = ">=0.8.0,<1.0.0" },
     { name = "pydantic", specifier = ">=2.0.3,<3" },
-    { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.0,<3" },
 ]
 
 [package.metadata.requires-dev]
@@ -849,8 +849,10 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=1.0.0" },
     { name = "pytest-cov", specifier = ">=6.1.1" },
     { name = "ruff", specifier = ">=0.11.12" },
+    { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.0,<3" },
     { name = "testcontainers", extras = ["postgres", "rabbitmq"], specifier = ">=4.13.3" },
     { name = "ty", specifier = ">=0.0.1a26" },
+    { name = "types-psycopg2", specifier = ">=2.9.21.20251012" },
 ]
 noasync = [{ name = "psycopg2-binary", specifier = ">=2.9.11" }]
 
@@ -1619,6 +1621,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/10/f8/d869492bdbb21ae8cf4c99b02f20812bbbf49aa187cfeb387dfaa03036a8/ty-0.0.1a26-py3-none-win32.whl", hash = "sha256:86689b90024810cac7750bf0c6e1652e4b4175a9de7b82b8b1583202aeb47287", size = 8645669, upload-time = "2025-11-10T18:02:23.23Z" },
     { url = "https://files.pythonhosted.org/packages/b4/18/8a907575d2b335afee7556cb92233ebb5efcefe17752fc9dcab21cffb23b/ty-0.0.1a26-py3-none-win_amd64.whl", hash = "sha256:829e6e6dbd7d9d370f97b2398b4804552554bdcc2d298114fed5e2ea06cbc05c", size = 9442975, upload-time = "2025-11-10T18:02:25.68Z" },
     { url = "https://files.pythonhosted.org/packages/e9/22/af92dcfdd84b78dd97ac6b7154d6a763781f04a400140444885c297cc213/ty-0.0.1a26-py3-none-win_arm64.whl", hash = "sha256:b8f431c784d4cf5b4195a3521b2eca9c15902f239b91154cb920da33f943c62b", size = 8958958, upload-time = "2025-11-10T18:02:28.071Z" },
+]
+
+[[package]]
+name = "types-psycopg2"
+version = "2.9.21.20251012"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/9b/b3/2d09eaf35a084cffd329c584970a3fa07101ca465c13cad1576d7c392587/types_psycopg2-2.9.21.20251012.tar.gz", hash = "sha256:4cdafd38927da0cfde49804f39ab85afd9c6e9c492800e42f1f0c1a1b0312935", size = 26710, upload-time = "2025-10-12T02:55:39.5Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ec/0c/05feaf8cb51159f2c0af04b871dab7e98a2f83a3622f5f216331d2dd924c/types_psycopg2-2.9.21.20251012-py3-none-any.whl", hash = "sha256:712bad5c423fe979e357edbf40a07ca40ef775d74043de72bd4544ca328cc57e", size = 24883, upload-time = "2025-10-12T02:55:38.439Z" },
 ]
 
 [[package]]

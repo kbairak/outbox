@@ -1,23 +1,24 @@
 """Outbox benchmark - supports single-process and multi-process workers."""
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import multiprocessing
 import time
-from typing import Generator, Optional, Union, cast
+from collections.abc import Generator
+from typing import cast
 
 import aio_pika
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from testcontainers.rabbitmq import RabbitMqContainer  # type: ignore[import-untyped]
 
 from outbox import Consumer, MessageRelay, OutboxMessage, Publisher, Worker
-from outbox.utils import ensure_database_async
+from outbox.utils import ensure_outbox_table_async
 
 
-def _generate_batch_sizes(
-    rate: Union[int, float], duration: Union[int, float]
-) -> Generator[int, None, None]:
+def _generate_batch_sizes(rate: int | float, duration: int | float) -> Generator[int, None, None]:
     start = time.perf_counter()
     yield (sent := 1)
     while (now := time.perf_counter()) - start <= duration:
@@ -33,7 +34,6 @@ def message_relay_process(postgres_url: str, rabbitmq_url: str, batch_size: int)
     message_relay = MessageRelay(
         db_engine_url=postgres_url,
         rmq_connection_url=rabbitmq_url,
-        auto_create_table=False,  # Already created by main process
         enable_metrics=False,
         batch_size=batch_size,
     )
@@ -43,8 +43,8 @@ def message_relay_process(postgres_url: str, rabbitmq_url: str, batch_size: int)
 def worker_process(rabbitmq_url: str, prefetch_count: int, timestamp_list: list[float]) -> None:
     """Run a worker process that consumes messages."""
     # Track metrics locally in this process
-    first_message_time: Optional[float] = None
-    last_message_time: Optional[float] = None
+    first_message_time: float | None = None
+    last_message_time: float | None = None
 
     async def on_message(_: str) -> None:
         """Handler that tracks latency."""
@@ -95,10 +95,12 @@ async def benchmark(
         print(f"RabbitMQ: {rabbitmq_url}")
 
         # Setup in main process (creates table)
-        publisher = Publisher(db_engine_url=postgres_url, auto_create_table=True)
-        assert publisher.db_engine is not None
-        assert isinstance(publisher.db_engine, AsyncEngine)
-        await ensure_database_async(publisher.db_engine)
+        # Convert SQLAlchemy URL format to asyncpg format for table creation
+        asyncpg_url = postgres_url.replace("postgresql+asyncpg://", "postgresql://")
+        await ensure_outbox_table_async(asyncpg_url)
+        # Create SQLAlchemy engine for backward compatible publishing
+        db_engine = create_async_engine(postgres_url)
+        publisher = Publisher()
 
         # Start message relay processes
         print(f"Starting {relay_count} message relay process(es)...")
@@ -107,7 +109,7 @@ async def benchmark(
             relay_processes.append(
                 multiprocessing.Process(
                     target=message_relay_process,
-                    args=(postgres_url, rabbitmq_url, batch_size),
+                    args=(asyncpg_url, rabbitmq_url, batch_size),
                 )
             )
             relay_processes[-1].start()
@@ -134,7 +136,7 @@ async def benchmark(
             "seconds..."
         )
         publish_start_time = time.perf_counter()
-        async with AsyncSession(publisher.db_engine) as session:
+        async with AsyncSession(db_engine) as session:
             message = OutboxMessage(routing_key="benchmark.test", body="*" * message_size)
             for publish_batch_size in _generate_batch_sizes(message_rate, duration):
                 await publisher.bulk_publish(

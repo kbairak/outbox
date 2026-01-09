@@ -1,11 +1,13 @@
+from __future__ import annotations
+
 import asyncio
 import inspect
 import json
 import signal
 import time
-from collections.abc import Sequence
+from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable, Coroutine, Optional, Union, cast
+from typing import Any, Callable, cast, get_type_hints
 
 import aio_pika
 from aio_pika.abc import (
@@ -32,12 +34,12 @@ from .utils import (
 class Consumer:
     binding_key: str
     queue: str
-    callback: Union[Callable[..., Any], Callable[..., Coroutine[Any, Any, None]]]
-    retry_delays: Optional[Sequence[str]] = None
-    _queue_obj: Optional[AbstractQueue] = None
-    _consumer_tag: Optional[ConsumerTag] = None
+    callback: Callable[..., Any] | Callable[..., Coroutine[Any, Any, None]]
+    retry_delays: Sequence[str] | None = None
+    _queue_obj: AbstractQueue | None = None
+    _consumer_tag: ConsumerTag | None = None
     _delay_exchanges: dict[str, AbstractExchange] = field(default_factory=dict)
-    _exchange_name: Optional[str] = None
+    _exchange_name: str | None = None
 
     def __post_init__(self) -> None:
         if not self.queue:
@@ -82,12 +84,16 @@ class Consumer:
         body_param_key = parameter_keys.pop()
         body_param = parameters[body_param_key]
 
+        # Get type hints to resolve string annotations to actual types
+        type_hints = get_type_hints(self.callback)
+        body_type = type_hints.get(body_param_key, body_param.annotation)
+
         tracking_ids = tuple(
             json.loads(cast(str, message.headers.get("x-outbox-tracking-ids", "[]")))
         )
         token = tracking_ids_contextvar.set(tracking_ids)
 
-        attempt_count_header = cast(Optional[str], message.headers.get("x-delivery-count"))
+        attempt_count_header = cast(str | None, message.headers.get("x-delivery-count"))
         retry_delays = self.retry_delays or ()
 
         if attempt_count_header is not None:
@@ -110,15 +116,14 @@ class Consumer:
         # Get routing key - use original routing key if preserved in header (for retries)
         # otherwise use message routing key (for initial delivery)
         routing_key = (
-            cast(Optional[str], message.headers.get("x-original-routing-key"))
-            or message.routing_key
+            cast(str | None, message.headers.get("x-original-routing-key")) or message.routing_key
         )
         assert routing_key is not None
         body = message.body
         try:
-            if issubclass(body_param.annotation, BaseModel):
-                body = body_param.annotation.model_validate_json(message.body)
-            elif issubclass(body_param.annotation, bytes):
+            if inspect.isclass(body_type) and issubclass(body_type, BaseModel):
+                body = body_type.model_validate_json(message.body)
+            elif inspect.isclass(body_type) and issubclass(body_type, bytes):
                 body = message.body
             else:
                 body = json.loads(message.body)
@@ -216,7 +221,8 @@ class Consumer:
             await message.nack(requeue=True)
             metrics.retry_attempts.labels(queue=self.queue, delay_seconds=delay_str).inc()
             logger.info(
-                f"Message requeued for instant retry (attempt {attempt_count}/{len(retry_delays)}) "
+                f"Message requeued for instant retry "
+                f"(attempt {attempt_count}/{len(retry_delays)}) "
                 f"routing_key={message.routing_key}, {tracking_ids=}"
             )
             return
@@ -272,10 +278,10 @@ class Consumer:
 def consume(
     binding_key: str,
     queue: str,
-    retry_delays: Optional[Sequence[str]] = None,
-) -> Callable[[Union[Callable[..., Any], Callable[..., Coroutine[Any, Any, None]]]], Consumer]:
+    retry_delays: Sequence[str] | None = None,
+) -> Callable[[Callable[..., Any] | Callable[..., Coroutine[Any, Any, None]]], Consumer]:
     def decorator(
-        func: Union[Callable[..., Any], Callable[..., Coroutine[Any, Any, None]]],
+        func: Callable[..., Any] | Callable[..., Coroutine[Any, Any, None]],
     ) -> Consumer:
         return Consumer(binding_key, queue, func, retry_delays)
 
@@ -284,15 +290,15 @@ def consume(
 
 @dataclass
 class Worker:
-    rmq_connection: Optional[AbstractConnection] = None
-    rmq_connection_url: Optional[str] = None
+    rmq_connection: AbstractConnection | None = None
+    rmq_connection_url: str | None = None
     consumers: Sequence[Consumer] = field(default_factory=list)
     exchange_name: str = "outbox"
     retry_delays: Sequence[str] = ("1s", "10s", "1m", "5m")
     prefetch_count: int = 10
     enable_metrics: bool = True
     # Instance attribute (not just local var) to allow tests to simulate shutdown signals
-    _shutdown_future: Optional[asyncio.Future[None]] = None
+    _shutdown_future: asyncio.Future[None] | None = None
 
     def __post_init__(self) -> None:
         metrics.enable_metrics(self.enable_metrics)

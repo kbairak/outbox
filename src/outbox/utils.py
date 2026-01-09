@@ -1,17 +1,17 @@
 import re
 import reprlib
 import uuid
+from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Generator
+from typing import Any
 
 import aio_pika
+import asyncpg
+import psycopg2
 from aio_pika.abc import AbstractConnection
-from sqlalchemy import Engine, text
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
-from sqlalchemy.orm import Session
+from psycopg2.extensions import connection as Psycopg2Connection
 
-from outbox.database import Base
 from outbox.log import logger
 
 
@@ -45,68 +45,123 @@ async def get_rmq_connection(rmq_connection_url: str) -> AbstractConnection:
 _table_created: set[str] = set()
 
 
-notify_statements = [
-    text("""
-        CREATE OR REPLACE FUNCTION notify_outbox_insert() RETURNS TRIGGER AS $$
+DDL_STATEMENTS = [
+    """ CREATE TABLE IF NOT EXISTS {table_name} (
+            id SERIAL PRIMARY KEY,
+            routing_key TEXT NOT NULL,
+            body BYTEA NOT NULL,
+            tracking_ids JSONB NOT NULL,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+            expiration INTERVAL,
+            send_after TIMESTAMP WITH TIME ZONE NOT NULL,
+            sent_at TIMESTAMP WITH TIME ZONE
+        )""",
+    """ CREATE INDEX IF NOT EXISTS outbox_pending_idx
+        ON {table_name} (send_after, created_at)
+        WHERE sent_at IS NULL""",
+    """ CREATE INDEX IF NOT EXISTS outbox_cleanup_idx
+        ON {table_name} (sent_at)
+        WHERE sent_at IS NOT NULL""",
+    """ CREATE OR REPLACE FUNCTION notify_outbox_insert() RETURNS TRIGGER AS $$
         BEGIN
             IF NEW.send_after <= NOW() THEN
                 PERFORM pg_notify('outbox_channel', '');
             END IF;
             RETURN NEW;
         END;
-        $$ LANGUAGE plpgsql
-    """),
-    text("DROP TRIGGER IF EXISTS outbox_notify_trigger ON outbox_table"),
-    text("""
-        CREATE TRIGGER outbox_notify_trigger
-            AFTER INSERT ON outbox_table
-            FOR EACH ROW
-            EXECUTE FUNCTION notify_outbox_insert()
-    """),
+        $$ LANGUAGE plpgsql""",
+    "DROP TRIGGER IF EXISTS outbox_notify_trigger ON {table_name}",
+    """ CREATE TRIGGER outbox_notify_trigger
+        AFTER INSERT ON {table_name}
+        FOR EACH ROW
+        EXECUTE FUNCTION notify_outbox_insert()""",
 ]
 
 
-def ensure_database_sync(db_engine: Engine) -> None:
-    if str(db_engine.url) in _table_created:
+def ensure_outbox_table_sync(
+    db: str | Psycopg2Connection, table_name: str = "outbox_table"
+) -> None:
+    """Ensure outbox table exists with proper schema and triggers.
+
+    Args:
+        db: Either a PostgreSQL connection URL string (e.g., "postgresql://user:pass@host/db")
+            or an existing psycopg2 connection object
+    """
+    # Determine if we need to create/close connection
+    if isinstance(db, str):
+        cache_key = db
+        should_close = True
+        conn = psycopg2.connect(db)
+    else:
+        cache_key = None
+        should_close = False
+        conn = db
+
+    # Check cache
+    if cache_key and cache_key in _table_created:
+        if should_close:
+            conn.close()
         return
 
     logger.info("Setting up outbox table with triggers")
     try:
-        Base.metadata.create_all(db_engine)
+        with conn.cursor() as cursor:
+            for ddl in DDL_STATEMENTS:
+                cursor.execute(ddl.format(table_name=table_name))
+        conn.commit()
 
-        # Create NOTIFY trigger for instant message delivery
-        with Session(db_engine) as session:
-            for notify_statement in notify_statements:
-                session.execute(notify_statement)
-            session.commit()
-
-        _table_created.add(str(db_engine.url))
+        if cache_key:
+            _table_created.add(cache_key)
         logger.debug("Outbox table and triggers created successfully")
     except Exception as exc:
+        conn.rollback()
         logger.error(f"Failed to create outbox table: {exc}", exc_info=True)
         raise
+    finally:
+        if should_close:
+            conn.close()
 
 
-async def ensure_database_async(db_engine: AsyncEngine) -> None:
-    if str(db_engine.url) in _table_created:
+async def ensure_outbox_table_async(
+    db: str | asyncpg.Connection, table_name: str = "outbox_table"
+) -> None:
+    """Ensure outbox table exists with proper schema and triggers.
+
+    Args:
+        db: Either a PostgreSQL connection URL string (e.g., "postgresql://user:pass@host/db")
+            or an existing asyncpg connection object
+    """
+    # Determine if we need to create/close connection
+    if isinstance(db, str):
+        cache_key = db
+        should_close = True
+        conn = await asyncpg.connect(db)
+    else:
+        cache_key = None
+        should_close = False
+        conn = db
+
+    # Check cache
+    if cache_key and cache_key in _table_created:
+        if should_close:
+            await conn.close()
         return
 
     logger.info("Setting up outbox table with triggers")
     try:
-        async with db_engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+        async with conn.transaction():
+            for ddl in DDL_STATEMENTS:
+                await conn.execute(ddl.format(table_name=table_name))
 
-        # Create NOTIFY trigger for instant message delivery
-        async with AsyncSession(db_engine) as session:
-            for notify_statement in notify_statements:
-                await session.execute(notify_statement)
-            await session.commit()
-
-        _table_created.add(str(db_engine.url))
+        if cache_key:
+            _table_created.add(cache_key)
         logger.debug("Outbox table and triggers created successfully")
     except Exception as exc:
         logger.error(f"Failed to create outbox table: {exc}", exc_info=True)
         raise
+    finally:
+        if should_close:
+            await conn.close()
 
 
 tracking_ids_contextvar: ContextVar[tuple[str, ...]] = ContextVar[tuple[str, ...]](

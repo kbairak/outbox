@@ -12,7 +12,7 @@ from outbox import Consumer, MessageRelay, Reject, Worker, consume, get_tracking
 from .utils import Person, PublishType, get_dlq_message_count, run_worker
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_register_consumer() -> None:
     # test
     @consume(
@@ -28,9 +28,9 @@ async def test_register_consumer() -> None:
     assert handler._consumer_tag is None
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_worker(
-    publish: PublishType, session: AsyncSession, message_relay: MessageRelay, worker: Worker
+    publish: PublishType, session_async: AsyncSession, message_relay: MessageRelay, worker: Worker
 ) -> None:
     # arrange
     callcount = 0
@@ -42,8 +42,8 @@ async def test_worker(
         callcount += 1
         retrieved_argument = person
 
-    await publish(session, "routing_key", {"name": "MyName"})
-    await session.commit()
+    await publish(session_async, "routing_key", {"name": "MyName"})
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [handler]
     await worker._set_up_queues()
@@ -60,9 +60,9 @@ async def test_worker(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_worker_with_pydantic(
-    publish: PublishType, session: AsyncSession, worker: Worker, message_relay: MessageRelay
+    publish: PublishType, session_async: AsyncSession, worker: Worker, message_relay: MessageRelay
 ) -> None:
     # arrange
     callcount = 0
@@ -74,8 +74,8 @@ async def test_worker_with_pydantic(
         callcount += 1
         retrieved_argument = person
 
-    await publish(session, "routing_key", Person(name="MyName"))
-    await session.commit()
+    await publish(session_async, "routing_key", Person(name="MyName"))
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [handler]
     await worker._set_up_queues()
@@ -92,9 +92,9 @@ async def test_worker_with_pydantic(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_worker_with_wildcard(
-    publish: PublishType, worker: Worker, message_relay: MessageRelay, session: AsyncSession
+    publish: PublishType, worker: Worker, message_relay: MessageRelay, session_async: AsyncSession
 ) -> None:
     # arrange
     callcount = 0
@@ -108,8 +108,8 @@ async def test_worker_with_wildcard(
         retrieved_routing_key = routing_key
         retrieved_argument = person
 
-    await publish(session, "routing_key.foo", {"name": "MyName"})
-    await session.commit()
+    await publish(session_async, "routing_key.foo", {"name": "MyName"})
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [handler]
     await worker._set_up_queues()
@@ -127,9 +127,9 @@ async def test_worker_with_wildcard(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_retry(
-    publish: PublishType, worker: Worker, message_relay: MessageRelay, session: AsyncSession
+    publish: PublishType, worker: Worker, message_relay: MessageRelay, session_async: AsyncSession
 ) -> None:
     # arrange
     callcount = 0
@@ -143,8 +143,8 @@ async def test_retry(
             raise ValueError("Simulated failure")
         retrieved_argument = person
 
-    await publish(session, "routing_key", {"name": "MyName"})
-    await session.commit()
+    await publish(session_async, "routing_key", {"name": "MyName"})
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [handler]
     await worker._set_up_queues()
@@ -161,9 +161,9 @@ async def test_retry(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_instant_retry(
-    publish: PublishType, worker: Worker, message_relay: MessageRelay, session: AsyncSession
+    publish: PublishType, worker: Worker, message_relay: MessageRelay, session_async: AsyncSession
 ) -> None:
     """Test that delay=0 uses nack(requeue=True) for instant retries."""
     # arrange
@@ -182,8 +182,8 @@ async def test_instant_retry(
             raise ValueError("Simulated failure")
         retrieved_argument = person
 
-    await publish(session, "routing_key", {"name": "InstantRetry"})
-    await session.commit()
+    await publish(session_async, "routing_key", {"name": "InstantRetry"})
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [handler]
     await worker._set_up_queues()
@@ -200,9 +200,9 @@ async def test_instant_retry(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_no_retry_with_setup(
-    publish: PublishType, worker: Worker, message_relay: MessageRelay, session: AsyncSession
+    publish: PublishType, worker: Worker, message_relay: MessageRelay, session_async: AsyncSession
 ) -> None:
     # arrange
     prev_retry_delays = worker.retry_delays
@@ -218,8 +218,8 @@ async def test_no_retry_with_setup(
             raise ValueError("Simulated failure")
         retrieved_argument = person
 
-    await publish(session, "routing_key", {"name": "MyName"})
-    await session.commit()
+    await publish(session_async, "routing_key", {"name": "MyName"})
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [handler]
     await worker._set_up_queues()
@@ -237,9 +237,9 @@ async def test_no_retry_with_setup(
     worker.retry_delays = prev_retry_delays
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_no_retry_with_consume(
-    publish: PublishType, worker: Worker, message_relay: MessageRelay, session: AsyncSession
+    publish: PublishType, worker: Worker, message_relay: MessageRelay, session_async: AsyncSession
 ) -> None:
     # arrange
     callcount = 0
@@ -253,8 +253,8 @@ async def test_no_retry_with_consume(
             raise ValueError("Simulated failure")
         retrieved_argument = person
 
-    await publish(session, "routing_key", {"name": "MyName"})
-    await session.commit()
+    await publish(session_async, "routing_key", {"name": "MyName"})
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [handler]
     await worker._set_up_queues()
@@ -271,10 +271,10 @@ async def test_no_retry_with_consume(
     assert retrieved_argument is None
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_no_retry_with_empty_delays_setup(
     publish: PublishType,
-    session: AsyncSession,
+    session_async: AsyncSession,
     worker: Worker,
     message_relay: MessageRelay,
     rmq_connection: AbstractConnection,
@@ -290,8 +290,8 @@ async def test_no_retry_with_empty_delays_setup(
         callcount += 1
         raise Exception("Simulated failure")
 
-    await publish(session, "routing_key", {"name": "MyName"})
-    await session.commit()
+    await publish(session_async, "routing_key", {"name": "MyName"})
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [handler]
     await worker._set_up_queues()
@@ -311,12 +311,12 @@ async def test_no_retry_with_empty_delays_setup(
     worker.retry_delays = prev_retry_delays
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_no_retry_with_empty_delays_consume(
     publish: PublishType,
     worker: Worker,
     message_relay: MessageRelay,
-    session: AsyncSession,
+    session_async: AsyncSession,
     rmq_connection: AbstractConnection,
 ) -> None:
     # arrange - empty retry_delays on consumer means no retries, go to DLQ
@@ -332,8 +332,8 @@ async def test_no_retry_with_empty_delays_consume(
         callcount += 1
         raise Exception("Simulated failure")
 
-    await publish(session, "routing_key", {"name": "MyName"})
-    await session.commit()
+    await publish(session_async, "routing_key", {"name": "MyName"})
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [handler]
     await worker._set_up_queues()
@@ -354,9 +354,9 @@ async def test_no_retry_with_empty_delays_consume(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_publish_and_consume_binary(
-    publish: PublishType, worker: Worker, message_relay: MessageRelay, session: AsyncSession
+    publish: PublishType, worker: Worker, message_relay: MessageRelay, session_async: AsyncSession
 ) -> None:
     # arrange
     callcount = 0
@@ -368,8 +368,8 @@ async def test_publish_and_consume_binary(
         callcount += 1
         retrieved_argument = person
 
-    await publish(session, "routing_key", "hεllo".encode())
-    await session.commit()
+    await publish(session_async, "routing_key", "hεllo".encode())
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [handler]
     await worker._set_up_queues()
@@ -381,16 +381,17 @@ async def test_publish_and_consume_binary(
     # assert
     assert callcount == 1
     assert retrieved_argument == "hεllo".encode()
-    assert retrieved_argument is not None and len(retrieved_argument) == 6
+    assert retrieved_argument is not None
+    assert len(retrieved_argument) == 6
 
     # reset
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_dead_letter(
     publish: PublishType,
-    session: AsyncSession,
+    session_async: AsyncSession,
     worker: Worker,
     message_relay: MessageRelay,
     rmq_connection: AbstractConnection,
@@ -400,8 +401,8 @@ async def test_dead_letter(
     async def handler(_: object) -> None:
         raise Reject("test")
 
-    await publish(session, "routing_key", {})
-    await session.commit()
+    await publish(session_async, "routing_key", {})
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [handler]
     await worker._set_up_queues()
@@ -417,10 +418,10 @@ async def test_dead_letter(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_dead_letter_with_expiration(
     publish: PublishType,
-    session: AsyncSession,
+    session_async: AsyncSession,
     worker: Worker,
     message_relay: MessageRelay,
     rmq_connection: AbstractConnection,
@@ -430,8 +431,8 @@ async def test_dead_letter_with_expiration(
     async def handler(_: object) -> None:
         raise Exception("test")
 
-    await publish(session, "routing_key", {}, expiration=0.02)
-    await session.commit()
+    await publish(session_async, "routing_key", {}, expiration=0.02)
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [handler]
     await worker._set_up_queues()
@@ -449,9 +450,9 @@ async def test_dead_letter_with_expiration(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_graceful_shutdown(
-    publish: PublishType, session: AsyncSession, worker: Worker, message_relay: MessageRelay
+    publish: PublishType, session_async: AsyncSession, worker: Worker, message_relay: MessageRelay
 ) -> None:
     # arrange
     before, after = 0, 0
@@ -463,8 +464,8 @@ async def test_graceful_shutdown(
         await asyncio.sleep(0.3)
         after += 1
 
-    await publish(session, "routing_key", {})
-    await session.commit()
+    await publish(session_async, "routing_key", {})
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [handler]
     await worker._set_up_queues()
@@ -487,9 +488,9 @@ async def test_graceful_shutdown(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_messages_not_lost_during_graceful_shutdown(
-    publish: PublishType, session: AsyncSession, worker: Worker, message_relay: MessageRelay
+    publish: PublishType, session_async: AsyncSession, worker: Worker, message_relay: MessageRelay
 ) -> None:
     # arrange
     before, after = 0, 0
@@ -503,8 +504,8 @@ async def test_messages_not_lost_during_graceful_shutdown(
         await asyncio.sleep(0.3)
         after += 1
 
-    await publish(session, "routing_key", {})
-    await session.commit()
+    await publish(session_async, "routing_key", {})
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [handler]
     await worker._set_up_queues()
@@ -520,8 +521,8 @@ async def test_messages_not_lost_during_graceful_shutdown(
 
     # Send another message while the worker is in shutdown mode
     await asyncio.sleep(0.1)
-    await publish(session, "routing_key", {})
-    await session.commit()
+    await publish(session_async, "routing_key", {})
+    await session_async.commit()
     await message_relay._consume_outbox_table()
 
     await asyncio.wait((worker_task,))
@@ -543,11 +544,11 @@ async def test_messages_not_lost_during_graceful_shutdown(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_tracking_ids(
     monkeypatch: pytest.MonkeyPatch,
     publish: PublishType,
-    session: AsyncSession,
+    session_async: AsyncSession,
     message_relay: MessageRelay,
     worker: Worker,
 ) -> None:
@@ -559,15 +560,15 @@ async def test_tracking_ids(
 
     with tracking():
         logs.append(get_tracking_ids())
-        await publish(session, "r1", {})
-        await session.commit()
+        await publish(session_async, "r1", {})
+        await session_async.commit()
 
     @consume(binding_key="r1", queue="test_tracking_ids_queue_1")
     async def handler1(_: object) -> None:
         logs.append(get_tracking_ids())
-        await publish(session, "r2", {})
-        await publish(session, "r2", {})
-        await session.commit()
+        await publish(session_async, "r2", {})
+        await publish(session_async, "r2", {})
+        await session_async.commit()
         await message_relay._consume_outbox_table()
 
     @consume(binding_key="r2", queue="test_tracking_ids_queue_2")
@@ -589,11 +590,11 @@ async def test_tracking_ids(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_tracking_ids_with_parameter(
     monkeypatch: pytest.MonkeyPatch,
     publish: PublishType,
-    session: AsyncSession,
+    session_async: AsyncSession,
     message_relay: MessageRelay,
     worker: Worker,
 ) -> None:
@@ -605,15 +606,15 @@ async def test_tracking_ids_with_parameter(
 
     with tracking():
         logs.append(get_tracking_ids())
-        await publish(session, "r1", {})
-        await session.commit()
+        await publish(session_async, "r1", {})
+        await session_async.commit()
 
     @consume(binding_key="r1", queue="test_tracking_ids_with_parameter_queue1")
     async def handler1(_: object, tracking_ids: Sequence[str]) -> None:
         logs.append(tracking_ids)
-        await publish(session, "r2", {})
-        await publish(session, "r2", {})
-        await session.commit()
+        await publish(session_async, "r2", {})
+        await publish(session_async, "r2", {})
+        await session_async.commit()
         await message_relay._consume_outbox_table()
 
     @consume(binding_key="r2", queue="test_tracking_ids_with_parameter_queue2")
@@ -635,10 +636,10 @@ async def test_tracking_ids_with_parameter(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_publish_retry_delays(
     publish: PublishType,
-    session: AsyncSession,
+    session_async: AsyncSession,
     worker: Worker,
     message_relay: MessageRelay,
     rmq_connection: AbstractConnection,
@@ -646,8 +647,8 @@ async def test_publish_retry_delays(
     # arrange - test that default retry_delays from Outbox are used
     prev_retry_delays = worker.retry_delays
     worker.retry_delays = ("100ms", "100ms")
-    await publish(session, "r1", {})
-    await session.commit()
+    await publish(session_async, "r1", {})
+    await session_async.commit()
 
     callcount = 0
 
@@ -674,17 +675,17 @@ async def test_publish_retry_delays(
     worker.retry_delays = prev_retry_delays
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_consume_retry_delays(
     publish: PublishType,
-    session: AsyncSession,
+    session_async: AsyncSession,
     worker: Worker,
     message_relay: MessageRelay,
     rmq_connection: AbstractConnection,
 ) -> None:
     # arrange
-    await publish(session, "r1", {})
-    await session.commit()
+    await publish(session_async, "r1", {})
+    await session_async.commit()
 
     callcount = 0
 
@@ -713,10 +714,10 @@ async def test_consume_retry_delays(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_setup_retry_delays(
     publish: PublishType,
-    session: AsyncSession,
+    session_async: AsyncSession,
     worker: Worker,
     message_relay: MessageRelay,
     rmq_connection: AbstractConnection,
@@ -725,8 +726,8 @@ async def test_setup_retry_delays(
     prev_retry_delays = worker.retry_delays
     worker.retry_delays = ("100ms", "100ms")
 
-    await publish(session, "r1", {})
-    await session.commit()
+    await publish(session_async, "r1", {})
+    await session_async.commit()
 
     callcount = 0
 
@@ -753,9 +754,9 @@ async def test_setup_retry_delays(
     worker.retry_delays = prev_retry_delays
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_wildcard_routing_key_preserved_through_retries(
-    publish: PublishType, session: AsyncSession, worker: Worker, message_relay: MessageRelay
+    publish: PublishType, session_async: AsyncSession, worker: Worker, message_relay: MessageRelay
 ) -> None:
     # arrange - test that wildcard routing keys are preserved through delay exchange retries
     callcount = 0
@@ -771,8 +772,8 @@ async def test_wildcard_routing_key_preserved_through_retries(
         if callcount < 3:
             raise ValueError("Simulated failure")
 
-    await publish(session, "order.created", {"name": "MyName"})
-    await session.commit()
+    await publish(session_async, "order.created", {"name": "MyName"})
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [handler]
     await worker._set_up_queues()
@@ -789,9 +790,9 @@ async def test_wildcard_routing_key_preserved_through_retries(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_retry_routes_to_single_queue_only(
-    publish: PublishType, session: AsyncSession, worker: Worker, message_relay: MessageRelay
+    publish: PublishType, session_async: AsyncSession, worker: Worker, message_relay: MessageRelay
 ) -> None:
     "Test that retries only go to the failing queue, not all queues matching the routing pattern."
     # arrange - two queues with overlapping wildcard patterns
@@ -811,8 +812,8 @@ async def test_retry_routes_to_single_queue_only(
         queue2_callcount += 1
         # This handler always succeeds
 
-    await publish(session, "user.created", {"name": "TestUser"})
-    await session.commit()
+    await publish(session_async, "user.created", {"name": "TestUser"})
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [handler1, handler2]
     await worker._set_up_queues()
@@ -831,9 +832,9 @@ async def test_retry_routes_to_single_queue_only(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_sync_callback(
-    publish: PublishType, session: AsyncSession, worker: Worker, message_relay: MessageRelay
+    publish: PublishType, session_async: AsyncSession, worker: Worker, message_relay: MessageRelay
 ) -> None:
     """Test that sync (non-async) callbacks are supported via auto-wrapping."""
     # arrange
@@ -846,8 +847,8 @@ async def test_sync_callback(
         callcount += 1
         retrieved_data = data
 
-    await publish(session, "sync.test", {"message": "hello"})
-    await session.commit()
+    await publish(session_async, "sync.test", {"message": "hello"})
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [sync_handler]
     await worker._set_up_queues()
@@ -864,9 +865,9 @@ async def test_sync_callback(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_sync_callback_with_pydantic(
-    publish: PublishType, session: AsyncSession, worker: Worker, message_relay: MessageRelay
+    publish: PublishType, session_async: AsyncSession, worker: Worker, message_relay: MessageRelay
 ) -> None:
     """Test that sync callbacks work with Pydantic models."""
     # arrange
@@ -879,8 +880,8 @@ async def test_sync_callback_with_pydantic(
         callcount += 1
         retrieved_person = person
 
-    await publish(session, "person.created", Person(name="John"))
-    await session.commit()
+    await publish(session_async, "person.created", Person(name="John"))
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [sync_handler]
     await worker._set_up_queues()
@@ -897,9 +898,9 @@ async def test_sync_callback_with_pydantic(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_sync_callback_with_special_params(
-    publish: PublishType, session: AsyncSession, worker: Worker, message_relay: MessageRelay
+    publish: PublishType, session_async: AsyncSession, worker: Worker, message_relay: MessageRelay
 ) -> None:
     """Test that sync callbacks receive special parameters correctly."""
     # arrange
@@ -912,8 +913,8 @@ async def test_sync_callback_with_special_params(
         retrieved_routing_key = routing_key
         retrieved_tracking_ids = tracking_ids
 
-    await publish(session, "special.test", {"value": 42})
-    await session.commit()
+    await publish(session_async, "special.test", {"value": 42})
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [sync_handler]
     await worker._set_up_queues()
@@ -931,10 +932,10 @@ async def test_sync_callback_with_special_params(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_sync_callback_exception_retry(
     publish: PublishType,
-    session: AsyncSession,
+    session_async: AsyncSession,
     worker: Worker,
     message_relay: MessageRelay,
 ) -> None:
@@ -949,8 +950,8 @@ async def test_sync_callback_exception_retry(
         if callcount < 2:
             raise Exception("Temporary error")
 
-    await publish(session, "retry.test", {})
-    await session.commit()
+    await publish(session_async, "retry.test", {})
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [sync_handler]
     await worker._set_up_queues()
@@ -966,10 +967,10 @@ async def test_sync_callback_exception_retry(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_sync_callback_reject(
     publish: PublishType,
-    session: AsyncSession,
+    session_async: AsyncSession,
     worker: Worker,
     message_relay: MessageRelay,
     rmq_connection: AbstractConnection,
@@ -984,8 +985,8 @@ async def test_sync_callback_reject(
         callcount += 1
         raise Reject()
 
-    await publish(session, "reject.test", {})
-    await session.commit()
+    await publish(session_async, "reject.test", {})
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [sync_handler]
     await worker._set_up_queues()
@@ -1002,9 +1003,9 @@ async def test_sync_callback_reject(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_mixed_sync_async_consumers(
-    publish: PublishType, session: AsyncSession, worker: Worker, message_relay: MessageRelay
+    publish: PublishType, session_async: AsyncSession, worker: Worker, message_relay: MessageRelay
 ) -> None:
     """Test that sync and async consumers can coexist in the same worker."""
     # arrange
@@ -1021,9 +1022,9 @@ async def test_mixed_sync_async_consumers(
         nonlocal async_callcount
         async_callcount += 1
 
-    await publish(session, "mixed.sync", {})
-    await publish(session, "mixed.async", {})
-    await session.commit()
+    await publish(session_async, "mixed.sync", {})
+    await publish(session_async, "mixed.async", {})
+    await session_async.commit()
     prev_consumers = worker.consumers
     worker.consumers = [sync_handler, async_handler]
     await worker._set_up_queues()
@@ -1040,7 +1041,7 @@ async def test_mixed_sync_async_consumers(
     worker.consumers = prev_consumers
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_consumer_direct_instantiation_with_sync() -> None:
     """Test that Consumer class works with sync callbacks when instantiated directly."""
 

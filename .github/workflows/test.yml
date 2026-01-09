@@ -9,9 +9,6 @@ on:
 jobs:
   lint:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
 
     steps:
       - name: Checkout code
@@ -27,15 +24,13 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.13"
 
       - name: uv sync
         run: uv sync --all-groups
 
       - name: Run linters
         run: make lint
-        env:
-          MYPY_PYTHON_VERSION: ${{ matrix.python-version }}
 
   test:
     runs-on: ubuntu-latest

@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from outbox import MessageRelay, Publisher, Worker, consume
+from outbox.utils import ensure_outbox_table_async
 
 logging.basicConfig(level=logging.DEBUG)
 logging.getLogger("outbox").setLevel(logging.DEBUG)
@@ -15,14 +16,19 @@ logging.getLogger("aiormq").setLevel(logging.INFO)
 
 start_http_server(8000)
 
-db_engine = create_async_engine("postgresql+asyncpg://postgres:postgres@localhost/postgres")
+db_url = "postgresql://postgres:postgres@localhost/postgres"
 
-publisher = Publisher(db_engine=db_engine, auto_create_table=True)
+# Create tables
+asyncio.run(ensure_outbox_table_async(db_url))
+
+# Create SQLAlchemy engine for backward compatible publishing
+db_engine = create_async_engine(f"postgresql+asyncpg://{db_url.split('://', 1)[1]}")
+
+publisher = Publisher()
 
 message_relay = MessageRelay(
-    db_engine=db_engine,
+    db_engine_url=db_url,
     rmq_connection_url="amqp://guest:guest@localhost:5672/",
-    auto_create_table=True,
 )
 
 

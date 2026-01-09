@@ -1,10 +1,17 @@
-import asyncio
-from collections.abc import Sequence
-from typing import Any, Awaitable, Optional, Protocol
+from __future__ import annotations
 
+import asyncio
+import contextlib
+from collections.abc import Awaitable, Sequence
+from typing import Any, Protocol, overload
+
+import asyncpg
 from aio_pika.abc import AbstractConnection, DateType
+from psycopg2.extensions import connection as Psycopg2Connection
+from psycopg2.extensions import cursor as Psycopg2Cursor
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from outbox import Consumer, Worker
 
@@ -14,24 +21,44 @@ class Person(BaseModel):
 
 
 class PublishType(Protocol):
+    @overload
     def __call__(
         self,
-        session: AsyncSession,
+        handle: Session | Psycopg2Connection | Psycopg2Cursor,
         routing_key: str,
         body: Any,
         *,
-        expiration: Optional[DateType] = None,
-        eta: Optional[DateType] = None,
+        expiration: DateType | None = None,
+        eta: DateType | None = None,
+    ) -> None: ...
+
+    @overload
+    def __call__(
+        self,
+        handle: AsyncSession | asyncpg.Connection,
+        routing_key: str,
+        body: Any,
+        *,
+        expiration: DateType | None = None,
+        eta: DateType | None = None,
     ) -> Awaitable[None]: ...
+
+    def __call__(
+        self,
+        handle: AsyncSession | asyncpg.Connection | Session | Psycopg2Connection | Psycopg2Cursor,
+        routing_key: str,
+        body: Any,
+        *,
+        expiration: DateType | None = None,
+        eta: DateType | None = None,
+    ) -> Awaitable[None] | None: ...
 
 
 async def run_worker(worker: Worker, consumers: Sequence[Consumer], timeout: float) -> None:
     prev_consumers = worker.consumers
     worker.consumers = consumers
-    try:
+    with contextlib.suppress(asyncio.TimeoutError):
         await asyncio.wait_for(worker.run(), timeout=timeout)
-    except asyncio.TimeoutError:
-        pass
     worker.consumers = prev_consumers
 
 

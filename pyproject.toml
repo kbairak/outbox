@@ -6,13 +6,12 @@ readme = "README.md"
 authors = [{ name = "Konstantinos Bairaktaris", email = "ikijob@gmail.com" }]
 requires-python = ">=3.9.2"
 dependencies = [
-    "aio-pika>=9.4.3,<9.5; python_version < '3.10'",
-    "aio-pika>=9.5.0,<10; python_version >= '3.10'",
-    "pydantic>=2.0.3,<3",
-    "sqlalchemy[asyncio]>=2.0.0,<3",
-    "prometheus-client>=0.8.0,<1.0.0",
-    "asyncpg>=0.30.0",
-    "asyncpg-stubs>=0.30.0",
+  "aio-pika>=9.4.3,<9.5; python_version < '3.10'",
+  "aio-pika>=9.5.0,<10; python_version >= '3.10'",
+  "pydantic>=2.0.3,<3",
+  "prometheus-client>=0.8.0,<1.0.0",
+  "asyncpg>=0.30.0",
+  "asyncpg-stubs>=0.30.0",
 ]
 
 [build-system]
@@ -21,16 +20,18 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
-    "mypy>=1.18.2",
-    "ptipython>=1.0.1",
-    "pudb>=2025.1",
-    "pynvim>=0.5.2",
-    "pytest>=8.4.0",
-    "pytest-asyncio>=1.0.0",
-    "pytest-cov>=6.1.1",
-    "ruff>=0.11.12",
-    "testcontainers[postgres,rabbitmq]>=4.13.3",
-    "ty>=0.0.1a26",
+  "mypy>=1.18.2",
+  "ptipython>=1.0.1",
+  "pudb>=2025.1",
+  "pynvim>=0.5.2",
+  "pytest>=8.4.0",
+  "pytest-asyncio>=1.0.0",
+  "pytest-cov>=6.1.1",
+  "ruff>=0.11.12",
+  "sqlalchemy[asyncio]>=2.0.0,<3",
+  "testcontainers[postgres,rabbitmq]>=4.13.3",
+  "ty>=0.0.1a26",
+  "types-psycopg2>=2.9.21.20251012",
 ]
 noasync = ["psycopg2-binary>=2.9.11"]
 
@@ -38,7 +39,17 @@ noasync = ["psycopg2-binary>=2.9.11"]
 line-length = 99
 
 [tool.ruff.lint]
-select = ["I"]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "SIM",    # flake8-simplify
+    "I",      # isort
+    "ASYNC",  # flake8-async
+    "PT",     # flake8-pytest-style
+]
 
 [tool.mypy]
 python_version = "3.13"
@@ -47,3 +58,7 @@ exclude = ["src/benchmarks/celery_benchmark.py"]
 
 [tool.ty.src]
 exclude = ["src/benchmarks/celery_benchmark.py"]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"

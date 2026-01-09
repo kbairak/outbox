@@ -1,6 +1,6 @@
-# Outbox pattern for Python, SQLAlchemy, RabbitMQ and Pydantic
+# Outbox pattern for Python, PostgreSQL, and RabbitMQ
 
-Implementation of the [outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html) for async Python applications with PostgreSQL (SQLAlchemy) and RabbitMQ.
+Implementation of the [outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html) for async Python applications with PostgreSQL and RabbitMQ.
 
 ```mermaid
 flowchart LR
@@ -33,7 +33,7 @@ from outbox import Publisher
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 
 db_engine = create_async_engine("postgresql+asyncpg://user:password@localhost/dbname")
-publisher = Publisher(db_engine=db_engine)
+publisher = Publisher()
 
 async def main():
     async with AsyncSession(db_engine) as session, session.begin():
@@ -60,10 +60,6 @@ asyncio.run(message_relay.run())
 
 ### Worker process
 
-You can define handlers using either decorators or by creating `Consumer` instances directly.
-
-**Option 1: Using the `@consume` decorator:**
-
 ```python
 import asyncio
 
@@ -82,7 +78,8 @@ worker = Worker(
 asyncio.run(worker.run())
 ```
 
-**Option 2: Using `Consumer` directly:**
+<details>
+    <summary><h4>Option 2: Using `Consumer` directly</h4></summary>
 
 ```python
 import asyncio
@@ -112,6 +109,8 @@ Both approaches are equivalent. The decorator is more concise, while the explici
 Consumer(binding_key="...", queue="...", callback=..., ...)
 consume(binding_key="...", queue="...", ...)(callback)
 ```
+
+</details>
 
 ## Why
 
@@ -144,9 +143,38 @@ Celery has very flexible retry mechanisms: You can trigger retries explicitly, y
 
 The trade-off of using this library instead of Celery is that we lose the jitter feature and that we end up with many delay exchanges/queues that will need to be managed. What we get in return is the certainty that messages will never be lost and the fact that we can take advantage of all of RabbitMQ's routing mechanisms.
 
-### Why SQLAlchemy (Postgres), aio-pika (RabbitMQ) and Pydantic
+### Why PostgreSQL, aio-pika (RabbitMQ) and Pydantic
 
-Both SQLAlchemy and Pydantic are popular and integrated into many existing frameworks and aio-pika is the go-to library for working with RabbitMQ in async Python applications. This makes this library compatible with many existing applications and frameworks. With SQLAlchemy we could target a lot of different databases, but we focused on Postgres because it is both proven, reliable and popular and because it features a LISTEN/NOTIFY system that makes the message relay more efficient by avoiding polling when there are no messages to send.
+**PostgreSQL** is proven, reliable, and popular. It features a LISTEN/NOTIFY system that makes the message relay more efficient by avoiding polling when there are no messages to send. This is why we focused on PostgreSQL rather than supporting multiple databases.
+
+**aio-pika** is the go-to library for working with RabbitMQ in async Python applications. It provides robust connection handling, automatic reconnection, and full support for RabbitMQ's features.
+
+**Pydantic** is popular and integrated into many existing frameworks (FastAPI, etc.), making automatic message serialization/deserialization seamless.
+
+<details>
+    <summary><h4>SQLAlchemy Support</h4></summary>
+
+This library works with **asyncpg** and **psycopg2** connections directly and does not require SQLAlchemy. However, **most applications use SQLAlchemy**, and this library fully supports it.
+
+**Why SQLAlchemy is optional:**
+
+- Keeps the library lightweight with minimal dependencies
+- Supports projects that don't use SQLAlchemy
+- Allows faster import times
+
+**How to use with SQLAlchemy:**
+
+- Install SQLAlchemy separately: `pip install sqlalchemy[asyncio]` or `uv add sqlalchemy[asyncio]`
+- Pass SQLAlchemy sessions to `publisher.publish()` - the library automatically detects and handles them
+- Full support for both `AsyncSession` (async) and `Session` (sync)
+
+**How to use without SQLAlchemy:**
+
+- Pass `asyncpg.Connection`, `psycopg2` connection, or `psycopg2` cursor to `publisher.publish()`
+- The library works identically with raw connections
+
+The examples use SQLAlchemy since it's the most common use case, but you can substitute raw connections anywhere you see a session.
+</details>
 
 ## Features
 
@@ -333,36 +361,37 @@ Class for publishing messages to the outbox table.
 
 **Constructor parameters:**
 
-- `db_engine_url`: A string that indicates database dialect and connection arguments. Will be passed to SQLAlchemy. For async: `postgresql+asyncpg://<username>:<password>@<host>:<port>/<db_name>`. For sync: `postgresql+psycopg2://<username>:<password>@<host>:<port>/<db_name>`. Example: `postgresql+asyncpg://postgres:postgres@localhost:5432/postgres`
-- `db_engine`: If you already have a SQLAlchemy engine, you can pass it here instead of `db_engine_url` (you must pass either one or the other). Accepts both `AsyncEngine` (async) and `Engine` (sync)
 - `expiration`: Default expiration time for messages in RabbitMQ. Defaults to `None` (no expiration)
 - `table_name`: Name of the outbox table to use. Defaults to `outbox_table`
-- `auto_create_table`: If `True`, the outbox table will be automatically created if it does not exist. Defaults to `False`
 
 **Methods:**
 
-- `publish(session, routing_key, body, *, expiration=None, eta=None)`: Publish a single message to the outbox table. Automatically detects sync vs async based on session type
-  - `session`: A SQLAlchemy session (`Session` for sync, `AsyncSession` for async)
+- `publish(handle, routing_key, body, *, expiration=None, eta=None)`: Publish a single message to the outbox table. Automatically detects sync vs async based on handle type
+  - `handle`: Database connection/session. Accepts:
+    - **Async**: `AsyncSession` (SQLAlchemy, if installed) or `asyncpg.Connection`
+    - **Sync**: `Session` (SQLAlchemy, if installed), `psycopg2.Connection`, or `psycopg2.Cursor`
   - `routing_key`: The routing key to use for the message
   - `body`: The body of the message. If it is an instance of a Pydantic model, it will be serialized by Pydantic, if it is bytes, it will be used as is, otherwise outbox will attempt to serialize it with `json.dumps`
   - `expiration`: The expiration time in seconds for the message. Overrides the default set in the constructor
   - `eta`: The time at which the message should be sent. Can be a `datetime`, a `timedelta` or an interval in milliseconds
 
-- `publish_async(session, routing_key, body, *, expiration=None, eta=None)`: Async version of `publish()` (explicit)
-- `publish_sync(session, routing_key, body, *, expiration=None, eta=None)`: Sync version of `publish()` (explicit)
+- `publish_async(handle, routing_key, body, *, expiration=None, eta=None)`: Async version of `publish()` (explicit)
+- `publish_sync(handle, routing_key, body, *, expiration=None, eta=None)`: Sync version of `publish()` (explicit)
 
-- `bulk_publish(session, messages)`: Publish multiple messages in a single database operation. Automatically detects sync vs async based on session type
-  - `session`: A SQLAlchemy session (`Session` for sync, `AsyncSession` for async)
+- `bulk_publish(handle, messages)`: Publish multiple messages in a single database operation. Automatically detects sync vs async based on handle type
+  - `handle`: Database connection/session (same types as `publish()`)
   - `messages`: A sequence of `OutboxMessage` instances
 
-- `bulk_publish_async(session, messages)`: Async version of `bulk_publish()` (explicit)
-- `bulk_publish_sync(session, messages)`: Sync version of `bulk_publish()` (explicit)
+- `bulk_publish_async(handle, messages)`: Async version of `bulk_publish()` (explicit)
+- `bulk_publish_sync(handle, messages)`: Sync version of `bulk_publish()` (explicit)
 
 - `OutboxMessage`: A dataclass representing a message to be published. Used in `bulk_publish()`
   - `routing_key`: The routing key to use for the message
   - `body`: The body of the message. If it is an instance of a Pydantic model, it will be serialized by Pydantic, if it is bytes, it will be used as is, otherwise outbox will attempt to serialize it with `json.dumps`
   - `expiration`: The expiration time in seconds for the message. Overrides the default set in the constructor
   - `eta`: The time at which the message should be sent. Can be a `datetime`, a `timedelta` or an interval in milliseconds
+
+**Note:** SQLAlchemy sessions (`AsyncSession` and `Session`) are fully supported if you have SQLAlchemy installed. The library automatically detects the connection type and extracts the underlying database connection.
 
 </details>
 
@@ -374,7 +403,7 @@ For performance-critical scenarios where you need to publish many messages at on
 ```python
 from outbox import Publisher, OutboxMessage
 
-publisher = Publisher(db_engine=db_engine)
+publisher = Publisher()
 
 async with AsyncSession(db_engine) as session, session.begin():
     messages = [
@@ -401,14 +430,14 @@ from sqlalchemy.orm import Session
 
 # Sync setup (for legacy codebases)
 db_engine = create_engine("postgresql+psycopg2://user:password@localhost/dbname")
-publisher = Publisher(db_engine=db_engine)
+publisher = Publisher()
 
 with Session(db_engine) as session, session.begin():
     session.add(User(id=123, username="johndoe"))
     publisher.publish(session, "user.created", {"id": 123, "username": "johndoe"})
 ```
 
-The `publish()` and `bulk_publish()` methods automatically detect whether you're using a sync `Session` or async `AsyncSession`. You can also use the explicit `publish_sync()`/`publish_async()` and `bulk_publish_sync()`/`bulk_publish_async()` methods.
+The `publish()` and `bulk_publish()` methods automatically detect whether you're using an async handle (`AsyncSession` or `asyncpg.Connection`) or a sync handle (`Session`, `psycopg2.Connection`, or `psycopg2.Cursor`). You can also use the explicit `publish_sync()`/`publish_async()` and `bulk_publish_sync()`/`bulk_publish_async()` methods.
 
 **Installation:** To use sync publishing, install the `noasync` dependency group to add psycopg2:
 
@@ -417,6 +446,67 @@ uv pip install --group noasync
 ```
 
 Note: `MessageRelay` and `Worker` remain async-only, as they are standalone processes designed for asynchronous operation.
+
+</details>
+
+<details>
+    <summary><h4>Using asyncpg or psycopg2 connections directly</h4></summary>
+
+If you're not using SQLAlchemy, you can pass raw database connections directly to the publisher:
+
+**Async with asyncpg.Connection:**
+
+```python
+import asyncpg
+from outbox import Publisher
+
+publisher = Publisher()
+
+# Using a single connection
+conn = await asyncpg.connect("postgresql://user:password@localhost/dbname")
+try:
+    # Publish within a transaction
+    async with conn.transaction():
+        await conn.execute("INSERT INTO users (id, username) VALUES ($1, $2)", 123, "johndoe")
+        await publisher.publish(conn, "user.created", {"id": 123, "username": "johndoe"})
+finally:
+    await conn.close()
+
+# Or using a connection pool
+pool = await asyncpg.create_pool("postgresql://user:password@localhost/dbname")
+async with pool.acquire() as conn:
+    async with conn.transaction():
+        await conn.execute("INSERT INTO users (id, username) VALUES ($1, $2)", 456, "janedoe")
+        await publisher.publish(conn, "user.created", {"id": 456, "username": "janedoe"})
+```
+
+**Sync with psycopg2 connection:**
+
+```python
+import psycopg2
+from outbox import Publisher
+
+publisher = Publisher()
+
+# Using psycopg2 connection
+with psycopg2.connect("postgresql://user:password@localhost/dbname") as conn:
+    with conn.cursor() as cursor:
+        cursor.execute("INSERT INTO users (id, username) VALUES (%s, %s)", (123, "johndoe"))
+    publisher.publish_sync(conn, "user.created", {"id": 123, "username": "johndoe"})
+    conn.commit()
+```
+
+**Sync with psycopg2 cursor:**
+
+```python
+with psycopg2.connect("postgresql://user:password@localhost/dbname") as conn:
+    with conn.cursor() as cursor:
+        cursor.execute("INSERT INTO users (id, username) VALUES (%s, %s)", (123, "johndoe"))
+        publisher.publish_sync(cursor, "user.created", {"id": 123, "username": "johndoe"})
+    conn.commit()
+```
+
+The publisher works identically with raw connections and SQLAlchemy sessions - choose whichever fits your application architecture.
 
 </details>
 
@@ -449,17 +539,16 @@ Class for relaying messages from the outbox table to RabbitMQ.
 
 **Constructor parameters:**
 
-- `db_engine_url`: Database connection string (same as Publisher)
-- `db_engine`: SQLAlchemy engine (same as Publisher)
+- `db_engine_url`: PostgreSQL connection string in the format `postgresql://username:password@host:port/database`. Example: `postgresql://postgres:postgres@localhost:5432/mydb`
+- `db_pool`: A `asyncpg.ConnectionPool` instance. Can be used in place of `db_engine_url` in case you already have one create or you want to fine-tune its parameters. Create with `await asyncpg.create_pool(self.db_engine_url, min_size=1, max_size=10)`
 - `rmq_connection_url`: A string that indicates RabbitMQ connection parameters. Follows the pattern `amqp[s]://<username>:<password>@<host>:(<port>)/(virtualhost)`. Example: `amqp://guest:guest@localhost:5672/`
 - `rmq_connection`: If you already have a aio-pika connection, you can pass it here instead of `rmq_connection_url` (you must pass either one or the other)
 - `exchange_name`: Name of the RabbitMQ exchange to use. Defaults to `outbox`
 - `notification_timeout`: Maximum time (in seconds) to wait for a PostgreSQL NOTIFY before checking for scheduled messages. Acts as a safety timeout. Defaults to `60` seconds
-- `expiration`: Default expiration time for messages (same as Publisher)
+- `expiration`: Default expiration time for messages. Defaults to `None` (no expiration)
 - `clean_up_after`: How long to keep messages in the outbox table after they are sent. Can be `IMMEDIATELY`, `NEVER`, or a `timedelta`. Defaults to `IMMEDIATELY`
-- `table_name`: Name of the outbox table (same as Publisher)
+- `table_name`: Name of the outbox table to use. Defaults to `outbox_table`
 - `batch_size`: Number of messages to fetch and publish concurrently in each batch from the outbox table. Defaults to `50`. Higher values improve throughput but increase transaction duration and memory usage. Set to `1` for sequential processing.
-- `auto_create_table`: Auto-create table if missing (same as Publisher)
 - `enable_metrics`: Enable Prometheus metrics. Defaults to `True`
 
 **Methods:**
@@ -731,6 +820,45 @@ For **CPU-bound work**, see Best Practices / Worker.
 
 </details>
 
+### Utils
+
+<details>
+    <summary><h4>API</h4></summary>
+
+##### `ensure_outbox_table_async(db, table_name="outbox_table")`
+
+Ensure the outbox table exists with proper schema, indexes, and triggers (async version).
+
+**Parameters:**
+- `db`: PostgreSQL connection URL string or `asyncpg.Connection` object
+- `table_name`: Table name. Defaults to `"outbox_table"`
+
+**Returns:** None. Idempotent - safe to call multiple times.
+
+##### `ensure_outbox_table_sync(db, table_name="outbox_table")`
+
+Ensure the outbox table exists with proper schema, indexes, and triggers (sync version).
+
+**Parameters:**
+- `db`: PostgreSQL connection URL string or `psycopg2.Connection` object
+- `table_name`: Table name. Defaults to `"outbox_table"`
+
+**Returns:** None. Idempotent - safe to call multiple times.
+
+##### `get_tracking_ids()`
+
+Get the current tracking IDs from context.
+
+**Returns:** Tuple of UUID strings representing the tracking chain.
+
+##### `tracking()`
+
+Context manager that adds a UUID to the tracking ID chain. Use at entrypoints (API handlers, etc.) to include an identifier for the originating operation.
+
+**Returns:** Context manager.
+
+</details>
+
 ## Best Practices
 
 ### Overall
@@ -772,9 +900,36 @@ For production, `logging.INFO` is recommended so you can track message flow with
 <details>
     <summary><h4>Database setup</h4></summary>
 
-If you pass `auto_create_table=True` to the `Publisher` or `MessageRelay` constructors, then the library will automatically get-or-create the outbox table before it's needed (before publishing and during the message relay). This is fine for development environments or if your policies around the database are not particularly strict. If you want better control of your database, you can leave `auto_create_table=False`, which is the default, and do this:
+The outbox pattern requires a database table to store messages before they're published to RabbitMQ. You can set this up in different ways depending on your environment:
 
-##### Using Alembic
+##### Quick Setup (Development)
+
+For development environments, you can use the provided utility functions to create the outbox table at application startup:
+
+```python
+import asyncio
+from outbox.utils import ensure_outbox_table_async, ensure_outbox_table_sync
+
+# Async version (recommended)
+async def setup():
+    await ensure_outbox_table_async("postgresql://user:password@localhost/dbname")
+
+asyncio.run(setup())
+
+# Or sync version
+from outbox.utils import ensure_outbox_table_sync
+ensure_outbox_table_sync("postgresql://user:password@localhost/dbname")
+```
+
+These functions are **idempotent** (get-or-create) - they're safe to call multiple times and will only create the table if it doesn't already exist. They create:
+
+- The `outbox_table` with all necessary columns
+- Indexes for efficient querying
+- PostgreSQL NOTIFY trigger for instant message delivery
+
+**Note:** This approach is convenient for development but for production environments, you should use a proper migration tool (see below) to have better control over your database schema.
+
+##### Using Alembic (Production)
 
 If you manage database migrations using Alembic, before deploying the code that uses this library, you should create a new empty migration:
 
@@ -1351,13 +1506,15 @@ This pattern gives you complete control over parallelism while keeping the libra
 
 The library uses `aio_pika.connect_robust()` for RabbitMQ connections, which provides automatic reconnection with full state recovery (queues, exchanges, bindings, and consumers). If RabbitMQ restarts or network issues occur, connections automatically recover without manual intervention.
 
-For additional control over connection resilience, you can pass connection objects directly to the class constructors:
+**PostgreSQL - Connection Pooling:**
 
-**PostgreSQL - Configure connection pooling:**
+If you're using SQLAlchemy, configure your engine with connection pooling:
 
 ```python
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from outbox import Publisher
 
+# Configure engine with pooling
 db_engine = create_async_engine(
     "postgresql+asyncpg://user:password@localhost/dbname",
     pool_pre_ping=True,        # Test connections before use (recommended)
@@ -1366,8 +1523,11 @@ db_engine = create_async_engine(
     max_overflow=10,           # Max connections beyond pool_size
 )
 
-publisher = Publisher(db_engine=db_engine)
-message_relay = MessageRelay(db_engine=db_engine, rmq_connection_url="...")
+publisher = Publisher()
+
+# Use engine to create sessions
+async with AsyncSession(db_engine) as session:
+    await publisher.publish(session, ...)
 ```
 
 **Key parameters:**
@@ -1375,6 +1535,28 @@ message_relay = MessageRelay(db_engine=db_engine, rmq_connection_url="...")
 - `pool_pre_ping=True` - Most important! Tests if a connection is alive before use, prevents "connection closed" errors
 - `pool_recycle=3600` - Closes and recreates connections after specified seconds to prevent stale connections
 - `pool_size` and `max_overflow` - Control connection pool sizing for your workload
+
+If you're using asyncpg directly, you can create a connection pool:
+
+```python
+import asyncpg
+from outbox import Publisher
+
+# Create connection pool
+pool = await asyncpg.create_pool(
+    "postgresql://user:password@localhost/dbname",
+    min_size=5,
+    max_size=10,
+)
+
+publisher = Publisher()
+
+# Use connection from pool
+async with pool.acquire() as conn:
+    await publisher.publish(conn, ...)
+```
+
+For `MessageRelay`, the `db_engine_url` parameter is used, and asyncpg handles connection pooling automatically. You can tune pool parameters in the connection URL if needed, or create your own pool for more control. Or you can pass the `db_pool` parameter in place of `db_engine_url` to create and configure the connection pool yourself.
 
 **RabbitMQ - Configure heartbeat and other connection parameters:**
 
@@ -1386,7 +1568,7 @@ rmq_connection = await aio_pika.connect_robust(
     heartbeat=30,              # Send heartbeats every 30 seconds (default: 60)
 )
 
-message_relay = MessageRelay(db_engine=db_engine, rmq_connection=rmq_connection)
+message_relay = MessageRelay(db_engine_url="...", rmq_connection=rmq_connection)
 worker = Worker(rmq_connection=rmq_connection, ...)
 ```
 
@@ -1405,9 +1587,10 @@ See [detailed benchmark results](src/benchmarks/README.md) for throughput scalin
 ### High priority
 
 - [ ] Graceful shutdown for message relay
-- [ ] Drop SQLAlchemy dependency, use asyncpg (and psycopg) connection directly
 
 ### Medium priority
+
+- [ ] Terraform examples to use string delays like "5s", "1m"
 
 ### Low priority
 

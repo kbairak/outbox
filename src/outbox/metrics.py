@@ -15,7 +15,7 @@ Usage:
     ).inc()
 """
 
-from typing import Union
+from __future__ import annotations
 
 import prometheus_client
 
@@ -23,7 +23,7 @@ import prometheus_client
 class NoopCounter:
     """No-op counter that duplicates Counter interface."""
 
-    def labels(self, **labels: str) -> "NoopCounter":
+    def labels(self, **labels: str) -> NoopCounter:
         """Return self for method chaining."""
         return self
 
@@ -35,7 +35,7 @@ class NoopCounter:
 class NoopHistogram:
     """No-op histogram that duplicates Histogram interface."""
 
-    def labels(self, **labels: str) -> "NoopHistogram":
+    def labels(self, **labels: str) -> NoopHistogram:
         """Return self for method chaining."""
         return self
 
@@ -47,7 +47,7 @@ class NoopHistogram:
 class NoopGauge:
     """No-op gauge that duplicates Gauge interface."""
 
-    def labels(self, **labels: str) -> "NoopGauge":
+    def labels(self, **labels: str) -> NoopGauge:
         """Return self for method chaining."""
         return self
 
@@ -134,17 +134,17 @@ active_consumers = prometheus_client.Gauge(
 class Metrics:
     """Global metrics registry."""
 
-    messages_published: Union[NoopCounter, prometheus_client.Counter]
-    publish_failures: Union[NoopCounter, prometheus_client.Counter]
-    message_age: Union[NoopHistogram, prometheus_client.Histogram]
-    poll_duration: Union[NoopHistogram, prometheus_client.Histogram]
-    table_backlog: Union[NoopGauge, prometheus_client.Gauge]
-    messages_received: Union[NoopCounter, prometheus_client.Counter]
-    messages_processed: Union[NoopCounter, prometheus_client.Counter]
-    retry_attempts: Union[NoopCounter, prometheus_client.Counter]
-    message_processing_duration: Union[NoopHistogram, prometheus_client.Histogram]
-    dlq_messages: Union[NoopGauge, prometheus_client.Gauge]
-    active_consumers: Union[NoopGauge, prometheus_client.Gauge]
+    messages_published: NoopCounter | prometheus_client.Counter
+    publish_failures: NoopCounter | prometheus_client.Counter
+    message_age: NoopHistogram | prometheus_client.Histogram
+    poll_duration: NoopHistogram | prometheus_client.Histogram
+    table_backlog: NoopGauge | prometheus_client.Gauge
+    messages_received: NoopCounter | prometheus_client.Counter
+    messages_processed: NoopCounter | prometheus_client.Counter
+    retry_attempts: NoopCounter | prometheus_client.Counter
+    message_processing_duration: NoopHistogram | prometheus_client.Histogram
+    dlq_messages: NoopGauge | prometheus_client.Gauge
+    active_consumers: NoopGauge | prometheus_client.Gauge
 
     def __init__(self) -> None:
         """Initialize metrics in disabled state."""

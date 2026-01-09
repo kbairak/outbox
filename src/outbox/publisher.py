@@ -1,20 +1,30 @@
+from __future__ import annotations
+
 import datetime
 import json
 import uuid
-from collections.abc import Sequence
+from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass
-from typing import Any, Awaitable, Optional, TypedDict, Union, overload
+from typing import TYPE_CHECKING, Any, cast, overload
 
+import asyncpg
 from aio_pika.abc import DateType
 from aio_pika.message import encode_expiration
+from psycopg2.extensions import connection as Psycopg2Connection
+from psycopg2.extensions import cursor as Psycopg2Cursor
 from pydantic import BaseModel
-from sqlalchemy import Engine, insert
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
-from sqlalchemy.orm import Session
 
-from .database import OutboxTable
 from .log import logger
-from .utils import ensure_database_async, ensure_database_sync, get_tracking_ids
+from .utils import get_tracking_ids
+
+# Optional SQLAlchemy support
+try:
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.orm import Session
+except ImportError:
+    if not TYPE_CHECKING:
+        AsyncSession = type(None)  # type: ignore[misc, assignment]
+        Session = type(None)  # type: ignore[misc, assignment]
 
 
 @dataclass
@@ -22,181 +32,228 @@ class OutboxMessage:
     routing_key: str
     body: Any
     expiration: DateType = None
-    eta: Optional[DateType] = None
+    eta: DateType | None = None
 
+    def to_sql_params(
+        self, now: datetime.datetime
+    ) -> tuple[str, bytes, str, datetime.datetime, datetime.datetime, datetime.timedelta | None]:
+        """Convert message to SQL parameters for insert.
 
-class OutboxRowDict(TypedDict):
-    routing_key: str
-    body: bytes
-    tracking_ids: list[str]
-    created_at: datetime.datetime
-    expiration: Optional[datetime.timedelta]
-    send_after: datetime.datetime
+        Returns: (routing_key, body_bytes, tracking_ids_json, created_at, send_after, expiration)
+        """
+        # Serialize body
+        try:
+            if isinstance(self.body, BaseModel):
+                body_bytes = self.body.model_dump_json().encode()
+            elif isinstance(self.body, bytes):
+                body_bytes = self.body
+            else:
+                body_bytes = json.dumps(self.body).encode()
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Cannot serialize message body for routing_key={self.routing_key!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        # Calculate expiration
+        expiration_td: datetime.timedelta | None = None
+        if self.expiration is not None:
+            milliseconds = encode_expiration(self.expiration)
+            if milliseconds is None:
+                raise ValueError(
+                    f"Invalid expiration value: encode_expiration returned None for "
+                    f"{self.expiration!r}"
+                )
+            expiration_td = datetime.timedelta(milliseconds=int(milliseconds))
+
+        # Calculate send_after
+        send_after = now
+        if self.eta is not None:
+            milliseconds = encode_expiration(self.eta)
+            if milliseconds is None:
+                raise ValueError(
+                    f"Invalid eta value: encode_expiration returned None for {self.eta!r}"
+                )
+            send_after = now + datetime.timedelta(milliseconds=int(milliseconds))
+
+        # Tracking IDs
+        tracking_ids = list(get_tracking_ids() + (str(uuid.uuid4()),))
+        tracking_ids_json = json.dumps(tracking_ids)
+
+        return (
+            self.routing_key,
+            body_bytes,
+            tracking_ids_json,
+            now,
+            send_after,
+            expiration_td,
+        )
 
 
 @dataclass
 class Publisher:
-    db_engine: Optional[Union[AsyncEngine, Engine]] = None
-    db_engine_url: Optional[str] = None
-    expiration: Optional[DateType] = None
+    expiration: DateType | None = None
     table_name: str = "outbox_table"
-    auto_create_table: bool = False
 
-    def __post_init__(self) -> None:
-        if self.db_engine is not None and self.db_engine_url is not None:
-            raise ValueError("You cannot set both db_engine and db_engine_url")
-        if self.db_engine_url is not None:
-            self.db_engine = create_async_engine(self.db_engine_url)
-        if self.table_name is not None:
-            OutboxTable.__tablename__ = self.table_name
+    async def _bulk_publish_to_connection_async(
+        self, connection: asyncpg.Connection, messages: Sequence[OutboxMessage]
+    ) -> None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        await connection.executemany(
+            f""" INSERT INTO {self.table_name}
+                 (routing_key, body, tracking_ids, created_at, send_after, expiration)
+                 VALUES ($1, $2, $3, $4, $5, $6)""",
+            (message.to_sql_params(now) for message in messages),
+        )
+        logger.info(f"Published {len(messages)} messages to outbox")
 
     async def bulk_publish_async(
-        self, session: AsyncSession, messages: Sequence[OutboxMessage]
+        self,
+        handle: AsyncSession | asyncpg.Connection,
+        messages: Sequence[OutboxMessage],
     ) -> None:
-        if not isinstance(self.db_engine, AsyncEngine):
-            raise ValueError("db_engine must be an AsyncEngine for async bulk_publish")
+        # Extract raw connection
+        if isinstance(handle, asyncpg.Connection):
+            connection = handle
+        elif isinstance(handle, AsyncSession):
+            # Extract raw asyncpg connection from SQLAlchemy session
+            sqla_conn = await handle.connection()
+            raw_conn = await sqla_conn.get_raw_connection()
+            # SQLAlchemy wraps asyncpg connection - unwrap it
+            connection = cast(asyncpg.Connection, raw_conn._connection)  # type: ignore[attr-defined]
+        else:
+            raise TypeError(
+                f"Expected asyncpg.Connection or AsyncSession, got {type(handle).__name__}"
+            )
 
-        if self.auto_create_table and self.db_engine is not None:
-            await ensure_database_async(self.db_engine)
-        rows = self._convert_messages_to_rows(messages)
-        await session.execute(insert(OutboxTable).values(rows))
-        logger.info(f"Published {len(rows)} messages to outbox")
+        await self._bulk_publish_to_connection_async(connection, messages)
 
-    def bulk_publish_sync(self, session: Session, messages: Sequence[OutboxMessage]) -> None:
-        if not isinstance(self.db_engine, Engine):
-            raise ValueError("db_engine must be an Engine for sync bulk_publish")
+    def _bulk_publish_to_cursor_sync(
+        self, cursor: Psycopg2Cursor, messages: Sequence[OutboxMessage]
+    ) -> None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cursor.executemany(
+            f""" INSERT INTO {self.table_name}
+                 (routing_key, body, tracking_ids, created_at, send_after, expiration)
+                 VALUES (%s, %s, %s, %s, %s, %s)""",
+            (message.to_sql_params(now) for message in messages),
+        )
+        logger.info(f"Published {len(messages)} messages to outbox")
 
-        if self.auto_create_table and self.db_engine is not None:
-            ensure_database_sync(self.db_engine)
-        rows = self._convert_messages_to_rows(messages)
-        session.execute(insert(OutboxTable).values(rows))
-        logger.info(f"Published {len(rows)} messages to outbox")
+    def bulk_publish_sync(
+        self,
+        handle: Session | Psycopg2Connection | Psycopg2Cursor,
+        messages: Sequence[OutboxMessage],
+    ) -> None:
+        # Extract cursor
+        if isinstance(handle, Psycopg2Cursor):
+            cursor = handle
+        elif isinstance(handle, Psycopg2Connection):
+            cursor = handle.cursor()
+        elif isinstance(handle, Session):
+            # Extract raw psycopg2 connection from SQLAlchemy session
+            sqla_conn = handle.connection()
+            raw_conn = sqla_conn.connection  # Get DBAPI connection
+            cursor = cast(Psycopg2Cursor, raw_conn.cursor())
+        else:
+            raise TypeError(
+                f"Expected Session, psycopg2 connection, or cursor, got {type(handle).__name__}"
+            )
 
-    @overload
-    def bulk_publish(self, session: Session, messages: Sequence[OutboxMessage]) -> None: ...
+        self._bulk_publish_to_cursor_sync(cursor, messages)
 
     @overload
     def bulk_publish(
-        self, session: AsyncSession, messages: Sequence[OutboxMessage]
+        self,
+        handle: Session | Psycopg2Connection | Psycopg2Cursor,
+        messages: Sequence[OutboxMessage],
+    ) -> None: ...
+
+    @overload
+    def bulk_publish(
+        self,
+        handle: AsyncSession | asyncpg.Connection,
+        messages: Sequence[OutboxMessage],
     ) -> Awaitable[None]: ...
 
     def bulk_publish(
-        self, session: Union[Session, AsyncSession], messages: Sequence[OutboxMessage]
-    ) -> Optional[Awaitable[None]]:
-        if isinstance(session, Session):
-            self.bulk_publish_sync(session, messages)
+        self,
+        handle: AsyncSession | asyncpg.Connection | Session | Psycopg2Connection | Psycopg2Cursor,
+        messages: Sequence[OutboxMessage],
+    ) -> Awaitable[None] | None:
+        # Detect async vs sync
+        if isinstance(handle, (asyncpg.Connection, AsyncSession)):
+            return self.bulk_publish_async(handle, messages)
+        elif isinstance(handle, (Session, Psycopg2Connection, Psycopg2Cursor)):
+            self.bulk_publish_sync(handle, messages)
             return None
-        elif isinstance(session, AsyncSession):
-            return self.bulk_publish_async(session, messages)
-        else:  # pragma: no cover
-            raise Exception("Unreachable code")
+        else:
+            raise TypeError(
+                f"Expected AsyncSession, asyncpg.Connection, Session, "
+                f"psycopg2 connection, or cursor, got {type(handle).__name__}"
+            )
 
     async def publish_async(
         self,
-        session: AsyncSession,
+        handle: AsyncSession | asyncpg.Connection,
         routing_key: str,
         body: Any,
         *,
-        expiration: Optional[DateType] = None,
-        eta: Optional[DateType] = None,
+        expiration: DateType | None = None,
+        eta: DateType | None = None,
     ) -> None:
-        await self.bulk_publish_async(session, [OutboxMessage(routing_key, body, expiration, eta)])
+        await self.bulk_publish_async(handle, [OutboxMessage(routing_key, body, expiration, eta)])
 
     def publish_sync(
         self,
-        session: Session,
+        handle: Session | Psycopg2Connection | Psycopg2Cursor,
         routing_key: str,
         body: Any,
         *,
-        expiration: Optional[DateType] = None,
-        eta: Optional[DateType] = None,
+        expiration: DateType | None = None,
+        eta: DateType | None = None,
     ) -> None:
-        self.bulk_publish_sync(session, [OutboxMessage(routing_key, body, expiration, eta)])
+        self.bulk_publish_sync(handle, [OutboxMessage(routing_key, body, expiration, eta)])
 
     @overload
     def publish(
         self,
-        session: Session,
+        handle: Session | Psycopg2Connection | Psycopg2Cursor,
         routing_key: str,
         body: Any,
         *,
-        expiration: Optional[DateType] = None,
-        eta: Optional[DateType] = None,
+        expiration: DateType | None = None,
+        eta: DateType | None = None,
     ) -> None: ...
 
     @overload
     def publish(
         self,
-        session: AsyncSession,
+        handle: AsyncSession | asyncpg.Connection,
         routing_key: str,
         body: Any,
         *,
-        expiration: Optional[DateType] = None,
-        eta: Optional[DateType] = None,
+        expiration: DateType | None = None,
+        eta: DateType | None = None,
     ) -> Awaitable[None]: ...
 
     def publish(
         self,
-        session: Union[Session, AsyncSession],
+        handle: AsyncSession | asyncpg.Connection | Session | Psycopg2Connection | Psycopg2Cursor,
         routing_key: str,
         body: Any,
         *,
-        expiration: Optional[DateType] = None,
-        eta: Optional[DateType] = None,
-    ) -> Optional[Awaitable[None]]:
-        if isinstance(session, Session):
-            self.publish_sync(session, routing_key, body, expiration=expiration, eta=eta)
+        expiration: DateType | None = None,
+        eta: DateType | None = None,
+    ) -> Awaitable[None] | None:
+        # Detect async vs sync
+        if isinstance(handle, (asyncpg.Connection, AsyncSession)):
+            return self.publish_async(handle, routing_key, body, expiration=expiration, eta=eta)
+        elif isinstance(handle, (Session, Psycopg2Connection, Psycopg2Cursor)):
+            self.publish_sync(handle, routing_key, body, expiration=expiration, eta=eta)
             return None
-        elif isinstance(session, AsyncSession):
-            return self.publish_async(session, routing_key, body, expiration=expiration, eta=eta)
-        else:  # pragma: no cover
-            raise Exception("Unreachable code")
-
-    @staticmethod
-    def _convert_messages_to_rows(messages: Sequence[OutboxMessage]) -> list[OutboxRowDict]:
-        now = datetime.datetime.now(datetime.timezone.utc)
-        rows = []
-        for message in messages:
-            try:
-                if isinstance(message.body, BaseModel):
-                    body = message.body.model_dump_json().encode()
-                elif not isinstance(message.body, bytes):
-                    body = json.dumps(message.body).encode()
-                else:
-                    body = message.body
-            except (TypeError, ValueError) as exc:
-                # Don't log - user called publish(), they'll see the exception
-                raise ValueError(
-                    f"Cannot serialize message body for routing_key={message.routing_key!r}: "
-                    f"{type(exc).__name__}: {exc}"
-                ) from exc
-            if message.expiration is not None:
-                milliseconds = encode_expiration(message.expiration)
-                if milliseconds is None:
-                    raise ValueError(
-                        "Invalid expiration value: encode_expiration returned None for "
-                        f"{message.expiration!r}"
-                    )
-                expiration = datetime.timedelta(milliseconds=int(milliseconds))
-            else:
-                expiration = None
-            if message.eta is not None:
-                milliseconds = encode_expiration(message.eta)
-                if milliseconds is None:
-                    raise ValueError(
-                        f"Invalid eta value: encode_expiration returned None for {message.eta!r}"
-                    )
-                send_after = now + datetime.timedelta(milliseconds=int(milliseconds))
-            else:
-                send_after = now
-            rows.append(
-                OutboxRowDict(
-                    routing_key=message.routing_key,
-                    body=body,
-                    tracking_ids=list(get_tracking_ids() + (str(uuid.uuid4()),)),
-                    created_at=now,
-                    expiration=expiration,
-                    send_after=send_after,
-                )
+        else:
+            raise TypeError(
+                f"Expected AsyncSession, asyncpg.Connection, Session, "
+                f"psycopg2 connection, or cursor, got {type(handle).__name__}"
             )
-        return rows

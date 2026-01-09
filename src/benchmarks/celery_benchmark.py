@@ -6,12 +6,15 @@
 # ]
 # ///
 
+from __future__ import annotations
+
 import argparse
+import contextlib
 import glob
 import os
 import subprocess
 import time
-from typing import Generator, Optional, Union
+from collections.abc import Generator
 
 from celery import Celery, group, signals
 from testcontainers.rabbitmq import RabbitMqContainer  # type: ignore[import-untyped]
@@ -20,8 +23,8 @@ TIMESTAMPS_PATTERN = "/tmp/celery_benchmark_timestamps_*.txt"
 
 app = Celery("celery_benchmark")
 
-min_timestamp: Optional[float] = None
-max_timestamp: Optional[float] = None
+min_timestamp: float | None = None
+max_timestamp: float | None = None
 
 
 @app.task(name="process_message", ignore_result=True)
@@ -41,9 +44,7 @@ def close_timestamp_file(**_):
         f.write(f"{min_timestamp}\n{max_timestamp}\n")
 
 
-def _generate_batch_sizes(
-    rate: Union[int, float], duration: Union[int, float]
-) -> Generator[int, None, None]:
+def _generate_batch_sizes(rate: int | float, duration: int | float) -> Generator[int, None, None]:
     """Generate batch sizes for steady message emission."""
     start = time.perf_counter()
     yield (sent := 1)
@@ -121,7 +122,8 @@ def benchmark(
 
         # Publish tasks at controlled rate
         print(
-            f"Publishing {message_count:,} tasks at {message_rate:,} msgs/sec for {duration} seconds..."
+            f"Publishing {message_count:,} tasks at {message_rate:,} msgs/sec "
+            f"for {duration} seconds..."
         )
 
         start_time = time.perf_counter()
@@ -147,7 +149,7 @@ def benchmark(
         print("Reading timestamps from files...")
         all_timestamps = []
         for filepath in glob.glob(TIMESTAMPS_PATTERN):
-            with open(filepath, "r") as f:
+            with open(filepath) as f:
                 for line in f:
                     all_timestamps.append(float(line.strip()))
 
@@ -168,10 +170,8 @@ def benchmark(
 
         # Clean up timestamp files
         for timestamp_file in glob.glob(TIMESTAMPS_PATTERN):
-            try:
+            with contextlib.suppress(Exception):
                 os.remove(timestamp_file)
-            except:
-                pass
 
 
 if __name__ == "__main__":
