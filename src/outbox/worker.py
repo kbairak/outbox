@@ -7,7 +7,7 @@ import signal
 import time
 from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable, cast, get_type_hints
+from typing import TYPE_CHECKING, Any, Callable, cast, get_type_hints
 
 import aio_pika
 from aio_pika.abc import (
@@ -17,7 +17,6 @@ from aio_pika.abc import (
     AbstractQueue,
     ConsumerTag,
 )
-from pydantic import BaseModel
 
 from .log import logger
 from .metrics import metrics
@@ -28,6 +27,13 @@ from .utils import (
     tracking_ids_contextvar,
     truncate_body,
 )
+
+# Optional pydantic support
+try:
+    from pydantic import BaseModel
+except ImportError:
+    if not TYPE_CHECKING:
+        BaseModel = type(None)  # type: ignore[misc, assignment]
 
 
 @dataclass
@@ -119,7 +125,7 @@ class Consumer:
             cast(str | None, message.headers.get("x-original-routing-key")) or message.routing_key
         )
         assert routing_key is not None
-        body = message.body
+        body: Any = message.body
         try:
             if inspect.isclass(body_type) and issubclass(body_type, BaseModel):
                 body = body_type.model_validate_json(message.body)

@@ -149,7 +149,7 @@ The trade-off of using this library instead of Celery is that we lose the jitter
 
 **aio-pika** is the go-to library for working with RabbitMQ in async Python applications. It provides robust connection handling, automatic reconnection, and full support for RabbitMQ's features.
 
-**Pydantic** is popular and integrated into many existing frameworks (FastAPI, etc.), making automatic message serialization/deserialization seamless.
+**Pydantic** (optional) is popular and integrated into many existing frameworks (FastAPI, etc.), making automatic message serialization/deserialization seamless when installed.
 
 <details>
     <summary><h4>SQLAlchemy Support</h4></summary>
@@ -176,12 +176,38 @@ This library works with **asyncpg** and **psycopg2** connections directly and do
 The examples use SQLAlchemy since it's the most common use case, but you can substitute raw connections anywhere you see a session.
 </details>
 
+<details>
+    <summary><h4>Pydantic Support</h4></summary>
+
+This library does not require Pydantic. However, **Pydantic integration is very common**, and this library fully supports automatic serialization/deserialization of Pydantic models.
+
+**Why Pydantic is optional:**
+
+- Keeps the library lightweight with minimal dependencies
+- Supports projects that don't use Pydantic
+- Allows faster import times
+
+**How to use with Pydantic:**
+
+- Install Pydantic separately: `pip install pydantic` or `uv add pydantic`
+- Pass Pydantic models to `publisher.publish()` - they will be automatically serialized using `model_dump_json()`
+- In worker functions, use Pydantic model type hints - messages will be automatically deserialized using `model_validate_json()`
+
+**How to use without Pydantic:**
+
+- Pass dicts, lists, or other JSON-serializable objects to `publisher.publish()` - they will be serialized using `json.dumps()`
+- In worker functions, use dict/list type hints or no type hints - messages will be deserialized using `json.loads()`
+- You can also pass raw bytes if needed
+
+The examples use Pydantic since it provides type safety and validation, but you can use plain dicts/JSON anywhere you see Pydantic models.
+</details>
+
 ## Features
 
 ### Overall
 
 <details>
-    <summary><h4>Automatic (de)serialization of Pydantic models</h4></summary>
+    <summary><h4>Automatic (de)serialization of Pydantic models (optional)</h4></summary>
 
 ```python
 class User(BaseModel):
@@ -371,7 +397,7 @@ Class for publishing messages to the outbox table.
     - **Async**: `AsyncSession` (SQLAlchemy, if installed) or `asyncpg.Connection`
     - **Sync**: `Session` (SQLAlchemy, if installed), `psycopg2.Connection`, or `psycopg2.Cursor`
   - `routing_key`: The routing key to use for the message
-  - `body`: The body of the message. If it is an instance of a Pydantic model, it will be serialized by Pydantic, if it is bytes, it will be used as is, otherwise outbox will attempt to serialize it with `json.dumps`
+  - `body`: The body of the message. If it is an instance of a Pydantic model (when Pydantic is installed), it will be serialized by Pydantic using `model_dump_json()`. If it is bytes, it will be used as is. Otherwise, outbox will serialize it with `json.dumps()`
   - `expiration`: The expiration time in seconds for the message. Overrides the default set in the constructor
   - `eta`: The time at which the message should be sent. Can be a `datetime`, a `timedelta` or an interval in milliseconds
 
@@ -387,7 +413,7 @@ Class for publishing messages to the outbox table.
 
 - `OutboxMessage`: A dataclass representing a message to be published. Used in `bulk_publish()`
   - `routing_key`: The routing key to use for the message
-  - `body`: The body of the message. If it is an instance of a Pydantic model, it will be serialized by Pydantic, if it is bytes, it will be used as is, otherwise outbox will attempt to serialize it with `json.dumps`
+  - `body`: The body of the message. If it is an instance of a Pydantic model (when Pydantic is installed), it will be serialized by Pydantic using `model_dump_json()`. If it is bytes, it will be used as is. Otherwise, outbox will serialize it with `json.dumps()`
   - `expiration`: The expiration time in seconds for the message. Overrides the default set in the constructor
   - `eta`: The time at which the message should be sent. Can be a `datetime`, a `timedelta` or an interval in milliseconds
 
@@ -773,7 +799,7 @@ If you arguments are named:
 - `tracking_ids`: it will be populated with the tracking IDs of the message
 - `attempt_count`: it will be populated with the number of attempts that have been made to process the message (starting from 1)
 
-You must have exactly **one** argument that doesn't meet the above criteria, which will be populated with the body of the message. If you supply a type annotation that is a subclass of `pydantic.BaseModel`, the library will automatically deserialize the body into an instance of that class. If you don't supply a type annotation, the library will attempt to deserialize it with `json.loads`. If that fails, you will receive the contents of the message as bytes.
+You must have exactly **one** argument that doesn't meet the above criteria, which will be populated with the body of the message. If you supply a type annotation that is a subclass of `pydantic.BaseModel` (when Pydantic is installed), the library will automatically deserialize the body into an instance of that class using `model_validate_json()`. If you annotate with `bytes`, you will receive the raw message body. Otherwise, the library will attempt to deserialize it with `json.loads`.
 
 </details>
 

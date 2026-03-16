@@ -807,14 +807,15 @@ dependencies = [
     { name = "asyncpg" },
     { name = "asyncpg-stubs" },
     { name = "prometheus-client" },
-    { name = "pydantic" },
 ]
 
 [package.dev-dependencies]
 dev = [
     { name = "mypy" },
+    { name = "psycopg2-binary" },
     { name = "ptipython" },
     { name = "pudb" },
+    { name = "pydantic" },
     { name = "pynvim" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -828,6 +829,9 @@ dev = [
 noasync = [
     { name = "psycopg2-binary" },
 ]
+pydantic = [
+    { name = "pydantic" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -836,14 +840,15 @@ requires-dist = [
     { name = "asyncpg", specifier = ">=0.30.0" },
     { name = "asyncpg-stubs", specifier = ">=0.30.0" },
     { name = "prometheus-client", specifier = ">=0.8.0,<1.0.0" },
-    { name = "pydantic", specifier = ">=2.0.3,<3" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "mypy", specifier = ">=1.18.2" },
+    { name = "psycopg2-binary", specifier = ">=2.9.11" },
     { name = "ptipython", specifier = ">=1.0.1" },
     { name = "pudb", specifier = ">=2025.1" },
+    { name = "pydantic", specifier = ">=2.0.3,<3" },
     { name = "pynvim", specifier = ">=0.5.2" },
     { name = "pytest", specifier = ">=8.4.0" },
     { name = "pytest-asyncio", specifier = ">=1.0.0" },
@@ -855,6 +860,7 @@ dev = [
     { name = "types-psycopg2", specifier = ">=2.9.21.20251012" },
 ]
 noasync = [{ name = "psycopg2-binary", specifier = ">=2.9.11" }]
+pydantic = [{ name = "pydantic", specifier = ">=2.0.3,<3" }]
 
 [[package]]
 name = "packaging"

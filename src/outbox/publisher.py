@@ -12,10 +12,16 @@ from aio_pika.abc import DateType
 from aio_pika.message import encode_expiration
 from psycopg2.extensions import connection as Psycopg2Connection
 from psycopg2.extensions import cursor as Psycopg2Cursor
-from pydantic import BaseModel
 
 from .log import logger
 from .utils import get_tracking_ids
+
+# Optional pydantic support
+try:
+    from pydantic import BaseModel
+except ImportError:
+    if not TYPE_CHECKING:
+        BaseModel = type(None)  # type: ignore[misc, assignment]
 
 # Optional SQLAlchemy support
 try:
