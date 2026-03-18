@@ -126,13 +126,12 @@ def message_relay(db_url_async: str, rmq_connection: AbstractConnection) -> Mess
         db_engine_url=url,
         rmq_connection=rmq_connection,
         clean_up_after="NEVER",
-        enable_metrics=False,
     )
 
 
 @pytest.fixture
 def worker(rmq_connection: AbstractConnection) -> Worker:
-    return Worker(rmq_connection=rmq_connection, enable_metrics=False)
+    return Worker(rmq_connection=rmq_connection)
 
 
 @pytest_asyncio.fixture(autouse=True)

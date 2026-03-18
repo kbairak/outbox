@@ -18,8 +18,8 @@ from aio_pika.abc import (
     ConsumerTag,
 )
 
+from . import metrics
 from .log import logger
-from .metrics import metrics
 from .utils import (
     Reject,
     get_rmq_connection,
@@ -302,12 +302,10 @@ class Worker:
     exchange_name: str = "outbox"
     retry_delays: Sequence[str] = ("1s", "10s", "1m", "5m")
     prefetch_count: int = 10
-    enable_metrics: bool = True
     # Instance attribute (not just local var) to allow tests to simulate shutdown signals
     _shutdown_future: asyncio.Future[None] | None = None
 
     def __post_init__(self) -> None:
-        metrics.enable_metrics(self.enable_metrics)
         if self.rmq_connection is not None and self.rmq_connection_url is not None:
             raise ValueError("You cannot set both rmq_connection and rmq_connection_url")
 
@@ -327,9 +325,7 @@ class Worker:
 
         tasks = set()
 
-        dlq_metrics_task = (
-            asyncio.create_task(self._update_dlq_metrics()) if self.enable_metrics else None
-        )
+        dlq_metrics_task = asyncio.create_task(self._update_dlq_metrics())
 
         logger.info(
             f"Starting worker on exchange '{self.exchange_name}' with "
@@ -370,8 +366,7 @@ class Worker:
         if tasks:
             await asyncio.wait(tasks)
 
-        if dlq_metrics_task is not None:
-            dlq_metrics_task.cancel()
+        dlq_metrics_task.cancel()
 
     async def _update_dlq_metrics(self) -> None:
         """Background task to periodically update DLQ message count metrics."""

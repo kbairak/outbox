@@ -34,7 +34,6 @@ def message_relay_process(postgres_url: str, rabbitmq_url: str, batch_size: int)
     message_relay = MessageRelay(
         db_engine_url=postgres_url,
         rmq_connection_url=rabbitmq_url,
-        enable_metrics=False,
         batch_size=batch_size,
     )
     asyncio.run(message_relay.run())
@@ -60,7 +59,6 @@ def worker_process(rabbitmq_url: str, prefetch_count: int, timestamp_list: list[
         consumers=[
             Consumer(binding_key="benchmark.test", queue="benchmark.test", callback=on_message)
         ],
-        enable_metrics=False,
         prefetch_count=prefetch_count,
     )
     try:

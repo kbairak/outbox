@@ -13,8 +13,8 @@ from aio_pika.abc import AbstractConnection, AbstractExchange, DateType, Headers
 from aio_pika.message import encode_expiration
 from asyncpg.pool import PoolConnectionProxy
 
+from . import metrics
 from .log import logger
-from .metrics import metrics
 from .utils import get_rmq_connection
 
 # Fixed delay for database retry (seconds)
@@ -35,10 +35,8 @@ class MessageRelay:
     ) = None
     table_name: str = "outbox_table"
     batch_size: int = 50
-    enable_metrics: bool = True
 
     def __post_init__(self) -> None:
-        metrics.enable_metrics(self.enable_metrics)
         if self.rmq_connection is not None and self.rmq_connection_url is not None:
             raise ValueError("You cannot set both rmq_connection and rmq_connection_url")
         if self.clean_up_after is not None and (
